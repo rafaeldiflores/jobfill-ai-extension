@@ -3,3 +3,10 @@
 !.claude/settings.json
 .impeccable/*.cache.json
 node_modules/
+# Hooks del grafo (Claude Code)
+.claude/.session-start
+.claude/hooks/grafo.env
+.claude/hooks/grafo.log
+.claude/settings.local.json
+.claude/hooks/
+.claude/commands/avance.md
