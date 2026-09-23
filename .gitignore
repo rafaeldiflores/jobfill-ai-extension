@@ -1,0 +1,5 @@
+# Estado local de herramientas (Claude Code, impeccable)
+.claude/*
+!.claude/settings.json
+.impeccable/*.cache.json
+node_modules/

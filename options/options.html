@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Configuración - JobFill AI</title>
+  <link rel="stylesheet" href="options.css">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- Sidebar -->
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <div class="brand-badge-icon">⚡</div>
+        <div class="brand-meta">
+          <h2>JobFill AI</h2>
+          <span class="tag">Panel de Control</span>
+        </div>
+      </div>
+
+      <nav class="nav-menu">
+        <button class="nav-item active" data-tab="tab-personal">
+          <span class="nav-icon">👤</span>
+          <span>Datos Personales</span>
+        </button>
+        <button class="nav-item" data-tab="tab-links">
+          <span class="nav-icon">🔗</span>
+          <span>Redes y Enlaces</span>
+        </button>
+        <button class="nav-item" data-tab="tab-experience">
+          <span class="nav-icon">💼</span>
+          <span>Experiencia y Empleo</span>
+        </button>
+        <button class="nav-item" data-tab="tab-education">
+          <span class="nav-icon">🎓</span>
+          <span>Educación y Skills</span>
+        </button>
+        <button class="nav-item" data-tab="tab-cv">
+          <span class="nav-icon">📄</span>
+          <span>Curriculum Vitae (CV)</span>
+        </button>
+        <button class="nav-item" data-tab="tab-custom-fields">
+          <span class="nav-icon">🧩</span>
+          <span>Campos Flexibles</span>
+        </button>
+        <button class="nav-item" data-tab="tab-legal">
+          <span class="nav-icon">⚖️</span>
+          <span>Legal / EEO</span>
+        </button>
+        <button class="nav-item" data-tab="tab-claude">
+          <span class="nav-icon">🤖</span>
+          <span>Claude IA (Anthropic)</span>
+        </button>
+        <button class="nav-item" data-tab="tab-qa">
+          <span class="nav-icon">💬</span>
+          <span>Banco de Respuestas</span>
+        </button>
+        <button class="nav-item" data-tab="tab-backup">
+          <span class="nav-icon">💾</span>
+          <span>Copia de Seguridad</span>
+        </button>
+      </nav>
+
+      <div class="sidebar-footer">
+        <div class="security-pill">
+          <span class="lock-icon">🔒</span>
+          <span>Datos almacenados localmente en tu navegador.</span>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main Content -->
+    <main class="main-content">
+      <form id="profileForm">
+        <!-- Floating Save Header -->
+        <div class="top-bar">
+          <div class="top-bar-left">
+            <h1 id="tabTitle">Datos Personales</h1>
+          </div>
+          <div class="top-actions">
+            <span id="saveStatus" class="save-status"></span>
+            <button type="submit" class="btn-save" id="btnSave">
+              <span>💾</span> Guardar Cambios
+            </button>
+          </div>
+        </div>
+
+        <!-- Global Master Profile Bar (Highest Level Context) -->
+        <div class="global-profile-master-bar" id="globalProfileMasterBar">
+          <div class="master-bar-main">
+            <div class="master-badge-icon">🎯</div>
+            <div class="master-select-group">
+              <label for="globalProfileSelect" class="master-select-label">
+                <strong>Perfil de CV Activo (Contexto Global):</strong>
+              </label>
+              <select id="globalProfileSelect" class="global-profile-select">
+                <!-- Dynamically loaded profiles -->
+              </select>
+            </div>
+          </div>
+          <div class="master-bar-actions">
+            <button type="button" class="btn-master btn-master-new" id="btnGlobalNewProfile" title="Crear un nuevo perfil de CV independiente">
+              <span>➕</span> Nuevo Perfil de CV
+            </button>
+            <button type="button" class="btn-master btn-master-secondary" id="btnGlobalRenameProfile" title="Renombrar perfil">
+              <span>✏️</span> Renombrar
+            </button>
+            <button type="button" class="btn-master btn-master-danger" id="btnGlobalDeleteProfile" title="Eliminar perfil">
+              <span>🗑️</span> Eliminar
+            </button>
+          </div>
+        </div>
+
+        <div class="tab-container">
+          <!-- TAB 1: Personal -->
+          <section id="tab-personal" class="tab-panel active">
+            <div class="section-desc">Tu información de contacto básica para encabezados de postulación.</div>
+            
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="firstName">Primer Nombre</label>
+                <input type="text" id="firstName" name="firstName" placeholder="Ej. Rafael">
+              </div>
+              <div class="form-group">
+                <label for="middleName">Segundo Nombre (opcional)</label>
+                <input type="text" id="middleName" name="middleName" placeholder="Ej. Andrés">
+                <span class="field-hint">Solo si tienes uno y un formulario lo pide por separado del primer nombre.</span>
+              </div>
+              <div class="form-group">
+                <label for="lastName">Apellidos</label>
+                <input type="text" id="lastName" name="lastName" placeholder="Ej. Díaz Flores">
+                <span class="field-hint">Ambos apellidos juntos. Si un formulario los pide por separado (Apellido Paterno / Materno), se parten automáticamente por espacio — corrígelos abajo solo si tu apellido es compuesto y esa partida simple no calza.</span>
+              </div>
+              <div class="form-group">
+                <label for="lastNamePaternal">Apellido Paterno (opcional)</label>
+                <input type="text" id="lastNamePaternal" name="lastNamePaternal" placeholder="Se deriva de Apellidos si lo dejas vacío">
+              </div>
+              <div class="form-group">
+                <label for="lastNameMaternal">Apellido Materno (opcional)</label>
+                <input type="text" id="lastNameMaternal" name="lastNameMaternal" placeholder="Se deriva de Apellidos si lo dejas vacío">
+              </div>
+              <div class="form-group full-width">
+                <label for="fullName">Nombre Completo</label>
+                <input type="text" id="fullName" name="fullName" placeholder="Ej. Rafael Pérez">
+                <span class="field-hint">Usado cuando el formulario pide un solo campo de "Nombre Completo".</span>
+              </div>
+              <div class="form-group">
+                <label for="rut">RUT / DNI / Cédula / Documento</label>
+                <input type="text" id="rut" name="rut" placeholder="Ej. 12.345.678-9 / 12345678-K">
+                <span class="field-hint">Se rellenará en campos de RUT, DNI, Cédula o Identificación.</span>
+              </div>
+              <div class="form-group">
+                <label for="birthDate">Fecha de Nacimiento</label>
+                <input type="date" id="birthDate" name="birthDate">
+                <span class="field-hint">Vacío por defecto — solo se rellena si algún formulario lo pide y tú la cargaste aquí.</span>
+              </div>
+              <div class="form-group">
+                <label for="email">Correo Electrónico *</label>
+                <input type="email" id="email" name="email" placeholder="tu_email@ejemplo.com" required>
+              </div>
+              <div class="form-group">
+                <label for="phone">Teléfono / Móvil *</label>
+                <input type="tel" id="phone" name="phone" placeholder="+56 9 1234 5678" required>
+              </div>
+              <div class="form-group">
+                <label for="country">País de Residencia</label>
+                <input type="text" id="country" name="country" placeholder="Chile">
+              </div>
+              <div class="form-group">
+                <label for="city">Ciudad</label>
+                <input type="text" id="city" name="city" placeholder="Santiago">
+              </div>
+              <div class="form-group">
+                <label for="address">Dirección / Calle</label>
+                <input type="text" id="address" name="address" placeholder="Av. Providencia 1234">
+              </div>
+              <div class="form-group">
+                <label for="postalCode">Código Postal</label>
+                <input type="text" id="postalCode" name="postalCode" placeholder="7500000">
+              </div>
+            </div>
+          </section>
+
+          <!-- TAB 2: Links -->
+          <section id="tab-links" class="tab-panel">
+            <div class="section-desc">Tus perfiles profesionales y portafolios en línea.</div>
+            
+            <div class="form-grid">
+              <div class="form-group full-width">
+                <label for="linkedinUrl">URL Perfil de LinkedIn</label>
+                <input type="url" id="linkedinUrl" name="linkedinUrl" placeholder="https://linkedin.com/in/tu-usuario">
+              </div>
+              <div class="form-group full-width">
+                <label for="githubUrl">URL Perfil de GitHub</label>
+                <input type="url" id="githubUrl" name="githubUrl" placeholder="https://github.com/tu-usuario">
+              </div>
+              <div class="form-group full-width">
+                <label for="portfolioUrl">URL Portafolio / Web Personal</label>
+                <input type="url" id="portfolioUrl" name="portfolioUrl" placeholder="https://miportafolio.dev">
+              </div>
+              <div class="form-group full-width">
+                <label for="twitterUrl">Twitter / X Handle</label>
+                <input type="text" id="twitterUrl" name="twitterUrl" placeholder="https://x.com/tu_usuario">
+              </div>
+            </div>
+          </section>
+
+          <!-- TAB 3: Experience -->
+          <section id="tab-experience" class="tab-panel">
+            <div class="section-desc">Tu experiencia profesional, expectativas de salario y disponibilidad.</div>
+            
+            <div class="form-grid">
+              <div class="form-group full-width">
+                <label for="headline">Titular Profesional / Cargo Deseado</label>
+                <input type="text" id="headline" name="headline" placeholder="Senior Fullstack Developer | Python & React">
+              </div>
+              <div class="form-group">
+                <label for="currentTitle">Cargo / Puesto Actual o Último</label>
+                <input type="text" id="currentTitle" name="currentTitle" placeholder="Desarrollador de Software">
+              </div>
+              <div class="form-group">
+                <label for="currentCompany">Empresa Actual / Última</label>
+                <input type="text" id="currentCompany" name="currentCompany" placeholder="Mi Empresa Actual">
+              </div>
+              <div class="form-group">
+                <label for="yearsOfExperience">Años de Experiencia Total</label>
+                <input type="number" id="yearsOfExperience" name="yearsOfExperience" min="0" max="50" placeholder="4">
+              </div>
+              <div class="form-group">
+                <label for="noticePeriod">Disponibilidad / Periodo de Preaviso</label>
+                <input type="text" id="noticePeriod" name="noticePeriod" placeholder="Inmediata / 2 semanas">
+              </div>
+              <div class="form-group">
+                <label for="salaryExpectation">Pretensiones Salariales (Monto)</label>
+                <input type="text" id="salaryExpectation" name="salaryExpectation" placeholder="2500000">
+              </div>
+              <div class="form-group">
+                <label for="currency">Moneda</label>
+                <select id="currency" name="currency">
+                  <option value="CLP">CLP ($ Pesos Chilenos)</option>
+                  <option value="USD">USD ($ Dólares)</option>
+                  <option value="EUR">EUR (€ Euros)</option>
+                  <option value="MXN">MXN ($ Pesos Mexicanos)</option>
+                  <option value="COP">COP ($ Pesos Colombianos)</option>
+                  <option value="ARS">ARS ($ Pesos Argentinos)</option>
+                </select>
+              </div>
+              <div class="form-group full-width">
+                <label for="englishLevel">Nivel de Inglés</label>
+                <select id="englishLevel" name="englishLevel">
+                  <option value="Básico (A1/A2)">Básico (A1 / A2)</option>
+                  <option value="Intermedio (B1/B2)">Intermedio (B1 / B2)</option>
+                  <option value="Avanzado / Fluido (C1/C2)">Avanzado / Fluido Profesional (C1 / C2)</option>
+                  <option value="Nativo / Bilingüe">Nativo / Bilingüe</option>
+                </select>
+              </div>
+              <div class="form-group full-width">
+                <label for="summary">Resumen Profesional / Bio / Carta de Presentación Base</label>
+                <textarea id="summary" name="summary" rows="4" placeholder="Breve resumen de tu trayectoria, principales logros y tecnologías que dominas..."></textarea>
+                <span class="field-hint">Se utilizará para rellenar campos de "Cover Letter", "Sobre ti" y como contexto para Claude IA.</span>
+              </div>
+            </div>
+          </section>
+
+          <!-- TAB 4: Education -->
+          <section id="tab-education" class="tab-panel">
+            <div class="section-desc">Tu formación académica y repertorio de habilidades técnicas y blandas.</div>
+            
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="degree">Título / Carrera Académica</label>
+                <input type="text" id="degree" name="degree" placeholder="Ingeniería en Informática / Software">
+              </div>
+              <div class="form-group">
+                <label for="university">Universidad / Institución</label>
+                <input type="text" id="university" name="university" placeholder="Universidad de Chile">
+              </div>
+              <div class="form-group">
+                <label for="gpa">Promedio / GPA (opcional)</label>
+                <input type="text" id="gpa" name="gpa" placeholder="6,2 o 3.8/4.0">
+              </div>
+              <div class="form-group full-width">
+                <label for="skills">Habilidades / Stack Tecnológico (Separadas por comas)</label>
+                <textarea id="skills" name="skills" rows="3" placeholder="JavaScript, TypeScript, React, Node.js, Python, PostgreSQL, Docker, Git, REST APIs, TailwindCSS"></textarea>
+                <span class="field-hint">Claude utilizará este listado para responder preguntas técnicas con exactitud.</span>
+              </div>
+            </div>
+          </section>
+
+          <!-- TAB: CV / Base de Datos -->
+          <section id="tab-cv" class="tab-panel">
+            <div class="section-desc">
+              Tu <strong>Curriculum Vitae (PDF o texto)</strong> es la fuente principal de información para este perfil. Al procesarlo, el sistema extraerá y completará automáticamente <strong>todas tus pestañas</strong> (Datos Personales, Contacto, Redes, Titular, Resumen, Habilidades, Cargos y Proyectos).
+            </div>
+
+            <!-- Profile Target Role & Auto-detect Keywords -->
+            <div class="cv-profile-meta-card">
+              <div class="form-grid">
+                <div class="form-group">
+                  <label for="profileTargetRole">Cargo o Especialidad de este Perfil</label>
+                  <input type="text" id="profileTargetRole" name="targetRole" placeholder="Ej: Senior Full Stack Developer / Tech Lead / DevOps">
+                  <span class="field-hint">Identifica el enfoque laboral de esta versión de perfil.</span>
+                </div>
+                <div class="form-group">
+                  <label for="profileKeywords">Palabras Clave del Empleo para Auto-Detectar este Perfil</label>
+                  <input type="text" id="profileKeywords" name="keywords" placeholder="Ej: full stack, tech lead, react, node, microservicios, cloud">
+                  <span class="field-hint">JobFill AI seleccionará este perfil automáticamente cuando la oferta laboral contenga estas palabras.</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="cv-workflow-card">
+              <div class="cv-upload-header">
+                <h3>📥 1. Documento CV del Perfil Activo (PDF o Texto)</h3>
+                <div class="upload-buttons">
+                  <input type="file" id="cvFileInput" accept=".txt,.md,.json,.pdf" style="display: none;">
+                  <button type="button" class="btn-secondary" id="btnUploadCvFile">📂 Cargar Archivo PDF / Documento</button>
+                </div>
+              </div>
+
+              <div class="form-group full-width" style="margin-top: 10px;">
+                <textarea id="resumeText" name="resumeText" rows="7" placeholder="Pega aquí el texto de tu CV o sube el archivo PDF correspondiente..."></textarea>
+              </div>
+
+              <div class="cv-action-row">
+                <button type="button" class="btn-primary" id="btnParseCvToDb">
+                  <span>⚡</span> Extraer y Autocompletar Todo el Perfil desde CV
+                </button>
+                <div id="cvParseStatus" class="api-test-badge"></div>
+              </div>
+
+              <!-- Animated Progress Bar with Percentage -->
+              <div id="cvProgressBarContainer" class="cv-progress-container" style="display: none;">
+                <div class="cv-progress-header">
+                  <span id="cvProgressStepText" class="cv-progress-step-text">⏳ Iniciando análisis del documento...</span>
+                  <span id="cvProgressPercentage" class="cv-progress-percentage">0%</span>
+                </div>
+                <div class="cv-progress-track">
+                  <div id="cvProgressFill" class="cv-progress-fill" style="width: 0%;"></div>
+                </div>
+              </div>
+            </div>
+
+            <!-- Visual Database Viewer & Editor -->
+            <div class="cv-db-section" id="cvDatabaseSection" style="margin-top: 28px;">
+              <div class="cv-db-header">
+                <div class="db-title-group">
+                  <h2>🗄️ Base de Datos de Cargos y Proyectos</h2>
+                  <span class="badge-count" id="cvDbStatsBadge">Cargos en base de datos</span>
+                </div>
+                <div class="db-actions">
+                  <button type="button" class="btn-secondary" id="btnAddCvExp">+ Agregar Cargo</button>
+                  <button type="button" class="btn-secondary" id="btnAddCvProj">+ Agregar Proyecto</button>
+                </div>
+              </div>
+
+              <div class="sub-section-title">💼 Historial de Cargos y Experiencia Laboral</div>
+              <div id="cvExperiencesList" class="cv-cards-list">
+                <!-- Rendered dynamically -->
+              </div>
+
+              <div class="sub-section-title" style="margin-top: 24px;">🚀 Proyectos Destacados</div>
+              <div id="cvProjectsList" class="cv-cards-list">
+                <!-- Rendered dynamically -->
+              </div>
+            </div>
+          </section>
+
+          <!-- TAB: Custom Fields -->
+          <section id="tab-custom-fields" class="tab-panel">
+            <div class="section-desc">Define cualquier campo adicional que te pidan con frecuencia (Licencia de conducir, Renta líquida, Nacionalidad secundaria, etc.). Asígnale palabras clave o sinónimos y la extensión lo rellenará automáticamente al detectarlo.</div>
+            
+            <div class="qa-toolbar">
+              <button type="button" class="btn-secondary" id="btnAddCustomField">+ Agregar Campo Personalizado</button>
+            </div>
+
+            <div id="customFieldsList" class="qa-cards-list">
+              <!-- Rendered dynamically -->
+            </div>
+          </section>
+
+          <!-- TAB 5: Legal / EEO -->
+          <section id="tab-legal" class="tab-panel">
+            <div class="section-desc">Respuestas a preguntas legales y de elegibilidad frecuentes en portales de empleo.</div>
+            
+            <div class="form-grid">
+              <div class="form-group">
+                <label for="legallyAuthorized">¿Estás legalmente autorizado para trabajar en tu país?</label>
+                <select id="legallyAuthorized" name="legallyAuthorized">
+                  <option value="yes">Sí (Yes)</option>
+                  <option value="no">No</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="requiresSponsorship">¿Requieres patrocinio de visa para trabajar?</label>
+                <select id="requiresSponsorship" name="requiresSponsorship">
+                  <option value="no">No (No requiero patrocinio)</option>
+                  <option value="yes">Sí (Requiero patrocinio / Visa)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="willingToRelocate">¿Disposición a reubicarte geográficamente?</label>
+                <select id="willingToRelocate" name="willingToRelocate">
+                  <option value="no">No</option>
+                  <option value="yes">Sí (Dispuesto a reubicación)</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="workPreference">Modalidad de Trabajo Preferida</label>
+                <select id="workPreference" name="workPreference">
+                  <option value="remote">100% Remoto</option>
+                  <option value="hybrid">Híbrido</option>
+                  <option value="onsite">Presencial</option>
+                </select>
+              </div>
+              <div class="form-group">
+                <label for="gender">Género (opcional)</label>
+                <select id="gender" name="gender">
+                  <option value="">Prefiero no responder / no aplica</option>
+                  <option value="female">Femenino</option>
+                  <option value="male">Masculino</option>
+                  <option value="other">Otro</option>
+                </select>
+                <span class="field-hint">Vacío por defecto, igual que el resto de esta sección — solo se rellena si tú eliges una opción aquí.</span>
+              </div>
+            </div>
+          </section>
+
+          <!-- TAB 6: Claude AI -->
+          <section id="tab-claude" class="tab-panel">
+            <div class="section-desc">Integra tu API Key de Claude (Anthropic) para responder automáticamente preguntas abiertas de postulaciones en 1 clic.</div>
+            
+            <div class="form-grid">
+              <div class="form-group full-width">
+                <label for="claudeApiKey">Anthropic Claude API Key *</label>
+                <div class="input-with-button">
+                  <input type="password" id="claudeApiKey" name="claudeApiKey" placeholder="sk-ant-api03-..." autocomplete="off">
+                  <button type="button" class="btn-toggle-eye" id="btnToggleKey">👁️</button>
+                  <button type="button" class="btn-test-api" id="btnTestClaude">⚡ Probar Conexión</button>
+                </div>
+                <span class="field-hint">Tu clave se guarda 100% local en tu navegador y solo se conecta a api.anthropic.com.</span>
+                <div id="claudeTestResult" class="api-test-badge"></div>
+              </div>
+
+              <div class="form-group full-width">
+                <label>Modelo</label>
+                <small>Se elige automáticamente según la pregunta: <strong>Sonnet 5</strong> para experiencia y motivación (las que deciden si te llaman a entrevista) y <strong>Haiku 4.5</strong> para las simples de disponibilidad, renta o ubicación, que además se envían sin el CV ni la descripción de la oferta.</small>
+              </div>
+
+              <div class="form-group">
+                <label for="aiTone">Tono de Redacción</label>
+                <select id="aiTone" name="aiTone">
+                  <option value="profesional y persuasivo">Profesional y Persuasivo</option>
+                  <option value="conciso y directo">Conciso y Directo al Grano</option>
+                  <option value="entusiasta y proactivo">Entusiasta y Proactivo</option>
+                </select>
+              </div>
+
+              <div class="form-group full-width">
+                <label for="customAiInstructions">Instrucciones Adicionales para Claude (System Prompt)</label>
+                <textarea id="customAiInstructions" name="customAiInstructions" rows="3" placeholder="Ej. Enfócate siempre en logros cuantitativos. Si preguntan por proyectos pasados, menciona experiencia con arquitectura escalable."></textarea>
+              </div>
+
+              <div class="form-group full-width">
+                <label for="confirmQuestionBeforeAi">
+                  <input type="checkbox" id="confirmQuestionBeforeAi" name="confirmQuestionBeforeAi" checked>
+                  Confirmar la pregunta antes de redactar
+                </label>
+                <small>Muestra el enunciado que JobFill AI leyó del formulario para que lo apruebes o lo corrijas antes de llamar a Claude. Útil en sitios cuyo formulario no identifica bien sus campos. Aunque lo desactives, se seguirá preguntando cuando la pregunta detectada sea ambigua.</small>
+              </div>
+
+              <div class="form-group full-width">
+                <label>Guardar el cargo de una oferta</label>
+                <small>Usa el botón "📄 Guardar cargo" junto al ícono flotante de JobFill AI en cualquier página de oferta — lee el cargo, la empresa y la descripción, y te los muestra antes de guardarlos. También tiene atajo de teclado (por defecto Ctrl+Shift+0, configurable en <code>chrome://extensions/shortcuts</code>), útil si lo asocias a un botón programable del mouse.</small>
+              </div>
+            </div>
+          </section>
+
+          <!-- TAB 7: Custom Q&A -->
+          <section id="tab-qa" class="tab-panel">
+            <div class="section-desc">Banco de respuestas fijas para preguntas recurrentes sin gastar tokens de la API.</div>
+            
+            <div class="qa-toolbar">
+              <button type="button" class="btn-secondary" id="btnAddQa">+ Agregar Nueva Pregunta</button>
+            </div>
+
+            <div id="qaList" class="qa-cards-list">
+              <!-- Rendered dynamically -->
+            </div>
+          </section>
+
+          <!-- TAB 8: Backup -->
+          <section id="tab-backup" class="tab-panel">
+            <div class="section-desc">Exporta o importa todos tus datos en formato JSON para respaldar o transferir a otro navegador.</div>
+            
+            <div class="backup-actions-grid">
+              <div class="backup-card">
+                <h3>📤 Exportar Perfil</h3>
+                <p>Descarga un archivo JSON con todos tus datos y configuración.</p>
+                <button type="button" class="btn-primary" id="btnExportJson">Descargar Respaldo JSON</button>
+              </div>
+
+              <div class="backup-card">
+                <h3>📥 Importar Perfil</h3>
+                <p>Carga un archivo JSON previamente exportado para restaurar tu perfil.</p>
+                <input type="file" id="importFileInput" accept=".json" style="display: none;">
+                <button type="button" class="btn-secondary" id="btnImportJson">Seleccionar Archivo JSON</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      </form>
+    </main>
+  </div>
+
+  <script src="pdf.min.js"></script>
+  <script src="pdf-parser.js"></script>
+  <script src="options.js"></script>
+</body>
+</html>

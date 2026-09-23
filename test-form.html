@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Página de Prueba - Formulario de Postulación de Empleo</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f1f5f9;
+      color: #1e293b;
+      padding: 40px 20px;
+      line-height: 1.5;
+    }
+    .container {
+      max-width: 720px;
+      margin: 0 auto;
+      background: #ffffff;
+      padding: 32px;
+      border-radius: 12px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.06);
+    }
+    .header {
+      border-bottom: 2px solid #e2e8f0;
+      padding-bottom: 16px;
+      margin-bottom: 24px;
+    }
+    .company-name {
+      color: #6366f1;
+      font-size: 14px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+    h1 {
+      font-size: 24px;
+      margin: 4px 0 8px;
+    }
+    .section-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: #334155;
+      margin: 24px 0 12px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid #cbd5e1;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .full { grid-column: span 2; }
+    .form-group {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    label {
+      font-size: 13px;
+      font-weight: 600;
+      color: #475569;
+    }
+    input, select, textarea {
+      padding: 10px 12px;
+      border: 1px solid #cbd5e1;
+      border-radius: 6px;
+      font-size: 14px;
+      font-family: inherit;
+    }
+    input:focus, select:focus, textarea:focus {
+      outline: 2px solid #6366f1;
+      border-color: #6366f1;
+    }
+    .btn-submit {
+      margin-top: 24px;
+      width: 100%;
+      padding: 12px;
+      background: #4f46e5;
+      color: #fff;
+      border: none;
+      border-radius: 6px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    .banner {
+      background: #e0e7ff;
+      border: 1px solid #c7d2fe;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      color: #3730a3;
+      margin-bottom: 20px;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="banner">
+      💡 <strong>Página de Prueba Local:</strong> Utiliza esta página para probar el botón flotante <strong>⚡ JobFill AI</strong> en la esquina inferior derecha o el popup de la extensión para auto-rellenar.
+    </div>
+
+    <div class="header">
+      <div class="company-name">TechGlobal Innovations</div>
+      <h1 class="job-title">Senior Software Engineer - Full Stack</h1>
+      <p style="color: #64748b; font-size: 13px;">Remoto • Tiempo Completo • USD $3,500 - $5,000</p>
+    </div>
+
+    <form id="jobForm" onsubmit="event.preventDefault(); alert('¡Formulario enviado con éxito!');">
+      <div class="section-title">1. Información Personal</div>
+      <div class="grid">
+        <div class="form-group">
+          <label for="first_name">Nombre (First Name) *</label>
+          <input type="text" id="first_name" name="first_name" placeholder="Tu primer nombre" required>
+        </div>
+        <div class="form-group">
+          <label for="last_name">Apellido (Last Name) *</label>
+          <input type="text" id="last_name" name="last_name" placeholder="Tus apellidos" required>
+        </div>
+        <div class="form-group full">
+          <label for="national_id">RUT / DNI / Cédula de Identidad *</label>
+          <input type="text" id="national_id" name="national_id" placeholder="12.345.678-9 / RUN" required>
+        </div>
+        <div class="form-group">
+          <label for="email">Correo Electrónico *</label>
+          <input type="email" id="email" name="email" placeholder="ejemplo@email.com" required>
+        </div>
+        <div class="form-group">
+          <label for="phone">Teléfono de Contacto *</label>
+          <input type="tel" id="phone" name="phone" placeholder="+56 9..." required>
+        </div>
+        <div class="form-group">
+          <label for="city">Ciudad de Residencia</label>
+          <input type="text" id="city" name="city" placeholder="Ciudad">
+        </div>
+        <div class="form-group">
+          <label for="country">País</label>
+          <input type="text" id="country" name="country" placeholder="País">
+        </div>
+      </div>
+
+      <div class="section-title">2. Enlaces Profesionales</div>
+      <div class="grid">
+        <div class="form-group full">
+          <label for="linkedin">Perfil de LinkedIn URL</label>
+          <input type="url" id="linkedin" name="linkedin" placeholder="https://linkedin.com/in/...">
+        </div>
+        <div class="form-group full">
+          <label for="github">Perfil de GitHub / Portafolio URL</label>
+          <input type="url" id="github" name="github" placeholder="https://github.com/...">
+        </div>
+      </div>
+
+      <div class="section-title">3. Experiencia, Salario y Campos Flexibles</div>
+      <div class="grid">
+        <div class="form-group">
+          <label for="job_title">Cargo Actual / Titular</label>
+          <input type="text" id="job_title" name="job_title">
+        </div>
+        <div class="form-group">
+          <label for="years_experience">Años de Experiencia</label>
+          <input type="number" id="years_experience" name="years_experience">
+        </div>
+        <div class="form-group">
+          <label for="salary_expectation">Expectativa Salarial Bruta</label>
+          <input type="text" id="salary_expectation" name="salary_expectation">
+        </div>
+        <div class="form-group">
+          <label for="net_salary_custom">Renta Líquida Pretendida (Campo Flexible)</label>
+          <input type="text" id="net_salary_custom" name="net_salary_custom" placeholder="Sueldo líquido pretendido">
+        </div>
+        <div class="form-group">
+          <label for="driver_license_input">Licencia de Conducir (Campo Flexible)</label>
+          <input type="text" id="driver_license_input" name="driver_license_input" placeholder="Tipo o clase de licencia">
+        </div>
+        <div class="form-group">
+          <label for="availability">Disponibilidad para Comenzar</label>
+          <input type="text" id="availability" name="availability">
+        </div>
+        <div class="form-group full">
+          <label for="english">Nivel de Inglés</label>
+          <select id="english" name="english">
+            <option value="">Selecciona...</option>
+            <option value="Básico (A1/A2)">Básico (A1/A2)</option>
+            <option value="Intermedio (B1/B2)">Intermedio (B1/B2)</option>
+            <option value="Avanzado / Fluido (C1/C2)">Avanzado / Fluido (C1/C2)</option>
+            <option value="Nativo / Bilingüe">Nativo / Bilingüe</option>
+          </select>
+        </div>
+        <div class="form-group full">
+          <label for="paste_resume">Currículum Vitae / Resume (Texto plano)</label>
+          <textarea id="paste_resume" name="paste_resume" rows="3" placeholder="Pega aquí tu CV completo..."></textarea>
+        </div>
+      </div>
+
+      <div class="section-title">4. Preguntas de Postulación (Prueba de Claude IA ✨)</div>
+      <div class="grid">
+        <div class="form-group full">
+          <label for="motivation_question">¿Por qué te gustaría trabajar en nuestra empresa y qué puedes aportar?</label>
+          <textarea id="motivation_question" name="motivation_question" rows="4" placeholder="Haz clic aquí y pulsa el botón flotante '✨ Redactar con Claude IA' para generar una respuesta a medida..."></textarea>
+        </div>
+        <div class="form-group full">
+          <label for="technical_challenge">Describe un desafío técnico complejo que hayas resuelto recientemente y qué tecnologías utilizaste:</label>
+          <textarea id="technical_challenge" name="technical_challenge" rows="4" placeholder="Pulsa '✨ Redactar con Claude IA' para que redacte tu respuesta basada en tu stack..."></textarea>
+        </div>
+      </div>
+
+      <button type="submit" class="btn-submit">Enviar Postulación de Prueba</button>
+    </form>
+  </div>
+</body>
+</html>

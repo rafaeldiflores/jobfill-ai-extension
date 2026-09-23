@@ -1,0 +1,3695 @@
+/**
+ * JobFill AI - Content Script
+ * Heuristic Autofill Engine & Claude AI Assistant for Job Application Forms
+ */
+
+(function () {
+  if (window.__JOBFILL_AI_LOADED__) return;
+  window.__JOBFILL_AI_LOADED__ = true;
+
+  let activeProfile = null;
+  let currentAiBtn = null;
+
+  /**
+   * Un `<dialog>` nativo abierto con `showModal()` — como el modal "Aplicar"
+   * de Easy Apply en LinkedIn — se pinta en el TOP LAYER del navegador, una
+   * capa por ENCIMA de todo el documento normal que ningún z-index, por alto
+   * que sea, puede superar. Es la causa real de "al mostrar el popup deja de
+   * funcionar": el widget flotante y los diálogos propios seguían viéndose,
+   * pero quedaban detrás del backdrop del modal en el hit-test — los clics
+   * nunca les llegaban.
+   *
+   * Se probó primero promover nuestros propios elementos al top layer con la
+   * Popover API (`showPopover()`), pero verificado contra el modal real de
+   * LinkedIn, NO alcanza: Easy Apply reabre/reemplaza su `<dialog>` en cada
+   * paso del formulario, lo que lo vuelve a empujar al frente del top layer
+   * después de nuestro popover, y el clic se pierde igual. La única forma
+   * fiable es no competir por ORDEN dentro del top layer, sino vivir DENTRO
+   * del propio `<dialog>` ajeno: un hijo de un elemento ya en el top layer
+   * hereda esa posición sin depender de en qué orden se abrió cada cosa —
+   * confirmado en vivo contra el modal de Easy Apply antes de fijar este
+   * enfoque. `position: fixed` en nuestros elementos se sigue calculando
+   * contra el viewport igual que si vivieran en `document.body`: un
+   * `<dialog>` no crea un nuevo "containing block" para descendientes fixed
+   * por el solo hecho de estar en el top layer.
+   */
+  function currentTopLayerHost() {
+    return document.querySelector("dialog[open]") || document.body;
+  }
+
+  function attachToTopLayerHost(el) {
+    const host = currentTopLayerHost();
+    if (el.parentNode !== host) host.appendChild(el);
+  }
+
+  /**
+   * El widget flotante se crea UNA vez al cargar la página, casi siempre
+   * antes de que exista ningún `<dialog>` — así que necesita un vigía que lo
+   * reubique cuando un modal ajeno aparezca (o desaparezca) después. Los
+   * demás elementos (botón ✨, diálogos propios, toasts) se crean bajo
+   * demanda mientras el usuario interactúa, así que simplemente preguntan por
+   * el host correcto en el momento de aparecer — no necesitan este vigía.
+   */
+  let topLayerWatcherAttached = false;
+  function ensureTopLayerWatcher() {
+    if (topLayerWatcherAttached) return;
+    topLayerWatcherAttached = true;
+
+    let pending = false;
+    const recheck = () => {
+      pending = false;
+      const widget = document.querySelector(".jobfill-floating-container");
+      if (widget) attachToTopLayerHost(widget);
+    };
+
+    new MutationObserver(() => {
+      if (pending) return;
+      pending = true;
+      setTimeout(recheck, 200);
+    }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ["open"] });
+  }
+
+  /**
+   * Año de egreso a partir de lo que el perfil tenga guardado en
+   * `education[].year`, que en la práctica llega en formas muy distintas:
+   * "2022", 2022, "2018-2022", "2018 a 2022". Se toma SIEMPRE el último año
+   * de cuatro dígitos: en un rango es el de egreso, y en un valor simple es
+   * el único que hay. Sin ningún año reconocible devuelve "" — el motor trata
+   * eso como "sin dato" y no toca el campo.
+   */
+  function extractGraduationYear(rawYear) {
+    if (rawYear === undefined || rawYear === null) return "";
+    const years = String(rawYear).match(/\b(19|20)\d{2}\b/g);
+    return years ? years[years.length - 1] : "";
+  }
+
+  function normalizeText(str) {
+    if (!str) return "";
+    return str
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[^a-z0-9_\-\s]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  const FIELD_RULES = [
+    {
+      key: "rut",
+      regex: /(rut|run|dni|c[eé]dula|identificaci[oó]n|national[\s_-]?id|tax[\s_-]?id|documento[\s_-]?(de[\s_-]?)?identidad|nif|nie|carnet|passport|pasaporte)/i,
+      getValue: (p) => p.rut
+    },
+    {
+      key: "fullName",
+      regex: /^(full[\s_-]?name|nombre[\s_-]?completo|candidate[\s_-]?name|your[\s_-]?name|nombre[\s_-]?y[\s_-]?apellidos|nombre$|name$)/i,
+      getValue: (p) => p.fullName || `${p.firstName || ""} ${p.lastName || ""}`.trim()
+    },
+    {
+      key: "firstName",
+      // "nombre" a secas solo cuenta si NO va seguido de un calificador que
+      // apunte a otra entidad: "Nombre de la empresa", "Nombre del proyecto",
+      // "Nombre de usuario", "Nombre de la universidad" y "Nombre de contacto
+      // de emergencia" NO son el nombre de pila del candidato. Sin esta
+      // exclusión, esta regla (que además está temprana en el array) secuestraba
+      // todos esos campos.
+      regex: /(first[\s_-]?name|primer[\s_-]?nombre|given[\s_-]?name|fname|forename|nombre(?!\s*(?:completo|y\s+apellido))(?!.*apellido)(?!\s+(?:de|del)\s+(?:la\s+|el\s+|tu\s+|su\s+)?(?:empresa|compa[ñn][ií]a|organizaci[oó]n|instituci[oó]n|universidad|proyecto|usuario|contacto|referencia|supervisor|jefatura|emergencia))|candidate[\s_-]?first)/i,
+      getValue: (p) => p.firstName || (p.fullName ? p.fullName.split(" ")[0] : "")
+    },
+    {
+      // "Segundo Nombre" (middle name) es un campo real y DISTINTO del apellido
+      // en formularios formales chilenos ("Nombre / Segundo Nombre / Apellido
+      // Paterno / Apellido Materno"). Antes vivía por error dentro del regex de
+      // "lastName" (ver abajo) — un formulario con esos 4 campos recibía el
+      // APELLIDO completo en la casilla de segundo nombre.
+      key: "middleName",
+      regex: /(segundo[\s_-]?nombre|middle[\s_-]?name)/i,
+      getValue: (p) => p.middleName
+    },
+    {
+      // "primer apellido" NO va aquí: en español es sinónimo de "apellido
+      // paterno" (legalmente el primer apellido de una persona), y esa
+      // combinación específica ya la cubre la regla lastNamePaternal de abajo,
+      // con un match más largo que le gana por puntaje. Repetirlo aquí
+      // empataría el puntaje de ambas reglas para ese label, y en un empate
+      // gana la primera del array — esta, la genérica — devolviendo el
+      // apellido completo en un campo que solo quiere el paterno.
+      key: "lastName",
+      regex: /(last[\s_-]?name|apellidos?|family[\s_-]?name|lname|surname|candidate[\s_-]?last)/i,
+      getValue: (p) => p.lastName || (p.fullName ? p.fullName.split(" ").slice(1).join(" ") : "")
+    },
+    {
+      // Formularios chilenos suelen pedir el apellido paterno y materno como
+      // DOS campos separados. La regla "lastName" de arriba matchea ambos por
+      // igual (los dos contienen "apellido") y les pegaba el mismo valor
+      // completo a los dos — el bug real: "Díaz Flores" en el campo paterno Y
+      // en el materno. Estas dos reglas son más específicas (match más largo:
+      // "apellido paterno" vs "apellido" a secas), así que el motor de scoring
+      // las prefiere automáticamente sobre la genérica cuando el label trae la
+      // palabra completa "paterno"/"materno".
+      key: "lastNamePaternal",
+      regex: /(apellido[\s_-]?paterno|primer[\s_-]?apellido(?!\s+materno)|paternal[\s_-]?surname|father'?s?[\s_-]?last[\s_-]?name|surname[\s_-]?1)/i,
+      // Convención chilena: el campo "Apellido" del perfil guarda ambos
+      // apellidos juntos ("Díaz Flores"). Sin un campo explícito de paterno,
+      // se toma la PRIMERA palabra — es lo mismo que ya hace este archivo para
+      // derivar firstName/lastName desde fullName (línea 44/49), no una
+      // heurística nueva.
+      getValue: (p) => p.lastNamePaternal || (p.lastName ? p.lastName.trim().split(/\s+/)[0] : "")
+    },
+    {
+      key: "lastNameMaternal",
+      regex: /(apellido[\s_-]?materno|segundo[\s_-]?apellido|maternal[\s_-]?surname|mother'?s?[\s_-]?last[\s_-]?name|surname[\s_-]?2)/i,
+      getValue: (p) => p.lastNameMaternal || (p.lastName ? p.lastName.trim().split(/\s+/).slice(1).join(" ") : "")
+    },
+    {
+      key: "email",
+      regex: /(email|e-mail|correo|correo[\s_-]?electronico|candidate[\s_-]?email)/i,
+      getValue: (p) => p.email
+    },
+    {
+      key: "phone",
+      regex: /(phone|telephone|tel[eé]fono|celular|mobile|phone[\s_-]?number|candidate[\s_-]?phone|numero[\s_-]?contacto)/i,
+      getValue: (p) => p.phone
+    },
+    {
+      // "fecha de nacimiento" ancla en "fecha", así que no compite con "país
+      // de nacimiento" (un campo real y distinto que algunos formularios piden
+      // aparte) — ese no tiene la palabra "fecha", no hace falta excluirlo a mano.
+      key: "birthDate",
+      regex: /(fecha[\s_-]?de[\s_-]?nacimiento|fecha[\s_-]?nacimiento|date[\s_-]?of[\s_-]?birth|birth[\s_-]?date|birthday)/i,
+      // Sin derivación posible: a diferencia de firstName/lastName (que se
+      // pueden partir de fullName), no hay ningún otro dato del que inferir de
+      // forma segura una fecha de nacimiento. Vacío si el usuario no lo cargó.
+      getValue: (p) => p.birthDate
+    },
+    {
+      key: "country",
+      regex: /(country|nationality|pa[ií]s|nacionalidad|citizenship)/i,
+      getValue: (p) => p.country
+    },
+    {
+      key: "city",
+      regex: /(city|ciudad|municipio|provincia|state|region|location|ubicaci[oó]n)/i,
+      getValue: (p) => p.city
+    },
+    {
+      key: "address",
+      regex: /(address|direcci[oó]n|domicilio|street|calle)/i,
+      getValue: (p) => p.address
+    },
+    {
+      key: "postalCode",
+      regex: /(zip|postal|c[oó]digo[\s_-]?postal|pincode)/i,
+      getValue: (p) => p.postalCode
+    },
+    {
+      key: "linkedinUrl",
+      regex: /(linkedin|linked[\s_-]?in|perfil[\s_-]?linkedin)/i,
+      getValue: (p) => p.linkedinUrl
+    },
+    {
+      key: "githubUrl",
+      regex: /(github|git[\s_-]?hub|repositorio)/i,
+      getValue: (p) => p.githubUrl
+    },
+    {
+      key: "portfolioUrl",
+      regex: /(portfolio|portafolio|website|sitio[\s_-]?web|personal[\s_-]?url|blog)/i,
+      getValue: (p) => p.portfolioUrl || p.websiteUrl
+    },
+    {
+      key: "twitterUrl",
+      regex: /(twitter|x[\s_-]?handle|x[\s_-]?profile)/i,
+      getValue: (p) => p.twitterUrl
+    },
+    {
+      key: "currentTitle",
+      regex: /(current[\s_-]?title|job[\s_-]?title|current[\s_-]?position|\bposition\b|cargo[\s_-]?actual|puesto[\s_-]?actual|posici[oó]n|t[ií]tulo[\s_-]?profesional|headline|professional[\s_-]?title|titular)/i,
+      getValue: (p) => p.currentTitle || p.headline || p.cvDatabase?.experiences?.[0]?.role || ""
+    },
+    {
+      key: "currentCompany",
+      // Incluye "nombre de la empresa" / "empresa" a secas: son la forma más
+      // común de pedir el empleador actual en formularios en español, y antes
+      // no matcheaban con nada (la regla exigía "empresa_actual").
+      regex: /(current[\s_-]?company|empresa[\s_-]?actual|empleador[\s_-]?actual|employer|company[\s_-]?name|nombre\s+(?:de\s+la\s+|del?\s+)?(?:empresa|compa[ñn][ií]a)|^empresa$|\bcompa[ñn][ií]a\b)/i,
+      getValue: (p) => p.currentCompany || p.cvDatabase?.experiences?.[0]?.company || ""
+    },
+    {
+      key: "previousCompany",
+      regex: /(previous[\s_-]?company|past[\s_-]?company|previous[\s_-]?employer|past[\s_-]?employer|empresa[\s_-]?anterior|antigua[\s_-]?empresa|empleador[\s_-]?previo)/i,
+      getValue: (p) => p.cvDatabase?.experiences?.[1]?.company || p.cvDatabase?.experiences?.[0]?.company || ""
+    },
+    {
+      key: "previousRole",
+      regex: /(previous[\s_-]?role|past[\s_-]?role|previous[\s_-]?position|past[\s_-]?position|cargo[\s_-]?anterior|puesto[\s_-]?anterior|t[ií]tulo[\s_-]?previo)/i,
+      getValue: (p) => p.cvDatabase?.experiences?.[1]?.role || p.cvDatabase?.experiences?.[0]?.role || ""
+    },
+    {
+      key: "skillsExperience",
+      regex: /(years[\s_]*of[\s_]*(?:work[\s_]*)?experience|a[ñn]os[\s_]*de[\s_]*experiencia|cu[aá]ntos[\s_]*a[ñn]os|experience[\s_]*with|experiencia[\s_]*con)/i,
+      getValue: (p, ctx) => {
+        // If question asks for years with a specific tech, check if candidate has it
+        const norm = normalizeText(ctx || "");
+        const skillsList = (p.skills || "").toLowerCase();
+        const cvRaw = (p.resumeText || "").toLowerCase();
+        
+        // Match tech mentioned in the question
+        const words = norm.split(" ").filter(w => w.length > 2);
+        const hasSpecificTech = words.some(w => skillsList.includes(w) || cvRaw.includes(w));
+        
+        if (hasSpecificTech) {
+          return p.yearsOfExperience || "3";
+        }
+        return p.yearsOfExperience || "3";
+      }
+    },
+    {
+      key: "yearsOfExperience",
+      regex: /(years[\s_]*of[\s_]*experience|a[ñn]os[\s_]*de[\s_]*experiencia|experiencia[\s_]*total|experience[\s_]*years)/i,
+      getValue: (p) => p.yearsOfExperience
+    },
+    {
+      key: "salaryExpectation",
+      regex: /(salary|salario|remuneraci[oó]n|pretensi[oó]n|pretensiones|compensation|expectativa[\s_-]?salarial|desired[\s_-]?salary|renta[\s_-]?l[ií]quida|sueldo)/i,
+      getValue: (p, ctx) => {
+        // If input only accepts numbers (like Getonbrd CLP salary), return clean digits
+        const norm = (ctx || "").toLowerCase();
+        const rawSalary = p.salaryExpectation || "";
+        if (norm.includes("clp") || norm.includes("número") || norm.includes("monto")) {
+          const digits = rawSalary.replace(/[^\d]/g, "");
+          return digits || rawSalary;
+        }
+        return rawSalary ? `${rawSalary} ${p.currency || ""}`.trim() : "";
+      }
+    },
+    {
+      key: "noticePeriod",
+      regex: /(notice[\s_-]?period|disponibilidad|preaviso|availability|start[\s_-]?date|fecha[\s_-]?incorporaci[oó]n)/i,
+      getValue: (p) => p.noticePeriod
+    },
+    // Legal / EEO: existían en el esquema del perfil desde el principio, pero
+    // sin NINGUNA regla que las reconociera — solo un respaldo para grupos de
+    // radio/checkbox (más abajo en este archivo) cubría legallyAuthorized y
+    // requiresSponsorship, y willingToRelocate/workPreference/gender no tenían
+    // absolutamente ninguna cobertura. Un formulario que las pidiera como
+    // <select> (lo más común) quedaba con esos campos vacíos siempre.
+    {
+      key: "legallyAuthorized",
+      regex: /(legally[\s_-]?authorized|autorizad[oa]?[\s_-]?(?:para|a)?[\s_-]?trabajar|work[\s_-]?permit|permiso[\s_-]?de[\s_-]?trabajo|authorized[\s_-]?to[\s_-]?work)/i,
+      getValue: (p) => p.legallyAuthorized
+    },
+    {
+      key: "requiresSponsorship",
+      regex: /(sponsorship|patrocinio|visa|visado|requiere[\s_-]?patrocinio)/i,
+      // La pregunta casi siempre se formula en positivo ("¿requieres
+      // patrocinio?"), así que se invierte el valor guardado ("no requiero" =
+      // profile "no") a lo que hay que responder. Un <select> con las opciones
+      // invertidas es indistinguible de uno normal por el label del campo, así
+      // que esto es lo mejor que se puede hacer sin ver las opciones — el
+      // respaldo de radio/checkbox más abajo sigue cubriendo ese caso mejor,
+      // comparando contra el texto real de cada opción.
+      getValue: (p) => p.requiresSponsorship
+    },
+    {
+      key: "willingToRelocate",
+      regex: /(willing[\s_-]?to[\s_-]?relocate|relocation|reubicaci[oó]n|reubicarte|disposici[oó]n[\s_-]?a[\s_-]?(?:la[\s_-]?)?reubicaci[oó]n|open[\s_-]?to[\s_-]?relocat)/i,
+      getValue: (p) => p.willingToRelocate
+    },
+    {
+      key: "workPreference",
+      regex: /(work[\s_-]?preference|modalidad[\s_-]?de[\s_-]?trabajo|modalidad[\s_-]?preferida|preferred[\s_-]?work[\s_-]?mode|work[\s_-]?mode|work[\s_-]?arrangement)/i,
+      getValue: (p) => p.workPreference
+    },
+    {
+      // Vacío por defecto (ver options.html): a diferencia del resto de estas
+      // reglas, aquí "sin dato" es la respuesta correcta más a menudo que no —
+      // getValue devuelve "" cuando el usuario no eligió nada, y una regla que
+      // no da valor simplemente no se aplica (el motor pasa a la siguiente).
+      key: "gender",
+      regex: /(^gender$|g[eé]nero|sexo(?!\s+de\s+la\s+empresa))/i,
+      getValue: (p) => (p.gender === "female" ? "Femenino" : p.gender === "male" ? "Masculino" : p.gender === "other" ? "Otro" : "")
+    },
+    {
+      key: "englishLevel",
+      regex: /(english|ingl[eé]s|idioma[\s_-]?ingl[eé]s|language[\s_-]?level|english[\s_-]?level)/i,
+      getValue: (p) => p.englishLevel
+    },
+    {
+      key: "degree",
+      regex: /(degree|t[ií]tulo[\s_-]?acad[eé]mico|carrera|estudios|licenciatura|ingenier[ií]a)/i,
+      getValue: (p) => p.degree
+    },
+    {
+      key: "university",
+      regex: /(university|universidad|instituci[oó]n|college|school|facultad)/i,
+      getValue: (p) => p.university
+    },
+    {
+      // "Overall Result (GPA)" en Workday, "Promedio" en portales locales.
+      // Token distintivo: `gpa` con límite de palabra no colisiona con nada
+      // más del formulario.
+      key: "gpa",
+      regex: /\bgpa\b|promedio(?:[\s_-]?de[\s_-]?notas)?|overall[\s_-]?result|grade[\s_-]?point/i,
+      getValue: (p) => p.gpa
+    },
+    {
+      // Año de egreso/titulación. El label de Workday es "To (Actual or
+      // Expected)" — un "To" a secas sería peligrosísimo (la sección de
+      // experiencia laboral también tiene From/To y quedaría el año de
+      // estudios en el cargo), así que se exige la frase completa que
+      // distingue al campo de educación.
+      //
+      // No hay regla equivalente para el "From": el perfil guarda UN año por
+      // estudio (el de egreso), no un rango. Rellenar el año de inicio
+      // exigiría inventarlo restando una duración supuesta.
+      key: "educationEndYear",
+      regex: /to[\s_-]?\(actual[\s_-]?or[\s_-]?expected\)|a[ñn]o[\s_-]?de[\s_-]?(?:egreso|titulaci[oó]n)|graduation[\s_-]?year/i,
+      getValue: (p) => extractGraduationYear(p.cvDatabase?.education?.[0]?.year)
+    },
+    {
+      // "Field of Study" (Workday y similares): un typeahead, no un texto
+      // libre — se rellena vía commitComboboxSelectionIfNeeded (detecta el
+      // contenedor `multiSelectContainer`). Sin un campo dedicado en el
+      // perfil, reutiliza `degree`: en la mayoría de los formularios el
+      // nombre de la carrera ES la disciplina que este campo pide. Si el
+      // sitio lista sus opciones en otro idioma y ninguna refleja lo
+      // tecleado, el motor de combobox simplemente no elige nada — no inventa
+      // una opción parecida.
+      key: "fieldOfStudy",
+      regex: /field[\s_-]?of[\s_-]?study|campo[\s_-]?de[\s_-]?estudio|especialidad|\bmajor\b/i,
+      getValue: (p) => p.degree
+    },
+    {
+      key: "skills",
+      regex: /(skills|technolog(?:y|ies)|habilidades|competencias|tecnolog[ií]as|stack)/i,
+      getValue: (p) => p.skills
+    },
+    {
+      key: "summary",
+      regex: /(summary|resumen|about[\s_-]?you|sobre[\s_-]?ti|cover[\s_-]?letter|carta[\s_-]?de[\s_-]?presentaci[oó]n|presentaci[oó]n|bio|mensaje|introduction)/i,
+      getValue: (p) => p.summary
+    },
+    {
+      key: "resumeText",
+      regex: /(curriculum|resume|cv|curriculum[\s_-]?vitae|hoja[\s_-]?de[\s_-]?vida|paste[\s_-]?resume|paste[\s_-]?cv|texto[\s_-]?cv)/i,
+      getValue: (p) => p.resumeText || p.summary
+    }
+  ];
+
+  async function loadProfile() {
+    return new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "GET_PROFILE" }, (response) => {
+        if (response && response.success && response.profile) {
+          activeProfile = response.profile;
+          resolve(activeProfile);
+        } else {
+          resolve(null);
+        }
+      });
+    });
+  }
+
+  function setElementValue(el, value) {
+    if (!el || value === undefined || value === null || value === "") return false;
+
+    // Rich Text / Trix Editor (Getonbrd / Modern Portals)
+    if (el.tagName === "TRIX-EDITOR") {
+      if (el.editor && typeof el.editor.loadHTML === "function") {
+        el.editor.loadHTML(value);
+      } else {
+        el.innerText = value;
+      }
+      el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      el.classList.add("jobfill-highlight-success");
+      setTimeout(() => el.classList.remove("jobfill-highlight-success"), 2500);
+      return true;
+    }
+
+    // ContentEditable elements
+    if (el.isContentEditable) {
+      el.innerText = value;
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: String(value) }));
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      el.classList.add("jobfill-highlight-success");
+      setTimeout(() => el.classList.remove("jobfill-highlight-success"), 2500);
+      return true;
+    }
+
+    // React 16-19 / Modern framework value tracker bypass
+    const tracker = el._valueTracker;
+    if (tracker) {
+      tracker.setValue("");
+    }
+
+    const nativeInputValueSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLInputElement.prototype,
+      "value"
+    )?.set;
+    const nativeTextAreaValueSetter = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype,
+      "value"
+    )?.set;
+
+    if (el.tagName === "TEXTAREA" && nativeTextAreaValueSetter) {
+      nativeTextAreaValueSetter.call(el, value);
+    } else if (el.tagName === "INPUT" && nativeInputValueSetter) {
+      nativeInputValueSetter.call(el, value);
+    } else {
+      el.value = value;
+    }
+
+    // Comprehensive synthetic events for React, Angular, Vue, Svelte, Web Components
+    try {
+      el.dispatchEvent(new Event("keydown", { bubbles: true, composed: true }));
+      el.dispatchEvent(new Event("keypress", { bubbles: true, composed: true }));
+      el.dispatchEvent(new Event("keyup", { bubbles: true, composed: true }));
+      el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: String(value) }));
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      el.dispatchEvent(new Event("blur", { bubbles: true, composed: true }));
+    } catch (e) {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true }));
+    }
+
+    el.classList.add("jobfill-highlight-success");
+    setTimeout(() => {
+      el.classList.remove("jobfill-highlight-success");
+    }, 2500);
+
+    return true;
+  }
+
+  /**
+   * Confirma la selección de un `<input role="combobox">` (react-select y
+   * librerías similares — el caso real que lo motivó: el selector de país del
+   * widget de teléfono en formularios de Greenhouse). Escribir texto ahí SOLO
+   * filtra la lista de opciones que la librería re-renderiza; el valor que el
+   * formulario usa de verdad para validar/enviar sigue vacío hasta que se
+   * hace clic en una opción — un simple `.value = "Chile"` deja el campo con
+   * texto tipeado pero SIN nada seleccionado, y el envío fallaría igual.
+   *
+   * No se asume que la lista de opciones que aparece es la correcta: puede
+   * haber más de un `[role="listbox"]` en la página (un widget vecino no
+   * relacionado, ya montado aunque cerrado — es justo lo que pasa en este
+   * mismo formulario de Greenhouse con el selector de código telefónico). Se
+   * identifica el listbox correcto por ser el que de verdad reflejó lo que se
+   * escribió (su primera opción CONTIENE el valor tecleado), no por ser el
+   * primero que aparezca en el documento. Si ninguno da esa confianza, no se
+   * hace clic en nada — mismo comportamiento que hoy, sin regresión.
+   */
+  /**
+   * Decide CUÁL opción hay que clicar, dada la lista de listboxes presentes en
+   * el documento — separada de `commitComboboxSelectionIfNeeded` a propósito
+   * para que sea una función pura y síncrona, testeable sin DOM real ni
+   * temporizadores (mismo criterio que ya se usó para `computeCropRect`).
+   *
+   * Devuelve el elemento opción a clicar, o `null` si ningún listbox refleja
+   * con confianza lo que se escribió.
+   */
+  /**
+   * Equivalente en inglés del área de estudios, para reintentar la búsqueda
+   * cuando el formulario lista sus opciones en inglés y el perfil está en
+   * español. Es una tabla corta y deliberadamente conservadora: solo áreas
+   * cuya traducción es unívoca. Ante cualquier duda no devuelve nada y el
+   * campo se queda vacío, que es preferible a seleccionar una carrera que no
+   * es la del candidato.
+   *
+   * Se compara sobre el texto normalizado y por CONTENIDO, no por igualdad:
+   * el perfil guarda "Ingeniería Civil en Informática", no "informatica".
+   */
+  const STUDY_FIELD_TRANSLATIONS = [
+    { re: /inform[aá]tic|computaci[oó]n|computer/i, en: "Computer Science" },
+    { re: /sistemas/i, en: "Information Systems" },
+    { re: /software/i, en: "Software Engineering" },
+    { re: /industrial/i, en: "Industrial Engineering" },
+    { re: /civil(?!\s+en)/i, en: "Civil Engineering" },
+    { re: /electr[oó]nic/i, en: "Electronics" },
+    { re: /el[eé]ctric/i, en: "Electrical Engineering" },
+    { re: /mec[aá]nic/i, en: "Mechanical Engineering" },
+    { re: /telecomunicaci/i, en: "Telecommunications" },
+    { re: /comercial|negocios|administraci[oó]n de empresas/i, en: "Business Administration" },
+    { re: /contabilidad|contador|auditor[ií]a/i, en: "Accounting" },
+    { re: /econom[ií]a/i, en: "Economics" },
+    { re: /marketing|mercadotecnia/i, en: "Marketing" },
+    { re: /dise[ñn]o/i, en: "Design" },
+    { re: /derecho|abogac[ií]a/i, en: "Law" },
+    { re: /psicolog[ií]a/i, en: "Psychology" },
+    { re: /matem[aá]tic/i, en: "Mathematics" },
+    { re: /estad[ií]stic/i, en: "Statistics" },
+    { re: /datos|data/i, en: "Data Science" }
+  ];
+
+  function translateStudyFieldToEnglish(text) {
+    if (!text) return "";
+    const norm = normalizeText(text);
+    if (!norm) return "";
+    const match = STUDY_FIELD_TRANSLATIONS.find(entry => entry.re.test(norm));
+    return match ? match.en : "";
+  }
+
+  function findMatchingComboboxOption(listboxes, typedValue) {
+    const typedNorm = normalizeText(typedValue);
+    if (!typedNorm) return null;
+
+    for (const listbox of listboxes) {
+      const firstOption = listbox.querySelector('[role="option"]');
+      if (!firstOption) continue;
+      if (!normalizeText(firstOption.innerText || "").includes(typedNorm)) continue;
+      return firstOption;
+    }
+    return null;
+  }
+
+  async function commitComboboxSelectionIfNeeded(el, typedValue) {
+    // `role="combobox"` cubre react-select y similares (el caso original,
+    // Greenhouse). Workday usa el mismo patrón de "escribir filtra, hay que
+    // clicar para confirmar" pero sin ese role — su input vive dentro de un
+    // contenedor propio (`multiSelectContainer`, visto en el campo "Field of
+    // Study"), así que se detecta por ahí también.
+    const isReactSelectCombobox = el && el.getAttribute("role") === "combobox";
+    const isWorkdayMultiSelect = el && !!el.closest("[data-automation-id='multiSelectContainer']");
+    if (!el || (!isReactSelectCombobox && !isWorkdayMultiSelect)) return false;
+
+    try {
+      // Un ciclo de render de React no es instantáneo tras despachar los
+      // eventos de input — hay que esperar un instante a que la librería
+      // termine de filtrar y montar la lista antes de buscarla.
+      await new Promise(r => setTimeout(r, 200));
+
+      let option = findMatchingComboboxOption(document.querySelectorAll('[role="listbox"]'), typedValue);
+
+      // Reintento en inglés: muchos formularios internacionales (Workday es el
+      // caso típico) listan sus opciones en inglés aunque el resto del sitio
+      // esté en español, así que "Ingeniería en Informática" no encuentra
+      // nada aunque "Computer Science" sí exista en la lista. Se vuelve a
+      // teclear con el término equivalente y se busca otra vez.
+      if (!option) {
+        const englishTerm = translateStudyFieldToEnglish(typedValue);
+        if (englishTerm) {
+          setElementValue(el, englishTerm);
+          await new Promise(r => setTimeout(r, 300));
+          option = findMatchingComboboxOption(document.querySelectorAll('[role="listbox"]'), englishTerm);
+        }
+      }
+
+      if (!option) return false;
+
+      option.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, composed: true }));
+      option.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, composed: true }));
+      option.click();
+      return true;
+    } catch (e) {
+      console.warn("[JobFill AI] No se pudo confirmar la selección del combobox:", e);
+      return false;
+    }
+  }
+
+  /**
+   * Dispara `trigger` (clic en un botón, tipear en un input) y devuelve el
+   * `[role="listbox"]` que aparece COMO CONSECUENCIA — nunca "el primero del
+   * documento". Puede haber más de uno montado (otro campo del mismo tipo ya
+   * abierto, o un widget vecino sin relación); a diferencia del combobox de
+   * Greenhouse, aquí no siempre hay texto tecleado con el que comparar el
+   * contenido (un botón como "Degree" no escribe nada), así que se
+   * distingue por APARICIÓN: el que no estaba antes de disparar la acción.
+   */
+  async function openListboxVia(trigger) {
+    const before = new Set(document.querySelectorAll('[role="listbox"]'));
+    await trigger();
+    await new Promise(r => setTimeout(r, 350));
+    const after = Array.from(document.querySelectorAll('[role="listbox"]'));
+    return after.find(lb => !before.has(lb)) || null;
+  }
+
+  /**
+   * Rellena un widget "botón que abre un listbox" (patrón ARIA
+   * `aria-haspopup="listbox"` — el "Degree" de Workday es el caso real que lo
+   * motivó, pero el patrón es común a varias librerías de componentes). No
+   * escribe nada: abre el listbox, deja que `matcher` elija cuál opción
+   * corresponde de las que el sitio ofrece realmente, y hace clic en ella. Si
+   * `matcher` no encuentra ninguna, se cierra el listbox sin tocar nada —
+   * mismo criterio de "sin pruebas suficientes, no adivinar" que el resto del
+   * motor.
+   */
+  async function fillListboxButtonField(button, matcher) {
+    try {
+      const listbox = await openListboxVia(async () => button.click());
+      if (!listbox) return false;
+
+      const options = Array.from(listbox.querySelectorAll('[role="option"]'));
+      const target = options.find(o => matcher(o.textContent.trim()));
+      if (!target) {
+        button.click(); // cierra el listbox sin elegir nada
+        return false;
+      }
+
+      target.click();
+      return true;
+    } catch (e) {
+      // Mismo criterio que el combobox: un widget que se comporta distinto a
+      // lo esperado deja el campo sin tocar, nunca tumba la pasada completa.
+      console.warn("[JobFill AI] No se pudo usar el listbox del botón:", e);
+      return false;
+    }
+  }
+
+  /**
+   * Caso concreto de `fillListboxButtonField`: el "Degree" de Workday. Solo
+   * actúa si el contexto del botón matchea la misma regla `degree` que ya usa
+   * el motor genérico — así una futura regla de FIELD_RULES para "degree" se
+   * sigue aplicando aquí sin duplicar el patrón.
+   */
+  async function tryFillCustomListboxButton(el, profile, textContext) {
+    if (el.tagName !== "BUTTON" || el.getAttribute("aria-haspopup") !== "listbox") return false;
+
+    const degreeRule = FIELD_RULES.find(r => r.key === "degree");
+    if (!degreeRule || !degreeRule.regex.test(textContext)) return false;
+
+    const level = classifyDegreeLevel(profile.degree || "");
+    if (!level) return false;
+
+    return fillListboxButtonField(el, text => findMatchingDegreeOptionIndex([text], level) === 0);
+  }
+
+  function setSelectValue(select, targetText) {
+    if (!select || !targetText) return false;
+    const targetNorm = normalizeText(targetText);
+    const targetWords = targetNorm.split(" ").filter(w => w.length > 1);
+
+    const options = Array.from(select.options);
+    let matchedOption = null;
+
+    // 1. Exact match on value or text
+    for (let opt of options) {
+      const optTextNorm = normalizeText(opt.text);
+      const optValNorm = normalizeText(opt.value);
+      if (optTextNorm === targetNorm || optValNorm === targetNorm) {
+        matchedOption = opt;
+        break;
+      }
+    }
+
+    // 2. Substring match
+    if (!matchedOption) {
+      for (let opt of options) {
+        const optTextNorm = normalizeText(opt.text);
+        if (optTextNorm.includes(targetNorm) || targetNorm.includes(optTextNorm)) {
+          matchedOption = opt;
+          break;
+        }
+      }
+    }
+
+    // 3. CEFR Language Level Detection (e.g. A1, A2, B1, B2, C1, C2)
+    if (!matchedOption) {
+      const cefrMatch = targetText.match(/\b([ABC][12])\b/i);
+      if (cefrMatch) {
+        const level = cefrMatch[1].toUpperCase();
+        matchedOption = options.find(opt => opt.text.toUpperCase().includes(level) || opt.value.toUpperCase().includes(level));
+      }
+    }
+
+    // 4. Token overlap score
+    if (!matchedOption && targetWords.length > 0) {
+      let maxScore = 0;
+      for (let opt of options) {
+        const optNorm = normalizeText(opt.text) + " " + normalizeText(opt.value);
+        const score = targetWords.filter(w => optNorm.includes(w)).length;
+        if (score > maxScore) {
+          maxScore = score;
+          matchedOption = opt;
+        }
+      }
+    }
+
+    if (matchedOption) {
+      select.value = matchedOption.value;
+      select.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      select.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      select.classList.add("jobfill-highlight-success");
+      setTimeout(() => select.classList.remove("jobfill-highlight-success"), 2500);
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * Grupos de radio/checkbox de OPCIÓN ÚNICA que el motor genérico de
+   * `executeAutofill` no sabe rellenar: ese motor (más abajo, sección
+   * `applyRuleValue`) solo marca una opción cuando el valor guardado es
+   * literalmente "yes" — no tiene forma de marcar la opción "no" de un grupo
+   * binario, y mucho menos elegir entre un enum de 3+ alternativas como
+   * modalidad de trabajo o género.
+   *
+   * Antes esto se resolvía con dos bloques `if/else` escritos a mano, uno por
+   * cada campo (legallyAuthorized, requiresSponsorship) — funcionaban, pero
+   * cualquier campo nuevo de este mismo tipo (willingToRelocate,
+   * workPreference, gender) se quedaba sin ningún respaldo hasta que alguien
+   * copiara y adaptara el bloque a mano. Esta tabla es esa misma lógica
+   * generalizada: cómo reconocer el GRUPO en el formulario (`groupRegex`), y
+   * para cada valor posible del perfil, qué palabras identifican la opción
+   * correspondiente dentro del grupo (`optionVariants`).
+   */
+  const RADIO_GROUP_FIELDS = [
+    {
+      profileKey: "requiresSponsorship",
+      groupRegex: /sponsorship|patrocinio|visa|visado|requiere[\s_-]?patrocinio/i,
+      optionVariants: { yes: ["yes", "si", "true"], no: ["no", "false"] }
+    },
+    {
+      profileKey: "legallyAuthorized",
+      groupRegex: /authorized|autorizado|legalmente|work[\s_-]?permit|permiso[\s_-]?de[\s_-]?trabajo/i,
+      optionVariants: { yes: ["yes", "si", "true"], no: ["no", "false"] }
+    },
+    {
+      profileKey: "willingToRelocate",
+      groupRegex: /willing[\s_-]?to[\s_-]?relocate|relocation|reubicaci[oó]n|reubicarte|mudarte|trasladarte/i,
+      optionVariants: { yes: ["yes", "si", "true"], no: ["no", "false"] }
+    },
+    {
+      profileKey: "workPreference",
+      groupRegex: /work[\s_-]?preference|modalidad[\s_-]?de[\s_-]?trabajo|modalidad[\s_-]?preferida|work[\s_-]?mode|work[\s_-]?arrangement/i,
+      optionVariants: {
+        remote: ["remote", "remoto", "teletrabajo"],
+        hybrid: ["hybrid", "hibrido", "mixto"],
+        onsite: ["onsite", "on site", "on-site", "presencial", "in office", "oficina"]
+      }
+    },
+    {
+      profileKey: "gender",
+      groupRegex: /^gender$|g[eé]nero|sexo/i,
+      optionVariants: {
+        female: ["female", "woman", "femenino", "mujer"],
+        male: ["male", "man", "masculino", "hombre"],
+        other: ["other", "otro", "otra", "prefer not", "prefiero no"]
+      }
+    }
+  ];
+
+  /**
+   * ¿El texto de ESTA opción del grupo (su `value`, o el texto del formulario
+   * a su alrededor) corresponde a alguna de las variantes dadas?
+   *
+   * Se compara por PALABRA COMPLETA (`\b...\b`), no por substring: sin el
+   * límite de palabra, la variante "no" matchearía dentro de "Noruega", y la
+   * variante "male" matchearía dentro de "female" — ambos son el tipo exacto
+   * de falso positivo que un simple `.includes()` produciría aquí.
+   */
+  function matchesAnyOptionVariant(text, variants) {
+    const norm = normalizeText(text || "");
+    return variants.some(variant => {
+      const escaped = variant.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      return new RegExp(`\\b${escaped}\\b`, "i").test(norm);
+    });
+  }
+
+  /**
+   * El "Degree" de Workday (y de otros ATS con el mismo patrón) no es un
+   * campo de texto libre: es un NIVEL estandarizado — "Bachelor of Science
+   * (BS)", "Masters of Arts (MA)", "FPII/Higher Technical Diploma" — nunca el
+   * nombre de la carrera. El perfil guarda el nombre ("Ingeniería en
+   * Informática"), así que hace falta traducir uno al otro. No se intenta un
+   * match exacto de texto (cada sitio redacta las opciones distinto); se
+   * clasifica el perfil en una categoría amplia y luego se busca esa
+   * categoría, con sinónimos, en las opciones reales que ofrezca el sitio.
+   *
+   * Orden intencional: de más específico (doctorado) a menos, porque un
+   * texto puede matchear más de un patrón ("Magíster en Ingeniería" toca
+   * tanto `master` como `bachelor` vía "ingenier") y debe ganar el más alto.
+   */
+  const DEGREE_LEVEL_PATTERNS = [
+    { level: "phd", re: /doctor|ph\.?\s?d\b/i },
+    { level: "master", re: /master|maestr[ií]a|mag[ií]ster|mba/i },
+    { level: "bachelor", re: /ingenier[ií]a|licenciatura|licenciado|bachelor/i },
+    { level: "associate", re: /t[eé]cnico|technical|associate|diploma/i },
+    { level: "highschool", re: /media|secundari[ao]|high\s?school|bachillerato/i }
+  ];
+
+  function classifyDegreeLevel(text) {
+    if (!text) return null;
+    for (const { level, re } of DEGREE_LEVEL_PATTERNS) {
+      if (re.test(text)) return level;
+    }
+    return null;
+  }
+
+  const DEGREE_LEVEL_OPTION_KEYWORDS = {
+    phd: [/doctor/i, /ph\.?\s?d/i],
+    master: [/master/i, /mag[ií]ster/i, /mba/i],
+    bachelor: [/bachelor/i, /licenciatura/i, /professional/i, /^ingenier/i],
+    associate: [/associate/i, /t[eé]cnic/i, /^diploma/i],
+    highschool: [/high\s?school/i, /secondary/i, /bachillerato/i]
+  };
+
+  /**
+   * Dado el nivel ya clasificado, busca en las opciones REALES del sitio (no
+   * en una lista fija propia, que quedaría desactualizada) cuál corresponde.
+   * Sin match — nivel no reconocido o ninguna opción del sitio lo nombra —
+   * no se elige nada: adivinar aquí firmaría el formulario con un nivel de
+   * estudios que no es el del candidato.
+   */
+  function findMatchingDegreeOptionIndex(optionTexts, level) {
+    const patterns = DEGREE_LEVEL_OPTION_KEYWORDS[level];
+    if (!patterns) return -1;
+    return optionTexts.findIndex(text => patterns.some(p => p.test(text)));
+  }
+
+  function stemWord(word) {
+    return word.replace(/(?:es|as|os|ar|er|ir|ado|ido|ando|iendo|cion|s)$/i, "");
+  }
+
+  function matchesQaAdvanced(formContext, qaKeywords) {
+    const normContext = normalizeText(formContext);
+    const contextWords = normContext.split(" ").filter(w => w.length > 2);
+    const contextStems = contextWords.map(stemWord);
+
+    const kwPhrases = qaKeywords.split(/[,;\n]+/).map(k => normalizeText(k)).filter(Boolean);
+    
+    return kwPhrases.some(phrase => {
+      if (normContext.includes(phrase)) return true;
+      const phraseWords = phrase.split(" ").filter(w => w.length > 2);
+      if (phraseWords.length === 0) return false;
+      
+      return phraseWords.every(pw => {
+        const pwStem = stemWord(pw);
+        return contextStems.some(cs => cs.includes(pwStem) || pwStem.includes(cs));
+      });
+    });
+  }
+
+  /**
+   * Busca el texto visible más cercano a `el` por posición real en pantalla
+   * (arriba o a la izquierda), sin depender de ningún nombre de clase CSS.
+   * Solo se invoca como último recurso desde getFieldContext — ver el
+   * comentario en el call site sobre cuándo se activa.
+   */
+  function findLabelByVisualProximity(el) {
+    const elRect = el.getBoundingClientRect();
+    if (elRect.width === 0 && elRect.height === 0) return "";
+
+    // Acotar la búsqueda a un ancestro razonable en vez de todo el documento:
+    // evita agarrar texto de secciones completamente distintas de la página.
+    let scopeRoot = el;
+    for (let i = 0; i < 8 && scopeRoot.parentElement && scopeRoot.parentElement !== document.body; i++) {
+      scopeRoot = scopeRoot.parentElement;
+    }
+
+    let candidates;
+    try {
+      candidates = Array.from(scopeRoot.querySelectorAll("label, span, div, p, td, th, dt, strong, b, legend"));
+    } catch (e) {
+      return "";
+    }
+
+    let best = "";
+    let bestScore = Infinity;
+
+    for (const node of candidates) {
+      if (node.contains(el) || el.contains(node)) continue;
+      if (node.children.length > 2) continue; // probablemente un contenedor, no el texto del label
+      const text = node.innerText?.trim();
+      if (!text || text.length < 2 || text.length > 100) continue;
+
+      const r = node.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) continue;
+
+      const isAbove = r.bottom <= elRect.top + 4;
+      const isLeft = r.right <= elRect.left + 4;
+      const horizontallyAligned = r.left < elRect.right && r.right > elRect.left - 40;
+      const verticallyAligned = r.top < elRect.bottom + 10 && r.bottom > elRect.top - 10;
+
+      if (!((isAbove && horizontallyAligned) || (isLeft && verticallyAligned))) continue;
+
+      const dx = isLeft ? (elRect.left - r.right) : 0;
+      const dy = isAbove ? (elRect.top - r.bottom) : 0;
+      const score = Math.sqrt(dx * dx + dy * dy);
+
+      if (score < bestScore) {
+        bestScore = score;
+        best = text;
+      }
+    }
+
+    return best;
+  }
+
+  /**
+   * Devuelve el contexto del campo SEPARADO POR ORIGEN, no como un solo string.
+   *
+   * El origen importa muchísimo para la precisión: el <label> visible del campo
+   * es evidencia fortísima de qué campo es, mientras que el blob de atributos
+   * (name/id generados) o el texto de un elemento vecino son pistas débiles y
+   * ruidosas. Aplanarlo todo en un string hacía que un match accidental en el
+   * texto vecino pesara igual que el label real del campo.
+   */
+  function getFieldContextParts(el) {
+    const label = [];
+    const attrs = [];
+    const nearby = [];
+
+    if (el.id) attrs.push(el.id);
+    if (el.name) attrs.push(el.name);
+    if (el.placeholder) attrs.push(el.placeholder);
+    if (el.title) attrs.push(el.title);
+    if (el.getAttribute("aria-label")) attrs.push(el.getAttribute("aria-label"));
+    if (el.getAttribute("aria-description")) attrs.push(el.getAttribute("aria-description"));
+    if (el.getAttribute("data-automation-id")) attrs.push(el.getAttribute("data-automation-id"));
+    if (el.getAttribute("data-testid")) attrs.push(el.getAttribute("data-testid"));
+    if (el.getAttribute("data-test-form-builder-element")) attrs.push(el.getAttribute("data-test-form-builder-element"));
+
+    // Check LinkedIn / Modern fieldset & legend context
+    const fieldset = el.closest("fieldset, [role='radiogroup'], [role='group']");
+    if (fieldset) {
+      const legend = fieldset.querySelector("legend, [role='heading'], .fb-form-element-label, .t-14, .label");
+      if (legend && legend.innerText) label.push(legend.innerText);
+    }
+
+    const labelledBy = el.getAttribute("aria-labelledby") || el.getAttribute("aria-describedby");
+    if (labelledBy) {
+      labelledBy.split(" ").forEach(id => {
+        try {
+          const labelEl = document.getElementById(id);
+          if (labelEl && labelEl.innerText) label.push(labelEl.innerText);
+        } catch (e) {}
+      });
+    }
+
+    if (el.id) {
+      try {
+        const forLabel = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (forLabel && forLabel.innerText) label.push(forLabel.innerText);
+      } catch (e) {}
+    }
+
+    const parentLabel = el.closest("label, .fb-form-element-label, .gb-label, .form-label");
+    if (parentLabel && parentLabel.innerText) label.push(parentLabel.innerText);
+
+    const context = label; // los pasos siguientes empujan etiquetas reales
+    let foundContainerLabel = false;
+    const container = el.closest(".form-group, .field, [class*='question'], [class*='field'], [class*='form-row'], .fb-single-line-text, .fb-dropdown, .gb-form-group, .input-container");
+    if (container) {
+      const labelEl = container.querySelector("label, .label, [class*='label'], [class*='title'], [class*='heading'], h3, h4, legend, span.label-text, p.help-block");
+      if (labelEl && labelEl.innerText && labelEl.innerText.length < 180) {
+        context.push(labelEl.innerText);
+        foundContainerLabel = true;
+      }
+    }
+
+    // Respaldo para widgets sin ninguna clase semántica reconocible (p. ej. los
+    // componentes <lyte-input>/<crux-*-component> de Zoho Recruit): el label
+    // real vive como HERMANO ANTERIOR de un ancestro varios niveles arriba, no
+    // dentro de ningún contenedor con clase reconocible. Un simple
+    // `el.closest("div")` se queda pegado en el primer <div> envoltorio
+    // inmediato (normalmente vacío) y nunca sube lo suficiente — por eso
+    // formularios enteros (Zoho Recruit y similares) no detectaban NINGÚN
+    // campo. Se sube ancestro por ancestro buscando un label hermano o interno.
+    let foundAncestorLabel = false;
+    if (!foundContainerLabel) {
+      let node = el.parentElement;
+      for (let depth = 0; depth < 6 && node && node !== document.body; depth++) {
+        const prevSibling = node.previousElementSibling;
+        if (prevSibling && (prevSibling.tagName === "LABEL" || /label/i.test(prevSibling.className || "")) && prevSibling.innerText?.trim() && prevSibling.innerText.length < 180) {
+          context.push(prevSibling.innerText);
+          foundAncestorLabel = true;
+          break;
+        }
+        const innerLabel = node.querySelector?.("label, [class*='label']");
+        if (innerLabel && innerLabel.innerText?.trim() && innerLabel.innerText.length < 180) {
+          context.push(innerLabel.innerText);
+          foundAncestorLabel = true;
+          break;
+        }
+        node = node.parentElement;
+      }
+    }
+
+    // Último recurso, solo si TODO lo anterior (clase semántica + caminata de
+    // ancestros) no encontró nada: buscar el texto visible más cercano al campo
+    // por POSICIÓN EN PANTALLA (arriba o a la izquierda), igual que hace el
+    // autofill nativo del navegador. Es más caro y algo menos preciso que un
+    // selector afinado a un sitio conocido, así que nunca reemplaza los pasos
+    // anteriores — solo cubre el hueco cuando el sitio usa un esquema de
+    // marcado que nunca hemos visto y ni siquiera tiene una jerarquía DOM
+    // razonable entre el label y el campo.
+    if (!foundContainerLabel && !foundAncestorLabel) {
+      const proximityLabel = findLabelByVisualProximity(el);
+      if (proximityLabel) context.push(proximityLabel);
+    }
+
+    let prev = el.previousElementSibling;
+    if (prev && (prev.tagName === "LABEL" || prev.tagName === "SPAN" || prev.tagName === "P" || prev.tagName === "H4") && prev.innerText && prev.innerText.length < 120) {
+      nearby.push(prev.innerText);
+    }
+
+    const clean = arr => arr.join(" ").replace(/\s+/g, " ").trim();
+    return { label: clean(label), attrs: clean(attrs), nearby: clean(nearby) };
+  }
+
+  // Contexto aplanado — se mantiene para todo lo que solo necesita "todo el
+  // texto asociado al campo" (extracción de preguntas, detección de límite de
+  // caracteres, banco de Q&A). El matching de reglas NO lo usa: necesita saber
+  // de qué origen vino cada match para poder ponderarlo.
+  function getFieldContext(el) {
+    const parts = getFieldContextParts(el);
+    return [parts.label, parts.attrs, parts.nearby].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  }
+
+  const AUTOFILLABLE_SELECTOR =
+    "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']), textarea, select, trix-editor, [contenteditable='true'], button[aria-haspopup='listbox']";
+
+  function isFillableVisible(el) {
+    if (el.disabled || el.readOnly) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return false;
+    const style = window.getComputedStyle(el);
+    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
+    return true;
+  }
+
+  /**
+   * Intenta rellenar UN campo con todo el motor (Q&A personalizado, campos
+   * flexibles, FIELD_RULES ponderadas por origen, respaldo de radio/checkbox).
+   * Extraído del bucle de `executeAutofill` para poder reutilizarlo desde el
+   * MutationObserver que sigue mirando la página después del primer pase (ver
+   * `watchForLateFields`): un formulario de varios pasos, o que revela
+   * preguntas al hacer scroll, agrega campos DESPUÉS del clic — un escaneo de
+   * una sola pasada nunca los llega a ver.
+   */
+  async function tryFillField(el, profile) {
+    const contextParts = getFieldContextParts(el);
+      const textContext = [contextParts.label, contextParts.attrs, contextParts.nearby].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+      const normContext = normalizeText(textContext);
+      const inputType = (el.type || "").toLowerCase();
+
+      // Un botón que abre un listbox (patrón ARIA `aria-haspopup="listbox"` —
+      // el "Degree" de Workday es el caso real) no encaja en nada del motor
+      // de abajo: no tiene `.value` que escribir ni es un <select> nativo. Se
+      // resuelve aparte y se sale enseguida.
+      if (el.tagName === "BUTTON") {
+        return await tryFillCustomListboxButton(el, profile, textContext);
+      }
+
+      let ruleMatched = false;
+
+      const applyRuleValue = async (val) => {
+        if (el.tagName === "SELECT") {
+          return setSelectValue(el, val);
+        }
+        if (inputType === "radio" || inputType === "checkbox") {
+          if (val === "yes" || val === "true" || val === true) {
+            if (/yes|s[ií]|true/i.test(el.value || textContext)) {
+              el.checked = true;
+              el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+              return true;
+            }
+          }
+          return false;
+        }
+        setElementValue(el, val);
+        // Un <input role="combobox"> (react-select y similares: el selector de
+        // país del widget de teléfono es el caso real que lo motivó) NO se
+        // rellena escribiendo texto — eso solo filtra su lista de opciones. El
+        // valor que el formulario de verdad usa para validar/enviar queda
+        // vacío hasta que se CONFIRMA una opción, así que sin este paso el
+        // campo se ve lleno pero el envío fallaría igual.
+        await commitComboboxSelectionIfNeeded(el, val);
+        return true;
+      };
+
+      // El tipo nativo del input es evidencia más fuerte que cualquier texto:
+      // un type="email" ES un email sin importar cómo se llame el label.
+      const typeRule = inputType === "email" ? FIELD_RULES.find(r => r.key === "email")
+        : inputType === "tel" ? FIELD_RULES.find(r => r.key === "phone")
+        : null;
+      if (typeRule) {
+        const val = typeRule.getValue(profile, textContext);
+        if (val && await applyRuleValue(val)) { ruleMatched = true; }
+      }
+
+      // Selección PONDERADA en vez de "la primera regla del array que matchee".
+      // El orden del array no es una jerarquía de precisión, y con first-match
+      // -wins reglas amplias y tempranas (p. ej. `nombre` en firstName)
+      // secuestraban campos que pertenecían a reglas más específicas y tardías
+      // ("Nombre de la empresa" se llenaba con el nombre de pila). Ahora cada
+      // regla se puntúa por DÓNDE matcheó (el label del campo vale mucho más
+      // que un atributo generado o el texto de un vecino) y por cuán específico
+      // fue el match (un match más largo es menos accidental).
+      //
+      // Se calcula ANTES de los campos personalizados (más abajo) y se
+      // reutiliza: si la regla mejor puntuada matcheó por LABEL — el origen de
+      // más peso, el enunciado real de la pregunta — gana siempre sobre un
+      // campo flexible del usuario. Bug real que motivó esto: un campo
+      // personalizado "Licencia de conducir" con el keyword suelto "número"
+      // le robó el campo "Ingresar RUT con puntos y número verificador" a la
+      // regla curada de RUT, porque "número" aparece en las dos etiquetas sin
+      // relación real entre sí. Un match por label de una regla del sistema es
+      // más confiable que un keyword corto y genérico escrito a mano.
+      const ORIGIN_WEIGHT = { label: 100, attrs: 60, nearby: 30 };
+      let scored = [];
+      if (!ruleMatched) {
+        for (const rule of FIELD_RULES) {
+          let bestWeight = 0;
+          let matchLength = 0;
+
+          for (const origin of ["label", "attrs", "nearby"]) {
+            const raw = contextParts[origin];
+            if (!raw) continue;
+            const m = raw.match(rule.regex) || normalizeText(raw).match(rule.regex);
+            if (m && ORIGIN_WEIGHT[origin] > bestWeight) {
+              bestWeight = ORIGIN_WEIGHT[origin];
+              matchLength = m[0].length;
+            }
+          }
+
+          if (bestWeight > 0) scored.push({ rule, originWeight: bestWeight, score: bestWeight + matchLength });
+        }
+
+        scored.sort((a, b) => b.score - a.score);
+
+        if (scored[0]?.originWeight === ORIGIN_WEIGHT.label) {
+          const val = scored[0].rule.getValue(profile, textContext);
+          if (val && await applyRuleValue(val)) { ruleMatched = true; }
+        }
+      }
+
+      // 1. Banco de Q&A personalizado (solo si ninguna regla del sistema ya
+      //    reclamó este campo con alta confianza — ver el guard de arriba).
+      if (!ruleMatched && (el.tagName === "TEXTAREA" || el.tagName === "TRIX-EDITOR" || el.isContentEditable) && profile.customQA && Array.isArray(profile.customQA)) {
+        for (let qa of profile.customQA) {
+          if (!qa.keywords || !qa.answer) continue;
+          if (matchesQaAdvanced(textContext, qa.keywords)) {
+            setElementValue(el, qa.answer);
+            return true;
+          }
+        }
+      }
+
+      // 2. Campos personalizados del usuario (idem).
+      if (!ruleMatched && profile.customFields && Array.isArray(profile.customFields)) {
+        for (let cf of profile.customFields) {
+          if (!cf.value) continue;
+          const searchTerms = `${cf.label || ""} ${cf.keywords || ""}`;
+          if (matchesQaAdvanced(textContext, searchTerms)) {
+            if (el.tagName === "SELECT") {
+              return setSelectValue(el, cf.value);
+            }
+            setElementValue(el, cf.value);
+            return true;
+          }
+        }
+      }
+
+      // 4. Resto de FIELD_RULES por puntaje (reutiliza `scored`, ya calculado
+      //    arriba — la regla de label ya se intentó; esto cubre attrs/nearby y
+      //    el caso de que la de label no tuviera dato cargado en el perfil).
+      if (!ruleMatched) {
+        for (const { rule } of scored) {
+          const val = rule.getValue(profile, textContext);
+          if (!val) continue;
+          if (await applyRuleValue(val)) { ruleMatched = true; }
+          break;
+        }
+      }
+
+      // 3. Respaldo para grupos de radio/checkbox de opción única (ver
+      // RADIO_GROUP_FIELDS): el motor genérico de arriba solo sabe marcar una
+      // opción cuando el valor es literalmente "yes" — nunca "no", y nunca un
+      // enum de 3+ alternativas (modalidad, género).
+      if (!ruleMatched && (inputType === "radio" || inputType === "checkbox")) {
+        for (const field of RADIO_GROUP_FIELDS) {
+          if (!field.groupRegex.test(textContext) && !field.groupRegex.test(normContext)) continue;
+
+          // Se identificó a qué campo pertenece este grupo — a partir de aquí
+          // siempre se sale del bucle: no tiene sentido seguir probando el
+          // regex de otros campos una vez que se sabe de cuál se trata.
+          const answer = profile[field.profileKey];
+          if (!answer) break; // el usuario no cargó este dato: no se adivina
+
+          const variants = field.optionVariants[answer];
+          if (!variants) break; // valor guardado fuera de la tabla esperada
+
+          if (matchesAnyOptionVariant(el.value || textContext, variants)) {
+            el.checked = true;
+            el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+            ruleMatched = true;
+          }
+          break;
+        }
+      }
+
+      return ruleMatched;
+  }
+
+  /**
+   * Campos obligatorios (`required`/`aria-required`) que quedaron sin valor
+   * tras el autorrelleno. Antes el único feedback era un contador — un campo
+   * obligatorio sin match pasaba desapercibido hasta que el sitio rechazaba
+   * el envío. Los de radio/checkbox se excluyen: el estado de un GRUPO no se
+   * lee de un input individual, y marcarlos todos como "faltantes" sería ruido.
+   */
+  function listMissingRequiredFields(inputs) {
+    const missing = [];
+    for (const el of inputs) {
+      const isRequired = el.required || el.getAttribute("aria-required") === "true";
+      if (!isRequired) continue;
+      const type = (el.type || "").toLowerCase();
+      if (type === "radio" || type === "checkbox") continue;
+      const value = el.isContentEditable ? el.innerText : el.value;
+      if (value && value.trim()) continue;
+      const parts = getFieldContextParts(el);
+      const label = (parts.label || parts.attrs || "").trim().slice(0, 40) || "(campo sin nombre detectable)";
+      missing.push(label);
+    }
+    return missing;
+  }
+
+  /**
+   * Sigue mirando la página un rato después del primer pase para rellenar
+   * campos que aparezcan DESPUÉS del clic — un formulario de varios pasos, un
+   * campo condicional que se revela al responder otra pregunta, o contenido
+   * que carga al hacer scroll. Sin esto, esos campos quedaban fuera para
+   * siempre porque el escaneo original era de una sola pasada.
+   *
+   * Se desconecta solo a los pocos segundos: observar indefinidamente
+   * costaría batería/CPU en páginas que siguen mutando por su cuenta (SPAs
+   * con animaciones, contadores, etc.) sin ningún beneficio real — pasado ese
+   * margen, el usuario ya puede volver a pulsar "Auto-Rellenar" a mano.
+   */
+  /**
+   * Envuelve `tryFillField` para que UN campo problemático no tumbe la pasada
+   * entera. Sin esto, una excepción a mitad del bucle (un widget exótico, un
+   * nodo que el framework reemplazó justo entonces) abortaba todos los campos
+   * RESTANTES y también el resumen final: el usuario se quedaba con un
+   * formulario a medio rellenar y sin ningún aviso de que algo falló.
+   *
+   * Descarta además los nodos que ya no están en el documento. Entre el
+   * escaneo inicial y el turno de este campo hay varios `await` (los combobox
+   * esperan a que la librería monte su lista), tiempo más que suficiente para
+   * que una SPA re-renderice el formulario por debajo. Escribir en un nodo
+   * desprendido no hace nada visible, pero sí sumaría al contador de
+   * "campos rellenados" — un resumen que miente es peor que uno bajo.
+   */
+  async function fillFieldSafely(el, profile) {
+    if (!el || !el.isConnected) return false;
+    try {
+      return await tryFillField(el, profile);
+    } catch (e) {
+      console.warn("[JobFill AI] Campo omitido por un error al rellenarlo:", el.name || el.id || el.tagName, e);
+      return false;
+    }
+  }
+
+  let activeLateFieldObserver = null;
+  function watchForLateFields(profile, alreadyProcessed) {
+    if (activeLateFieldObserver) activeLateFieldObserver.disconnect();
+
+    let lateFilledCount = 0;
+    let pending = false;
+
+    const scanForNewFields = async () => {
+      pending = false;
+      const found = Array.from(document.querySelectorAll(AUTOFILLABLE_SELECTOR))
+        .filter(el => !alreadyProcessed.has(el) && isFillableVisible(el));
+
+      for (const el of found) {
+        alreadyProcessed.add(el);
+        if (await fillFieldSafely(el, profile)) lateFilledCount++;
+      }
+    };
+
+    const observer = new MutationObserver(() => {
+      // Varias mutaciones llegan juntas (un framework re-renderiza de a
+      // varios nodos) — se procesan como un solo lote en el próximo tick en
+      // vez de una vez por mutación individual.
+      if (pending) return;
+      pending = true;
+      setTimeout(scanForNewFields, 300);
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+    activeLateFieldObserver = observer;
+
+    setTimeout(() => {
+      observer.disconnect();
+      if (activeLateFieldObserver === observer) activeLateFieldObserver = null;
+      if (lateFilledCount > 0) {
+        showToast(`⚡ +${lateFilledCount} campo${lateFilledCount > 1 ? "s" : ""} más, aparecieron después del primer rellenado.`, "success");
+      }
+    }, 6000);
+  }
+
+  // Dos pasadas simultáneas (doble clic en el widget, o el popup disparando
+  // una mientras el botón flotante ya lanzó otra) se pisan entre sí: las dos
+  // escriben los mismos campos y, sobre todo, las confirmaciones asíncronas
+  // de los combobox se entrelazan — una abre su lista de opciones mientras la
+  // otra la está leyendo, y terminan eligiendo la opción equivocada.
+  let autofillInProgress = false;
+
+  async function executeAutofill() {
+    if (autofillInProgress) return { count: 0, alreadyRunning: true };
+    autofillInProgress = true;
+
+    try {
+      const profile = await loadProfile();
+      if (!profile) {
+        showToast("Por favor abre JobFill AI y configura tus datos.", "error");
+        return { count: 0 };
+      }
+
+      // Search across the entire document and filter by visibility to support dynamic DOMs (LinkedIn, Getonbrd)
+      const inputs = Array.from(document.querySelectorAll(AUTOFILLABLE_SELECTOR)).filter(isFillableVisible);
+
+      let filledCount = 0;
+      for (const el of inputs) {
+        if (await fillFieldSafely(el, profile)) filledCount++;
+      }
+
+      const missingRequired = listMissingRequiredFields(inputs);
+      const missingNote = missingRequired.length
+        ? ` ⚠️ ${missingRequired.length} obligatorio${missingRequired.length > 1 ? "s" : ""} sin completar: ${missingRequired.slice(0, 3).join(", ")}${missingRequired.length > 3 ? "…" : ""}.`
+        : "";
+
+      if (filledCount > 0) {
+        showToast(`⚡ ¡${filledCount} campo${filledCount > 1 ? "s" : ""} rellenado${filledCount > 1 ? "s" : ""} con éxito!${missingNote}`, missingRequired.length ? "info" : "success");
+      } else {
+        showToast(`No se detectaron campos de postulación pendientes en esta sección.${missingNote}`, "info");
+      }
+
+      watchForLateFields(profile, new Set(inputs));
+
+      return { count: filledCount };
+    } finally {
+      // En `finally`: si algo revienta antes de tiempo, el flag NO puede
+      // quedarse encendido — dejaría el autorrelleno muerto para el resto de
+      // la vida de la pestaña, sin ninguna pista de por qué.
+      autofillInProgress = false;
+    }
+  }
+
+  // El usuario puede cerrar el conjunto de botones (✕ del pill) cuando estorba
+  // sobre el contenido de la página. Sin este flag, el MutationObserver que
+  // vigila cambios en el DOM (Easy Apply, pasos de Getonbrd, etc.) volvía a
+  // llamar `initFloatingWidget()` en la siguiente mutación y, como el widget
+  // ya no estaba en el documento, lo recreaba de inmediato — cerrarlo no
+  // servía de nada en cualquier página remotamente dinámica.
+  let widgetDismissed = false;
+
+  let currentActiveTarget = null;
+  let repositionListenerAttached = false;
+
+  // Última posición conocida del cursor, en px CSS del viewport — respaldo del
+  // botón manual de captura de cargo: si el DOM no da ningún título legible, se
+  // recorta la captura de pantalla alrededor de ESTA posición. Un simple
+  // mousemove pasivo es barato (solo dos asignaciones numéricas); no hace falta
+  // debounce porque no dispara ningún trabajo, solo registra el dato para
+  // cuando el usuario pulse el botón.
+  let lastMouseX = 0;
+  let lastMouseY = 0;
+  document.addEventListener("mousemove", e => {
+    lastMouseX = e.clientX;
+    lastMouseY = e.clientY;
+  }, { passive: true });
+
+  function updateAiButtonPosition() {
+    if (!currentAiBtn || !currentActiveTarget) return;
+    const rect = currentActiveTarget.getBoundingClientRect();
+    
+    // Hide if out of viewport
+    if (rect.bottom < 0 || rect.top > window.innerHeight || rect.width === 0 || rect.height === 0) {
+      currentAiBtn.style.display = "none";
+      return;
+    }
+    
+    currentAiBtn.style.display = "inline-flex";
+    const topPos = window.scrollY + rect.top + 6;
+    const rightPos = window.innerWidth - (window.scrollX + rect.right) + 6;
+
+    currentAiBtn.style.top = `${topPos}px`;
+    currentAiBtn.style.right = `${Math.max(10, rightPos)}px`;
+  }
+
+  function attachAiButtonToTextarea(targetEl) {
+    // Si ya está adjunto a ESTE MISMO campo, reposicionar en vez de destruir y
+    // recrear. En páginas con DOM muy dinámico (mutaciones periódicas ajenas a
+    // la extensión, o un framework que re-renderiza el campo) un `focusin`
+    // puede repetirse sin que el usuario haya cambiado de campo. Recrear el
+    // botón en ese instante es peligroso: si el usuario ya inició un clic
+    // (entre `mousedown` y `click`), el botón que recibía el evento desaparece
+    // del DOM a mitad de camino y el clic no llega a ningún listener — sin
+    // ningún error visible, el botón simplemente "no hace nada".
+    if (currentActiveTarget === targetEl && currentAiBtn && document.body.contains(currentAiBtn)) {
+      updateAiButtonPosition();
+      return;
+    }
+
+    removeAiButton();
+
+    const rect = targetEl.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+
+    const btn = document.createElement("button");
+    btn.className = "jobfill-ai-btn";
+    btn.type = "button";
+    btn.innerHTML = `<span>✨</span>`;
+    btn.title = "Redactar con Claude IA";
+
+    currentActiveTarget = targetEl;
+    currentAiBtn = btn;
+    updateAiButtonPosition();
+
+    btn.addEventListener("click", async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      await handleGenerateAiAnswer(targetEl, btn);
+    });
+
+    attachToTopLayerHost(btn);
+
+    if (!repositionListenerAttached) {
+      window.addEventListener("scroll", updateAiButtonPosition, { passive: true });
+      window.addEventListener("resize", updateAiButtonPosition, { passive: true });
+      repositionListenerAttached = true;
+    }
+  }
+
+  function removeAiButton() {
+    if (currentAiBtn && currentAiBtn.parentNode) {
+      currentAiBtn.parentNode.removeChild(currentAiBtn);
+    }
+    currentAiBtn = null;
+    currentActiveTarget = null;
+  }
+
+  /** "entre 300 y 2000 caracteres" / "between 300 and 2000 characters". */
+  const RANGE_LENGTH_RE = /(?:entre|between)\s*(\d{2,5})\s*(?:y|and|-|–)\s*(\d{2,5})\s*(?:caracteres|car[aá]cteres|chars|characters)/i;
+
+  /**
+   * Mínimo de caracteres que el formulario EXIGE para aceptar el envío.
+   *
+   * Sin esto, una respuesta correcta pero breve (típicamente una pregunta
+   * logística, que se responde en dos frases) es rechazada por el propio
+   * formulario: Getonbrd pide "entre 300 y 2000 caracteres" y descarta lo que no
+   * llegue. El mínimo no es una preferencia de estilo, es un requisito de envío.
+   */
+  function detectFieldMinimumLength(el) {
+    if (!el) return null;
+
+    const context = getFieldContext(el);
+    const match = context.match(RANGE_LENGTH_RE)
+      || context.match(/(?:m[ií]nimo|min\.?|al menos|as least|at least)[:\s]*(\d{2,5})\s*(?:caracteres|car[aá]cteres|chars|characters)/i);
+
+    if (!match) return null;
+    const min = parseInt(match[1], 10);
+    // Un mínimo por debajo de 50 no condiciona nada, y uno enorme sería un
+    // número mal leído del contexto.
+    return min >= 50 && min <= 5000 ? min : null;
+  }
+
+  function detectFieldCharacterLimit(el) {
+    if (!el) return null;
+
+    if (el.maxLength && el.maxLength > 0 && el.maxLength < 50000) {
+      return el.maxLength;
+    }
+    const dataMax = el.getAttribute("data-maxlength") || el.getAttribute("data-max-length") || el.getAttribute("data-max-chars") || el.getAttribute("data-character-limit");
+    if (dataMax && parseInt(dataMax, 10) > 0) {
+      return parseInt(dataMax, 10);
+    }
+
+    const context = getFieldContext(el);
+    // Un rango ("entre 300 y 2000 caracteres", Getonbrd) aporta el techo en su
+    // segundo número. Va primero porque los patrones de abajo no lo reconocen y
+    // el campo se quedaba sin límite detectado.
+    const rangeMatch = context.match(RANGE_LENGTH_RE);
+    if (rangeMatch) {
+      const max = parseInt(rangeMatch[2], 10);
+      if (max >= 20 && max <= 10000) return max;
+    }
+
+    const charLimitMatch = context.match(/(?:m[aá]ximo|max|l[ií]mite|hasta|limit)[:\s]*(\d{2,5})\s*(?:caracteres|car[aá]cteres|chars|characters|letras)/i)
+      || context.match(/(\d{2,5})\s*(?:caracteres|car[aá]cteres|chars|characters)\s*(?:m[aá]ximo|max|como m[aá]ximo)/i)
+      || context.match(/\/\s*(\d{2,5})\s*(?:caracteres|chars|\))/i);
+
+    if (charLimitMatch && charLimitMatch[1]) {
+      const limit = parseInt(charLimitMatch[1], 10);
+      if (limit >= 20 && limit <= 10000) return limit;
+    }
+
+    const wordLimitMatch = context.match(/(?:m[aá]ximo|max|l[ií]mite|hasta|limit)[:\s]*(\d{2,4})\s*(?:palabras|words)/i);
+    if (wordLimitMatch && wordLimitMatch[1]) {
+      return Math.floor(parseInt(wordLimitMatch[1], 10) * 6.5);
+    }
+
+    return null;
+  }
+
+  function enforceSafeCharacterLimit(text, limit) {
+    if (!text || !limit || text.length <= limit) return text;
+    const truncated = text.slice(0, limit);
+
+    // Look for last period, exclamation, or question mark
+    const lastSentenceEnd = Math.max(
+      truncated.lastIndexOf(". "),
+      truncated.lastIndexOf(".\n"),
+      truncated.lastIndexOf("! "),
+      truncated.lastIndexOf("? ")
+    );
+
+    if (lastSentenceEnd > limit * 0.6) {
+      return truncated.slice(0, lastSentenceEnd + 1).trim();
+    }
+
+    // Sin punto final cercano: cerrar con "." en vez de "...". Un "..." se lee
+    // como una idea cortada a medias en una respuesta de postulación laboral,
+    // algo que nunca debe pasar aunque la última cláusula quede incompleta.
+    const lastSpace = truncated.lastIndexOf(" ");
+    const cut = lastSpace > limit * 0.5 ? truncated.slice(0, lastSpace) : truncated;
+    const closed = cut.trim().replace(/[,;:\-–—]+$/, "");
+    return /[.!?]$/.test(closed) ? closed : `${closed}.`;
+  }
+
+  function cleanQuestionText(raw) {
+    return raw
+      // Numeración de listado ("1. ", "2) ") que anteponen formularios como
+      // HiringRoom: no aporta nada a la pregunta y ensucia la detección.
+      .replace(/^\s*\d{1,2}\s*[.)]\s+/, "")
+      .replace(/urn:li:[^\s]+/gi, "")
+      .replace(/single-line-text-form-component[^\s]*/gi, "")
+      .replace(/job_application(_\w+|\[[^\]]*\])*/gi, "")
+      .replace(/question_\d+/gi, "")
+      .replace(/data-test-[^\s]*/gi, "")
+      .replace(/ember\d+/gi, "")
+      .replace(/\*\s*(requerido|obligatorio|required)/gi, "")
+      .replace(/\((requerido|obligatorio|required|opcional|optional)\)/gi, "")
+      // Etiquetas de la barra de un editor enriquecido que hayan sobrevivido al
+      // filtrado estructural (algunos editores las ponen en <span>, no en
+      // <button>). Se exige una racha de 3 o más seguidas para no borrar una
+      // palabra legítima del enunciado: "Code" o "Link" sueltos pueden ser parte
+      // de la pregunta, pero "Bold Italic Strikethrough" nunca lo es.
+      .replace(
+        /(?:\b(?:bold|italic|strikethrough|underline|link|heading|quote|code|bullets|numbers|decrease level|increase level|attach files|undo|redo|negrita|cursiva|tachado|subrayado|enlace|encabezado|cita|c[oó]digo|vi[nñ]etas|n[uú]meros|disminuir nivel|aumentar nivel|adjuntar archivos|deshacer|rehacer)\b[\s,]*){3,}/gi,
+        " "
+      )
+      // Mensajes de validación y avisos del formulario: describen el campo, no
+      // preguntan nada, y contaminan tanto el enunciado como la detección de idioma.
+      .replace(/[^.!?]*\b(?:no puede estar en blanco|no puede quedar vac[ií]o|es obligatorio|campo requerido|can't be blank|cannot be blank|is required)\b[^.!?]*[.!?]?/gi, " ")
+      .replace(/[^.!?]*\b(?:aseg[uú]rate|aseg[uú]rese|make sure|ensure)\b[^.!?]*\b(?:caracteres|characters)\b[^.!?]*[.!?]?/gi, " ")
+      .replace(/[^.!?]*\b(?:guardaremos este campo|we'll save this field|se guardar[aá] para futuras)\b[^.!?]*[.!?]?/gi, " ")
+      // Contador de caracteres suelto ("0", "0/2000") que queda tras lo anterior.
+      .replace(/(?:^|\s)\d{1,5}\s*\/\s*\d{1,5}(?=\s|$)/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      // Un contador "0" pegado al final tras quitar su etiqueta.
+      .replace(/\s+\d{1,5}$/, "")
+      .trim();
+  }
+
+  /**
+   * Muletillas de placeholder que NO son preguntas. Un placeholder así es
+   * idéntico en todos los campos del formulario, así que usarlo como pregunta
+   * hace que campos distintos generen la misma consulta.
+   */
+  const GENERIC_PLACEHOLDER_RE = /^(ingresa|ingrese|escribe|escriba|introduce|introduzca|complete|completa|tu|su|type|enter|write|your)\b[\s\S]{0,40}$/i;
+
+  function isGenericPlaceholder(placeholder) {
+    const text = placeholder.trim().replace(/[.…]+$/, "");
+    // Si contiene un signo de interrogación es una pregunta de verdad, no una
+    // muletilla, por más que empiece por "Describe" o "Cuéntanos".
+    if (/[?¿]/.test(text)) return false;
+    return GENERIC_PLACEHOLDER_RE.test(text);
+  }
+
+  /**
+   * Sube por los ancestros buscando el bloque más grande que todavía contenga
+   * ESTE campo y ningún otro, y devuelve su texto como pregunta.
+   *
+   * Pensado para formularios CSS-in-JS (HiringRoom y similares) donde no hay
+   * ninguna pista semántica: ni id, ni name, ni label asociado, ni clases
+   * legibles. El texto de la pregunta solo existe como contenido de un div
+   * ancestro, y la única forma fiable de saber que ese texto pertenece a este
+   * campo y no a otro es exigir que el bloque no contenga más campos.
+   */
+  /**
+   * Texto de un bloque descartando el "cromo" del formulario: barras de
+   * herramientas de editores enriquecidos (Trix en Getonbrd, Quill, TinyMCE),
+   * botones, contadores y mensajes de validación.
+   *
+   * Sin esto, el enunciado que se lee en un campo con editor enriquecido llega
+   * como "Cuéntanos sobre tu experiencia... Bold Italic Strikethrough Link
+   * Heading Quote Code Bullets Numbers ... Attach Files 0 Asegúrate que el largo
+   * sea entre 300 y 2000 caracteres." — la pregunta real sepultada entre las
+   * etiquetas de los botones. Se elimina por ESTRUCTURA (los nodos que no son
+   * enunciado) en vez de por lista de palabras, que dependería del idioma y del
+   * editor concreto.
+   */
+  function readBlockText(node) {
+    let clone;
+    try {
+      clone = node.cloneNode(true);
+    } catch (e) {
+      return (node.innerText || "").trim();
+    }
+
+    clone.querySelectorAll(
+      "trix-toolbar, [role='toolbar'], [class*='toolbar'], button, [role='button'], " +
+      "select, option, [class*='counter'], [class*='char-count'], [class*='error'], " +
+      "[class*='invalid'], [class*='validation'], script, style, svg"
+    ).forEach(n => n.remove());
+
+    // El clon no está renderizado, así que innerText cae a textContent: se
+    // normalizan los saltos que el marcado deja entre nodos.
+    return (clone.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function findQuestionByAncestorBlock(el) {
+    let node = el.parentElement;
+    let best = null;
+
+    for (let depth = 0; depth < 8 && node && node !== document.body; depth++) {
+      const controls = node.querySelectorAll(
+        "input:not([type='hidden']):not([type='submit']):not([type='button']), textarea, select, [contenteditable='true']"
+      );
+      // En cuanto el bloque abarca otro campo deja de describir solo a este:
+      // seguir subiendo devolvería las preguntas del formulario entero juntas.
+      if (controls.length !== 1) break;
+
+      const text = readBlockText(node);
+      // Se queda con el texto del bloque MÁS AMPLIO que sigue siendo de este
+      // campo: el div inmediato suele envolver solo al input y venir vacío,
+      // mientras que el enunciado vive uno o dos niveles más arriba.
+      if (text.length >= 8 && text.length <= 400) best = text;
+
+      node = node.parentElement;
+    }
+
+    return best;
+  }
+
+  function extractHumanQuestion(el) {
+    let questionCandidates = [];
+
+    // 1. Explicit <label for="...">  — la fuente más específica: apunta exactamente a este campo.
+    if (el.id) {
+      try {
+        const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        if (label && label.innerText) questionCandidates.push(label.innerText);
+      } catch (e) {}
+    }
+
+    // 2. aria-labelledby o aria-describedby — igual de específico (ids exactos).
+    const labelledBy = el.getAttribute("aria-labelledby") || el.getAttribute("aria-describedby");
+    if (labelledBy) {
+      const parts = labelledBy.split(" ").map(id => {
+        try {
+          const labelEl = document.getElementById(id);
+          return labelEl && labelEl.innerText ? labelEl.innerText : "";
+        } catch (e) { return ""; }
+      }).filter(Boolean);
+      if (parts.length) questionCandidates.push(parts.join(" "));
+    }
+
+    // 3. <label> que envuelve directamente el campo.
+    const parentLabel = el.closest("label, .fb-form-element-label, .gb-label, .form-label");
+    if (parentLabel && parentLabel.innerText) questionCandidates.push(parentLabel.innerText);
+
+    // 4. Bloque contenedor angosto de ESTE campo (Getonbrd: .gb-form-group / .input-container
+    // envuelve un único input, así que su label es tan específico como el del propio campo).
+    const container = el.closest(".form-group, .field, [class*='question'], [class*='field'], [class*='form-row'], .fb-single-line-text, .fb-dropdown, .gb-form-group, .input-container");
+    if (container) {
+      const labelEl = container.querySelector("label, .label, [class*='label'], [class*='title'], [class*='heading'], h3, h4, legend, span.label-text, p.help-block");
+      if (labelEl && labelEl.innerText && labelEl.innerText.length < 350) {
+        questionCandidates.push(labelEl.innerText);
+      }
+    }
+
+    // 5. Fieldset legend / role=heading — ÚLTIMO recurso, no primero: un <fieldset> a
+    // menudo envuelve TODO un bloque de "preguntas adicionales" (varias preguntas
+    // distintas comparten el mismo fieldset ancestro), así que su legend describe la
+    // sección completa, no este campo puntual. Priorizarlo antes que el label/contenedor
+    // específico del campo hacía que TODAS las preguntas de esa sección recibieran el
+    // mismo título genérico de sección — la causa del desfase pregunta/respuesta en
+    // Getonbrd cuando varias preguntas personalizadas comparten fieldset.
+    const fieldset = el.closest("fieldset, [role='radiogroup'], [role='group']");
+    if (fieldset) {
+      const legend = fieldset.querySelector("legend, [role='heading'], .fb-form-element-label, .t-14, .label");
+      if (legend && legend.innerText) questionCandidates.push(legend.innerText);
+    }
+
+    // 6. Elemento anterior si es un heading/label.
+    let prev = el.previousElementSibling;
+    if (prev && (prev.tagName === "LABEL" || prev.tagName === "SPAN" || prev.tagName === "P" || prev.tagName === "H3" || prev.tagName === "H4") && prev.innerText && prev.innerText.length < 250) {
+      questionCandidates.push(prev.innerText);
+    }
+
+    // 6.5. Bloque ancestro que contiene UN ÚNICO campo (HiringRoom y cualquier
+    // otro formulario hecho con styled-components / CSS-in-JS). Ahí las clases
+    // son hashes (`sc-gtsrHT eqrnRd`) y los campos no traen id, name, aria-label
+    // ni <label for>: los pasos 1-6 fallan todos y la pregunta real solo existe
+    // como texto de un div ancestro. Sin este paso se caía al placeholder, que
+    // en HiringRoom es "Ingresa tu respuesta..." para TODAS las preguntas — así
+    // que las 4 preguntas del formulario llegaban a Claude como el mismo texto
+    // vacío de contenido y las respuestas no guardaban relación con lo que se
+    // preguntaba.
+    //
+    // La condición de "un único campo" es lo que lo hace seguro: se sube
+    // mientras el bloque siga conteniendo exactamente este control, y se para
+    // en cuanto abarque dos o más. Así nunca devuelve el texto del formulario
+    // completo (que mezclaría las 4 preguntas), solo el bloque de este campo.
+    const ancestorBlockQuestion = findQuestionByAncestorBlock(el);
+    if (ancestorBlockQuestion) questionCandidates.push(ancestorBlockQuestion);
+
+    // 7. Atributos de respaldo.
+    if (el.getAttribute("aria-label")) questionCandidates.push(el.getAttribute("aria-label"));
+    // El placeholder va al final y solo si NO es una muletilla genérica: un
+    // "Ingresa tu respuesta..." es indistinguible entre campos y convierte
+    // preguntas distintas en la misma consulta a Claude. Mejor no ofrecer
+    // pregunta (el llamador avisa al usuario) que ofrecer una falsa.
+    if (el.placeholder && el.placeholder.length > 5 && !isGenericPlaceholder(el.placeholder)) {
+      questionCandidates.push(el.placeholder);
+    }
+
+    // Usar la PRIMERA fuente válida (en orden de confianza) en vez de concatenar
+    // las 7: unirlas todas duplicaba el mismo texto (label + aria-labelledby
+    // apuntando al mismo elemento) y colaba texto ajeno a la pregunta real
+    // (p. ej. un contenedor amplio que también capturaba un aviso
+    // "(obligatorio)" o el label de un campo vecino). Eso generaba preguntas
+    // ilegibles enviadas a Claude y contaminaba la detección de idioma.
+    for (const raw of questionCandidates) {
+      if (!raw) continue;
+      const cleaned = cleanQuestionText(raw);
+      if (cleaned.length >= 3) return cleaned;
+    }
+
+    return getFieldContext(el);
+  }
+
+  /**
+   * Texto completo de la oferta (no solo título/empresa), para que Claude pueda
+   * anclar la respuesta a los requisitos y palabras clave reales del puesto en
+   * vez de generalizar a partir de un simple título de cargo.
+   */
+  /**
+   * ─── CONTEXTO DE LA OFERTA, PERSISTIDO ENTRE PÁGINAS ───────────────────────
+   *
+   * El formulario de postulación y la publicación de la oferta casi nunca son la
+   * misma página, y a veces ni el mismo dominio: en HiringRoom el formulario vive
+   * en /jobs/answer-questions/<hash>, una página que NO contiene el cargo, la
+   * empresa ni la descripción. Leyendo solo la página actual, Claude redactaba a
+   * ciegas sobre el puesto y el "cargo" detectado era el <h1> de turno
+   * ("Responde estas preguntas").
+   *
+   * Por eso el contexto se captura cuando el usuario pasa por la oferta y se
+   * guarda; al llegar al formulario se reutiliza. La fuente es el DOM, que ya
+   * tiene el texto exacto y estructurado.
+   *
+   * Se descarta en cuanto deja de ser válido: al detectar una postulación
+   * enviada, o al caducar. Un contexto viejo es peor que ninguno, porque
+   * produce respuestas convincentes sobre el puesto equivocado.
+   */
+  // Lista de ofertas recientes, no una sola: postular pasando por varios
+  // portales es lo normal (se abren 3 ofertas en pestañas y se postula a la
+  // segunda). Con una única clave global, la última oferta vista pisaba a las
+  // demás y el formulario redactaba sobre el puesto equivocado — con una
+  // respuesta impecable, que es lo que lo hace peligroso.
+  const JOB_CONTEXTS_KEY = "recentJobContexts";
+  const MAX_JOB_CONTEXTS = 6;
+  const JOB_CONTEXT_TTL_MS = 6 * 60 * 60 * 1000; // 6 h: una sesión de búsqueda
+
+  /**
+   * Señales de que la postulación ya se envió: el contexto deja de servir.
+   *
+   * Se comparan sobre texto normalizado (sin tildes y en minúsculas), así que
+   * aquí van SIN tildes: "postulacion enviada" cubre también "postulación
+   * enviada". Cubre español, inglés y portugués, que es lo que usan los
+   * portales de la región (Gupy y Bumeran publican en pt-BR).
+   */
+  const SUBMISSION_SIGNALS = [
+    // Español
+    "postulacion enviada", "postulacion exitosa", "postulacion recibida", "gracias por postular",
+    "hemos recibido tu postulacion", "recibimos tu postulacion", "tu postulacion fue enviada",
+    "candidatura enviada", "solicitud enviada", "ya postulaste", "postulaste a este aviso",
+    "tu solicitud ha sido enviada", "gracias por tu interes",
+    // Inglés
+    "application submitted", "application received", "application sent", "thank you for applying",
+    "we received your application", "your application has been sent", "successfully applied",
+    "you have already applied", "thanks for applying",
+    // Portugués
+    "candidatura enviada", "inscricao enviada", "obrigado por se candidatar", "recebemos sua candidatura"
+  ];
+
+  function normalizeForSignals(text) {
+    return (text || "").normalize("NFD").replace(new RegExp("[\\u0300-\\u036f]", "g"), "").toLowerCase();
+  }
+
+  function pageShowsSubmissionSignal() {
+    const text = normalizeForSignals(document.body?.innerText || "").slice(0, 5000);
+    return SUBMISSION_SIGNALS.some(signal => text.includes(signal));
+  }
+
+  /**
+   * Títulos de página que NO son un cargo. Un <h1> es el último recurso de la
+   * cascada y en una página de formulario suele ser el título de la pantalla
+   * ("Responde estas preguntas"), que cacheado como cargo contamina el contexto.
+   */
+  const NON_TITLE_PATTERNS = /^(responde|postula|postular|aplica|apply|application|formulario|preguntas|questions|completa|complete|gracias|thank|inicia sesi[oó]n|sign in|log in|registr|crea tu|create)/i;
+
+  function firstMatchingText(selectors, { min, max, reject } = {}) {
+    for (const sel of selectors) {
+      let nodes;
+      try {
+        nodes = document.querySelectorAll(sel);
+      } catch (e) { continue; }
+
+      for (const node of nodes) {
+        const text = node?.innerText?.trim().replace(/\s+/g, " ");
+        if (!text || text.length < min || text.length > max) continue;
+        if (reject && reject.test(text)) continue;
+        return text;
+      }
+    }
+    return "";
+  }
+
+  function extractJobTitle() {
+    // Ordenados de más específico a más genérico: un selector propio del portal
+    // es fiable; un <h1> puede ser cualquier cosa.
+    return firstMatchingText([
+      // Datos estructurados (los publican varios portales)
+      "[itemprop='title']",
+      // LinkedIn
+      ".jobs-unified-top-card__job-title", ".job-details-jobs-unified-top-card__job-title",
+      ".topcard__title", ".t-24.job-details-jobs-unified-top-card__job-title",
+      // Workday
+      "[data-automation-id='jobPostingHeader']",
+      // Lever
+      ".posting-headline h2",
+      // Greenhouse
+      ".app-title", ".job__title h1", "#header .app-title",
+      // SmartRecruiters / Teamtailor / Recruitee / Workable
+      ".job-title", "[data-test='job-title']", ".careers-hero h1", ".job-header__title",
+      // Getonbrd
+      ".gb-job-title", "#job-title",
+      // Computrabajo: verificado contra el DOM real. La vista de resultados es
+      // maestro-detalle (lista a la izquierda, oferta abierta a la derecha) sin
+      // navegar de página, y el título del panel de detalle es un <p
+      // class="title_offer">, no un h1/h2 — por eso el <h1> de la página
+      // ("287 Ofertas de trabajo de ia en Chile", el título de la BÚSQUEDA
+      // completa) se colaba como si fuera el cargo. Es la página de detalle
+      // standalone (otra URL) la que sí trae un <h1> correcto y único, cubierta
+      // por el <h1> genérico al final de esta lista.
+      ".title_offer",
+      // Bumeran / Laborum / Trabajando / Indeed
+      ".box_detail h1", "[class*='JobTitle']", ".job-detail__title", ".title-jobs",
+      "h1[data-testid='jobsearch-JobInfoHeader-title']",
+      // Genéricos
+      "[class*='job-title']", "[class*='jobtitle']", "h1.title", "h1"
+    ], { min: 3, max: 120, reject: NON_TITLE_PATTERNS });
+  }
+
+  function extractCompanyName() {
+    return firstMatchingText([
+      "[itemprop='hiringOrganization']",
+      // LinkedIn
+      ".jobs-unified-top-card__company-name", ".job-details-jobs-unified-top-card__company-name",
+      ".topcard__org-name-link",
+      // Workday / Lever / Greenhouse
+      "[data-automation-id='jobPostingCompany']", ".posting-categories .sort-by-team", ".company-name",
+      // SmartRecruiters / Teamtailor / Workable
+      "[data-test='company-name']", ".job-header__company", ".company__name",
+      // Computrabajo: el panel de detalle (misma estructura maestro-detalle
+      // que .title_offer arriba) enlaza la empresa con /empresas/ en el href,
+      // sin ninguna clase semántica propia — verificado contra el DOM real.
+      ".box_detail.post a[href*='/empresas/']",
+      // Getonbrd / Bumeran / Indeed
+      ".gb-company-name", "[class*='company-name']", "[class*='CompanyName']",
+      "[data-testid='inlineHeader-companyName']",
+      // Genéricos
+      "[class*='employer']", "[class*='company']"
+    ], { min: 2, max: 80 });
+  }
+
+  /**
+   * Ofertas recientes vigentes, más nueva primero.
+   *
+   * Solo se exige `title`: la descripción puede venir vacía en una captura
+   * manual por visión (el respaldo de pantalla solo lee el título, nunca la
+   * descripción completa) o si el usuario la dejó en blanco a propósito en el
+   * panel de revisión — un cargo sin descripción sigue siendo útil para
+   * identificar la oferta, aunque el prompt tenga menos con qué trabajar.
+   */
+  async function loadJobContexts() {
+    try {
+      const stored = (await chrome.storage.local.get(JOB_CONTEXTS_KEY))[JOB_CONTEXTS_KEY];
+      if (!Array.isArray(stored)) return [];
+      const now = Date.now();
+      return stored
+        .filter(c => c && c.title && now - c.capturedAt < JOB_CONTEXT_TTL_MS)
+        .sort((a, b) => b.capturedAt - a.capturedAt);
+    } catch (e) {
+      console.warn("[JobFill AI] No se pudo leer el contexto cacheado:", e);
+      return [];
+    }
+  }
+
+  /**
+   * Devuelve si el guardado se completó. Los dos fallos reales aquí son la
+   * cuota de `chrome.storage.local` (una descripción de oferta larga por cada
+   * oferta cacheada suma rápido) y la pestaña huérfana tras recargar la
+   * extensión. Antes ambos rompían sin capturar y el llamador seguía como si
+   * hubiera guardado, mostrando "✓ Cargo guardado" sobre algo que se perdió.
+   */
+  async function saveJobContexts(contexts) {
+    try {
+      await chrome.storage.local.set({ [JOB_CONTEXTS_KEY]: contexts.slice(0, MAX_JOB_CONTEXTS) });
+      return true;
+    } catch (e) {
+      console.warn("[JobFill AI] No se pudo guardar el cargo en el almacenamiento local:", e);
+      return false;
+    }
+  }
+
+
+  /**
+   * Puntúa cuánto encaja una oferta guardada con la página actual.
+   *
+   * Con varios portales abiertos a la vez, "la más reciente" es una apuesta
+   * mala: se postula a la segunda oferta abierta tan a menudo como a la última.
+   * Se buscan pruebas de relación —mismo dominio, la página nombra el cargo o la
+   * empresa, se llegó desde la oferta— y la recencia solo desempata.
+   */
+  function scoreJobContext(context, pageText, referrerHost) {
+    let score = 0;
+    const title = normalizeForSignals(context.title);
+    const company = normalizeForSignals(context.company || "");
+
+    if (context.host === location.hostname) score += 50;
+    if (referrerHost && referrerHost === context.host) score += 40;
+    // La prueba más fuerte: el formulario menciona el cargo al que postulas.
+    if (title.length > 6 && pageText.includes(title)) score += 100;
+    if (company.length > 2 && pageText.includes(company)) score += 60;
+    // Desempate por recencia, deliberadamente pequeño (máx. 10 puntos).
+    const ageHours = (Date.now() - context.capturedAt) / 3600000;
+    score += Math.max(0, 10 - ageHours);
+    return score;
+  }
+
+  /**
+   * Devuelve el contexto a usar: el de ESTA página si es fiable, y si no, la
+   * oferta guardada que mejor encaje.
+   */
+  async function resolveJobContext() {
+    const { text: description, reliable } = extractJobDescriptionWithSource();
+    const title = extractJobTitle();
+
+    // La página actual solo gana a la caché si su oferta viene de una fuente
+    // fiable. En el formulario de HiringRoom el respaldo genérico devuelve el
+    // texto del propio formulario: preferirlo descartaría el contexto bueno
+    // capturado en la oferta y se redactaría sobre la nada.
+    if (reliable && description && description.length >= 400 && title) {
+      return { title, company: extractCompanyName(), description, fromCache: false, candidates: [] };
+    }
+
+    const contexts = await loadJobContexts();
+    if (contexts.length) {
+      const pageText = normalizeForSignals(document.body?.innerText || "").slice(0, 6000);
+      let referrerHost = "";
+      try { referrerHost = document.referrer ? new URL(document.referrer).hostname : ""; } catch (e) {}
+
+      const ranked = contexts
+        .map(c => ({ context: c, score: scoreJobContext(c, pageText, referrerHost) }))
+        .sort((a, b) => b.score - a.score);
+
+      const best = ranked[0];
+      // Sin ninguna prueba de relación (solo recencia) y con varias ofertas
+      // guardadas, elegir por nuestra cuenta sería adivinar: se marca para que
+      // el usuario confirme cuál es en el diálogo.
+      const hasEvidence = best.score >= 40;
+      return {
+        title: best.context.title,
+        company: best.context.company,
+        description: best.context.description,
+        fromCache: true,
+        capturedAt: best.context.capturedAt,
+        uncertain: !hasEvidence && ranked.length > 1,
+        candidates: ranked.map(r => r.context)
+      };
+    }
+
+    // Sin contexto fiable: mejor lo poco que dé esta página que nada.
+    return { title, company: extractCompanyName(), description: description || "", fromCache: false, candidates: [] };
+  }
+
+  /**
+   * Al detectar una postulación enviada se descarta SOLO la oferta a la que se
+   * postuló, no todas: con varios portales abiertos, las demás siguen vigentes.
+   */
+  async function clearJobContextIfSubmitted() {
+    try {
+      const contexts = await loadJobContexts();
+      if (!contexts.length) return;
+
+      const pageText = normalizeForSignals(document.body?.innerText || "").slice(0, 6000);
+      let referrerHost = "";
+      try { referrerHost = document.referrer ? new URL(document.referrer).hostname : ""; } catch (e) {}
+
+      const ranked = contexts
+        .map(c => ({ context: c, score: scoreJobContext(c, pageText, referrerHost) }))
+        .sort((a, b) => b.score - a.score);
+
+      const submitted = ranked[0];
+      if (submitted.score < 40) return; // sin pruebas de a cuál se postuló, no se toca nada
+
+      await saveJobContexts(contexts.filter(c => c !== submitted.context));
+      console.log("[JobFill AI] Postulación enviada:", submitted.context.title, "— oferta descartada del contexto.");
+    } catch (e) {
+      console.warn("[JobFill AI] No se pudo limpiar el contexto:", e);
+    }
+  }
+
+  /**
+   * ¿Esta página es la publicación de una oferta?
+   *
+   * Sirve para autorizar el respaldo genérico de extracción, que lee el cuerpo
+   * de la página. Sin esta comprobación, una página de formulario (que no
+   * contiene la oferta) devolvería su propio texto como "descripción del
+   * puesto", y se cachearía como contexto: el peor resultado posible, porque
+   * Claude redactaría con basura creyendo tener la oferta.
+   */
+  function looksLikeJobPosting() {
+    if (/\/(jobs?|empleos?|trabajos?|vacantes?|careers?|puestos?|ofertas?)\//i.test(location.pathname)) return true;
+    const text = (document.body?.innerText || "").toLowerCase().slice(0, 3000);
+    const markers = ["postular", "postúlate", "apply now", "descripción del puesto", "job description", "requisitos", "requirements", "responsabilidades", "responsibilities"];
+    return markers.filter(m => text.includes(m)).length >= 2;
+  }
+
+  /** Oferta publicada como datos estructurados schema.org/JobPosting. */
+  function extractJobPostingJsonLd() {
+    for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try {
+        const parsed = JSON.parse(script.textContent);
+        const entries = Array.isArray(parsed) ? parsed : [parsed];
+        const posting = entries.find(o => o && (o["@type"] === "JobPosting" || (Array.isArray(o["@type"]) && o["@type"].includes("JobPosting"))));
+        if (posting?.description) {
+          const text = String(posting.description).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+          if (text.length > 200) return text.slice(0, 6000);
+        }
+      } catch (e) { /* JSON-LD malformado: se ignora y se sigue con el DOM */ }
+    }
+    return "";
+  }
+
+  /**
+   * Bloques de texto enriquecido que componen la oferta cuando NO hay un único
+   * contenedor que la envuelva.
+   *
+   * Getonbrd es el caso: la oferta se reparte en varios `div.gb-rich-txt`
+   * (descripción, funciones, requisitos, beneficios), no existe <main>, y
+   * ningún selector de contenedor casa. El resultado era una descripción VACÍA
+   * — Claude redactaba sin conocer el puesto y nadie se enteraba.
+   */
+  function extractRichTextBlocks() {
+    const blocks = [...document.querySelectorAll("[class*='rich-txt'], [class*='rich-text'], [class*='richtext']")]
+      .map(n => (n.innerText || "").trim())
+      .filter(t => t.length > 80);
+
+    if (!blocks.length) return "";
+    // Se deduplica: los contenedores anidados repiten el texto de sus hijos.
+    const unique = blocks.filter((t, i) => !blocks.some((other, j) => j !== i && other.length > t.length && other.includes(t)));
+    return unique.join("\n\n").slice(0, 6000);
+  }
+
+  /**
+   * Último recurso: el bloque de texto más sustancial de la página, excluyendo
+   * navegación, pies y formularios. Solo se usa en páginas que parecen una
+   * oferta publicada.
+   */
+  function extractLargestTextBlock() {
+    if (!looksLikeJobPosting()) return "";
+
+    let best = "";
+    for (const node of document.querySelectorAll("article, section, div")) {
+      // Un bloque que contiene el formulario no es la descripción del puesto.
+      if (node.querySelector("form, textarea, input[type='file']")) continue;
+      if (node.closest("nav, header, footer, aside")) continue;
+
+      const text = (node.innerText || "").trim();
+      if (text.length > best.length && text.length >= 400 && text.length <= 15000) {
+        best = text;
+      }
+    }
+    return best.slice(0, 6000);
+  }
+
+  /**
+   * Devuelve la descripción y DE DÓNDE salió.
+   *
+   * La procedencia importa tanto como el texto: `largest-block` es una
+   * heurística de último recurso que en una página de formulario puede devolver
+   * el texto del propio formulario. Ese texto NUNCA debe cachearse como oferta
+   * ni preferirse sobre un contexto bueno ya guardado — produciría respuestas
+   * seguras de sí mismas sobre un puesto inexistente.
+   *
+   * Se distingue por procedencia y no por heurísticas sobre la página porque
+   * estas últimas no discriminan: una oferta real de Getonbrd tiene 25 campos
+   * de formulario (el modal de "reportar aviso"), así que "parece formulario"
+   * no significa "no es una oferta".
+   */
+  function extractJobDescriptionWithSource() {
+    // Fuente preferida: datos estructurados. Cuando existen son exactos y ya
+    // vienen sin el "cromo" de la página.
+    const structured = extractJobPostingJsonLd();
+    if (structured) return { text: structured, source: "json-ld", reliable: true };
+
+    const selectors = [
+      // LinkedIn (página de detalle y modal de Easy Apply)
+      ".jobs-description__content", ".jobs-box__html-content", "#job-details",
+      // Greenhouse
+      "#content .job__description", "#job-content", "#app-body",
+      // Getonbrd
+      ".job-description", ".gb-job-description", "[class*='job-description']",
+      // Computrabajo: verificado contra el DOM real (panel maestro-detalle).
+      ".description_offer",
+      // Workday
+      "[data-automation-id='jobPostingDescription']",
+      // Lever
+      ".posting-description", ".section-wrapper.page-full-width",
+      // Genérico de respaldo
+      "[class*='jobdescription']", "[class*='job_description']", "main"
+    ];
+
+    for (const sel of selectors) {
+      const node = document.querySelector(sel);
+      const text = node?.innerText?.trim();
+      if (text && text.length > 100) {
+        return { text: text.slice(0, 6000), source: "selector", reliable: true };
+      }
+    }
+
+    // Sitios donde la oferta se reparte en varios bloques sin contenedor común
+    // (Getonbrd): sigue siendo una fuente fiable, apunta a contenido editorial.
+    const rich = extractRichTextBlocks();
+    if (rich) return { text: rich, source: "rich-text", reliable: true };
+
+    // Último recurso, NO fiable: puede ser el texto de un formulario.
+    const largest = extractLargestTextBlock();
+    if (largest) return { text: largest, source: "largest-block", reliable: false };
+
+    return { text: "", source: "", reliable: false };
+  }
+
+  function extractJobDescription() {
+    return extractJobDescriptionWithSource().text;
+  }
+
+  /**
+   * Respuestas ya redactadas por Claude en ESTE formulario, por campo. Se envían
+   * en la siguiente llamada para que el modelo no entregue tres párrafos casi
+   * calcados (misma apertura, mismo proyecto) a tres preguntas distintas: el
+   * reclutador las lee juntas y la plantilla queda a la vista.
+   *
+   * Es un Map (clave = el propio elemento) y no un array para que regenerar la
+   * respuesta de un campo REEMPLACE la anterior en vez de acumular una versión
+   * obsoleta que luego el modelo intentaría evitar repetir.
+   */
+  const generatedAnswersByField = new Map();
+
+  function rememberGeneratedAnswer(el, answer) {
+    generatedAnswersByField.set(el, answer);
+  }
+
+  function getPreviousAnswers(currentEl) {
+    const answers = [];
+    for (const [el, answer] of generatedAnswersByField) {
+      // Excluir el propio campo: al regenerar, su respuesta anterior se descarta,
+      // no es algo de lo que haya que diferenciarse.
+      if (el === currentEl) continue;
+      // Un campo ya editado a mano o desmontado del DOM ya no representa lo que
+      // el reclutador va a leer.
+      if (!el.isConnected) continue;
+      if (typeof el.value === "string" && el.value.trim() !== answer.trim()) continue;
+      answers.push(answer);
+    }
+    return answers;
+  }
+
+  /**
+   * Muestra la pregunta que se interpretó del DOM y espera la confirmación del
+   * usuario antes de llamar a Claude.
+   *
+   * El texto es EDITABLE a propósito: cuando la extracción falla (formularios
+   * sin marcado semántico, enunciados partidos en varios nodos), esta ventana
+   * deja de ser solo un aviso y pasa a ser el arreglo — el usuario corrige el
+   * enunciado y obtiene igualmente su respuesta, sin depender de que la
+   * extensión entienda ese sitio.
+   *
+   * Devuelve la pregunta confirmada (posiblemente editada) o null si se cancela.
+   */
+  /**
+   * Estilos del diálogo, incrustados en su propio Shadow DOM en vez de vivir en
+   * autofill.css. Un componente en Shadow DOM no hereda los estilos de la
+   * página, así que tendría que cargarlos por <link> desde el paquete de la
+   * extensión — lo que añade tres formas de fallar: depender de declararlo en
+   * web_accessible_resources, un parpadeo sin estilos mientras la hoja carga, y
+   * un diálogo crudo si la carga falla. Incrustarlos elimina las tres.
+   * Se incluyen las animaciones porque las de la hoja global no cruzan el shadow.
+   */
+  const CONFIRM_DIALOG_STYLES = `
+    @keyframes jf-fade-in { from { opacity: 0; } to { opacity: 1; } }
+    @keyframes jf-pop-in {
+      from { opacity: 0; transform: translateY(8px) scale(0.98); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    :host { all: initial; }
+    .jobfill-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 2147483647;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background: rgba(15, 23, 42, 0.55);
+      animation: jf-fade-in 0.15s ease;
+    }
+    .jobfill-confirm {
+      box-sizing: border-box;
+      width: min(560px, 100%);
+      max-height: 90vh;
+      overflow-y: auto;
+      padding: 22px;
+      border-radius: 14px;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #f8fafc;
+      background: #0f172a;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+      animation: jf-pop-in 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    .jobfill-confirm h3 {
+      margin: 0 0 6px;
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .jobfill-confirm p {
+      margin: 0 0 14px;
+      font-size: 12.5px;
+      line-height: 1.5;
+      color: #94a3b8;
+    }
+    .jobfill-confirm strong { color: #cbd5e1; }
+    .jobfill-confirm textarea {
+      box-sizing: border-box;
+      display: block;
+      width: 100%;
+      min-height: 88px;
+      padding: 11px 13px;
+      border-radius: 9px;
+      font-family: inherit;
+      font-size: 13.5px;
+      line-height: 1.5;
+      color: #f8fafc;
+      background: #1e293b;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      resize: vertical;
+    }
+    .jobfill-confirm textarea:focus {
+      outline: none;
+      border-color: #6366f1;
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25);
+    }
+    .jobfill-confirm-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 9px;
+      margin-top: 16px;
+    }
+    .jobfill-confirm button {
+      flex: 1 1 auto;
+      padding: 10px 16px;
+      border: 1px solid transparent;
+      border-radius: 9px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: filter 0.15s ease;
+    }
+    .jobfill-confirm button:hover { filter: brightness(1.12); }
+    .jobfill-confirm-ok { color: #fff; background: #6366f1; }
+    .jobfill-confirm-cancel {
+      color: #cbd5e1;
+      background: transparent;
+      border-color: rgba(255, 255, 255, 0.18);
+    }
+    .jobfill-confirm-skip {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 14px;
+      font-size: 12px;
+      color: #94a3b8;
+      cursor: pointer;
+    }
+    .jobfill-confirm-skip input { cursor: pointer; }
+    .jobfill-field {
+      margin-bottom: 12px;
+    }
+    .jobfill-field label {
+      display: block;
+      margin-bottom: 5px;
+      font-size: 11.5px;
+      font-weight: 600;
+      color: #94a3b8;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .jobfill-field input[type="text"] {
+      box-sizing: border-box;
+      width: 100%;
+      padding: 9px 11px;
+      border-radius: 8px;
+      font-family: inherit;
+      font-size: 13.5px;
+      color: #f8fafc;
+      background: #1e293b;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+    }
+    .jobfill-field input[type="text"]:focus {
+      outline: none;
+      border-color: #6366f1;
+      box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.25);
+    }
+    .jobfill-field textarea { min-height: 60px; }
+    .jobfill-panel-source {
+      margin: -4px 0 14px;
+      font-size: 11.5px;
+      color: #64748b;
+    }
+    .jobfill-confirm-danger {
+      color: #fca5a5;
+      background: transparent;
+      border-color: rgba(248, 113, 113, 0.35);
+      flex: 0 0 auto;
+    }
+    .jobfill-context {
+      display: flex;
+      gap: 8px;
+      margin-top: 12px;
+      padding: 10px 12px;
+      border-radius: 9px;
+      font-size: 12px;
+      line-height: 1.45;
+      color: #cbd5e1;
+      background: rgba(99, 102, 241, 0.12);
+      border: 1px solid rgba(99, 102, 241, 0.3);
+    }
+    .jobfill-context strong { color: #f8fafc; }
+    .jobfill-context > div { flex: 1; min-width: 0; }
+    .jobfill-context-uncertain {
+      background: rgba(245, 158, 11, 0.12);
+      border-color: rgba(245, 158, 11, 0.4);
+    }
+    .jobfill-context-select {
+      box-sizing: border-box;
+      width: 100%;
+      margin-top: 9px;
+      padding: 7px 9px;
+      border-radius: 7px;
+      font-family: inherit;
+      font-size: 12.5px;
+      color: #f8fafc;
+      background: #1e293b;
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      cursor: pointer;
+    }
+    .jobfill-context-select:focus {
+      outline: none;
+      border-color: #6366f1;
+    }`;
+
+  /** Estilos extra del diálogo de cobertura (se suman a los del de confirmación). */
+  const COVERAGE_DIALOG_STYLES = `
+    .jobfill-group {
+      margin-top: 14px;
+      padding: 13px 14px;
+      border-radius: 10px;
+      background: rgba(148, 163, 184, 0.08);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .jobfill-group h4 {
+      margin: 0 0 4px;
+      font-size: 12.5px;
+      font-weight: 700;
+      color: #e2e8f0;
+    }
+    .jobfill-group-hint {
+      margin: 0 0 10px !important;
+      font-size: 11.5px !important;
+      line-height: 1.45 !important;
+    }
+    .jobfill-terms {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 7px;
+    }
+    .jobfill-term {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 11px;
+      border-radius: 999px;
+      font-size: 12.5px;
+      color: #e2e8f0;
+      background: #1e293b;
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      cursor: pointer;
+      transition: border-color 0.15s ease, background-color 0.15s ease;
+    }
+    .jobfill-term:hover { border-color: rgba(99, 102, 241, 0.6); }
+    .jobfill-term:has(input:checked) {
+      background: rgba(99, 102, 241, 0.22);
+      border-color: #6366f1;
+    }
+    .jobfill-term input { cursor: pointer; margin: 0; }`;
+
+  /**
+   * Pregunta qué tecnologías/requisitos que pide la oferta y NO están en el
+   * perfil guardado, el usuario realmente domina — ANTES de generar la
+   * respuesta, no después. Preguntarlo recién con el texto ya escrito es
+   * ilógico: para entonces Claude ya redactó sin saber si esa habilidad es
+   * real, y "reescribir" gasta una segunda llamada por algo que se pudo saber
+   * de entrada. Lo confirmado aquí se manda como `mustCover` en la ÚNICA
+   * llamada de generación.
+   *
+   * No requiere llamar a Claude: `unbacked` es una comparación local entre la
+   * oferta y el perfil (ver `handlePreviewUnbackedTerms` en el service
+   * worker), así que este paso es instantáneo y no consume tokens.
+   */
+  function confirmSkillsBeforeGenerating(unbackedTerms) {
+    if (!unbackedTerms || !unbackedTerms.length) return Promise.resolve(null);
+
+    return new Promise(resolve => {
+      const host = document.createElement("div");
+      host.className = "jobfill-dialog-host";
+      const shadow = host.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = CONFIRM_DIALOG_STYLES + COVERAGE_DIALOG_STYLES;
+
+      const item = term => `
+        <label class="jobfill-term">
+          <input type="checkbox" value="${escapeHtml(term)}">
+          <span>${escapeHtml(term)}</span>
+        </label>`;
+
+      const overlay = document.createElement("div");
+      overlay.className = "jobfill-overlay";
+      overlay.innerHTML = `
+        <div class="jobfill-confirm" role="dialog" aria-modal="true" aria-label="Confirmar habilidades antes de redactar">
+          <h3>🎯 Antes de redactar</h3>
+          <p>La oferta pide esto y no está en tu perfil guardado. Marca <strong>solo</strong> lo que realmente domines — se incluirá en la respuesta desde el principio.</p>
+          <div class="jobfill-group">
+            <div class="jobfill-terms">${unbackedTerms.map(item).join("")}</div>
+          </div>
+          <div class="jobfill-confirm-actions">
+            <button class="jobfill-confirm-ok" type="button">✓ Continuar</button>
+            <button class="jobfill-confirm-cancel" type="button">Omitir</button>
+          </div>
+        </div>`;
+
+      shadow.append(style, overlay);
+      attachToTopLayerHost(host);
+
+      let settled = false;
+      const close = result => {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKeydown, true);
+        host.remove();
+        resolve(result);
+      };
+
+      function onKeydown(e) {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          close(null);
+        }
+      }
+
+      shadow.querySelector(".jobfill-confirm-ok").addEventListener("click", () => {
+        const checked = [...shadow.querySelectorAll(".jobfill-terms input:checked")].map(c => c.value);
+        close(checked);
+      });
+      shadow.querySelector(".jobfill-confirm-cancel").addEventListener("click", () => close(null));
+      overlay.addEventListener("click", e => { if (e.target === overlay) close(null); });
+      document.addEventListener("keydown", onKeydown, true);
+    });
+  }
+
+  /**
+   * Revisión de cobertura: muestra qué requisitos de la oferta no quedaron en la
+   * respuesta y deja que el usuario decida cuáles incluir.
+   *
+   * Los dos grupos tienen naturaleza distinta y por eso se presentan separados:
+   *  - `omitted` viene respaldado por el perfil, así que va premarcado: es una
+   *    omisión, no una decisión.
+   *  - `unbacked` NO está respaldado por nada, así que va desmarcado y se
+   *    pregunta. Aquí el usuario es la única fuente válida: su perfil guardado
+   *    está incompleto, pero solo él sabe si domina algo de verdad.
+   *
+   * Devuelve null si no hay nada que revisar o si se descarta.
+   */
+  function reviewRequirementCoverage(coverage, jobDescription) {
+    const omitted = coverage?.omitted || [];
+    const unbacked = coverage?.unbacked || [];
+    if (!jobDescription || (!omitted.length && !unbacked.length)) return Promise.resolve(null);
+
+    return new Promise(resolve => {
+      const host = document.createElement("div");
+      host.className = "jobfill-dialog-host";
+      const shadow = host.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = CONFIRM_DIALOG_STYLES + COVERAGE_DIALOG_STYLES;
+
+      const item = (term, group, checked) => `
+        <label class="jobfill-term">
+          <input type="checkbox" value="${escapeHtml(term)}" data-group="${group}" ${checked ? "checked" : ""}>
+          <span>${escapeHtml(term)}</span>
+        </label>`;
+
+      const overlay = document.createElement("div");
+      overlay.className = "jobfill-overlay";
+      overlay.innerHTML = `
+        <div class="jobfill-confirm" role="dialog" aria-modal="true" aria-label="Revisar cobertura de requisitos">
+          <h3>🎯 Cobertura de la oferta</h3>
+          <p>Estos requisitos aparecen en la oferta pero no en la respuesta. Marca los que quieras incluir y se reescribirá.</p>
+
+          ${omitted.length ? `
+            <div class="jobfill-group">
+              <h4>Tu perfil ya lo respalda — se omitió</h4>
+              <p class="jobfill-group-hint">Perder el match por no mencionarlo es el error más caro y el más fácil de evitar.</p>
+              <div class="jobfill-terms">${omitted.map(t => item(t, "omitted", true)).join("")}</div>
+            </div>` : ""}
+
+          ${unbacked.length ? `
+            <div class="jobfill-group">
+              <h4>La oferta lo pide y no está en tu perfil</h4>
+              <p class="jobfill-group-hint">Marca <strong>solo</strong> lo que realmente domines: tu perfil guardado está incompleto, pero en una entrevista te preguntarán por lo que escribas.</p>
+              <div class="jobfill-terms">${unbacked.map(t => item(t, "unbacked", false)).join("")}</div>
+              <label class="jobfill-confirm-skip">
+                <input type="checkbox" class="jobfill-save-profile" checked>
+                Guardar lo marcado en mi perfil para las próximas postulaciones
+              </label>
+            </div>` : ""}
+
+          <div class="jobfill-confirm-actions">
+            <button class="jobfill-confirm-ok" type="button">↻ Reescribir incluyéndolos</button>
+            <button class="jobfill-confirm-cancel" type="button">Dejar como está</button>
+          </div>
+        </div>`;
+
+      shadow.append(style, overlay);
+      attachToTopLayerHost(host);
+
+      let settled = false;
+      const close = result => {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKeydown, true);
+        host.remove();
+        resolve(result);
+      };
+
+      function onKeydown(e) {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          close(null);
+        }
+      }
+
+      shadow.querySelector(".jobfill-confirm-ok").addEventListener("click", () => {
+        const checked = [...shadow.querySelectorAll(".jobfill-terms input:checked")];
+        if (!checked.length) {
+          close(null);
+          return;
+        }
+        const saveToProfile = shadow.querySelector(".jobfill-save-profile")?.checked;
+        close({
+          terms: checked.map(c => c.value),
+          // Solo se guardan en el perfil los que el usuario confirmó tener y no
+          // estaban registrados; los omitidos ya figuran ahí.
+          termsToSaveInProfile: saveToProfile
+            ? checked.filter(c => c.dataset.group === "unbacked").map(c => c.value)
+            : []
+        });
+      });
+      shadow.querySelector(".jobfill-confirm-cancel").addEventListener("click", () => close(null));
+      overlay.addEventListener("click", e => { if (e.target === overlay) close(null); });
+      document.addEventListener("keydown", onKeydown, true);
+    });
+  }
+
+  function escapeHtml(str) {
+    return String(str).replace(/[&<>"']/g, c => (
+      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+    ));
+  }
+
+  function confirmQuestionWithUser(questionText, isAmbiguous = false, jobContext = null) {
+    return new Promise(resolve => {
+      // Con qué oferta se va a redactar. Solo se muestra cuando viene de la
+      // caché: si sale de la página actual es evidente y añadiría ruido.
+      let contextLine = "";
+      const candidates = jobContext?.candidates || [];
+      if (jobContext && jobContext.fromCache && jobContext.title) {
+        const describe = ctx => {
+          const minutes = Math.round((Date.now() - (ctx.capturedAt || Date.now())) / 60000);
+          const when = minutes < 1 ? "recién" : minutes < 60 ? `hace ${minutes} min` : `hace ${Math.round(minutes / 60)} h`;
+          return `${ctx.title}${ctx.company ? ` — ${ctx.company}` : ""} (${when})`;
+        };
+
+        // Con varias ofertas guardadas se ofrece elegir. Cuando además no hay
+        // pruebas de a cuál corresponde este formulario (`uncertain`), la
+        // elección deja de ser una comodidad y pasa a ser necesaria: redactar
+        // con la oferta equivocada produce una respuesta convincente y errónea.
+        const selector = candidates.length > 1
+          ? `<select class="jobfill-context-select">
+               ${candidates.map((c, i) => `<option value="${i}"${c.title === jobContext.title && c.capturedAt === jobContext.capturedAt ? " selected" : ""}>${escapeHtml(describe(c))}</option>`).join("")}
+             </select>`
+          : "";
+
+        contextLine = `
+          <div class="jobfill-context${jobContext.uncertain ? " jobfill-context-uncertain" : ""}">
+            <span>${jobContext.uncertain ? "❓" : "📄"}</span>
+            <div>
+              <div>${jobContext.uncertain
+                ? "Esta página no incluye la oferta y no se pudo determinar a cuál corresponde. <strong>Confirma el puesto</strong> antes de redactar:"
+                : `Se redactará para <strong>${escapeHtml(jobContext.title)}</strong>${jobContext.company ? ` en ${escapeHtml(jobContext.company)}` : ""}, según la oferta que viste. Esta página no la incluye.`}</div>
+              ${selector}
+            </div>
+          </div>`;
+      }
+      const host = document.createElement("div");
+      host.className = "jobfill-dialog-host";
+      // Shadow DOM: los formularios de postulación traen CSS agresivo (resets
+      // globales, !important sobre button/textarea) que deformaría el diálogo.
+      const shadow = host.attachShadow({ mode: "open" });
+
+      const style = document.createElement("style");
+      style.textContent = CONFIRM_DIALOG_STYLES;
+
+      const overlay = document.createElement("div");
+      overlay.className = "jobfill-overlay";
+      overlay.innerHTML = `
+        <div class="jobfill-confirm" role="dialog" aria-modal="true" aria-label="Confirmar pregunta">
+          <h3>${isAmbiguous ? "⚠️ Revisa esta pregunta" : "¿Es esta la pregunta?"}</h3>
+          <p>${isAmbiguous
+            ? "Este formulario no identifica sus campos con claridad y varios comparten el mismo texto, así que el enunciado leído probablemente <strong>no</strong> corresponde a este campo. Cópialo del formulario y pégalo aquí para obtener una respuesta correcta."
+            : "JobFill AI leyó este enunciado del formulario. Si no coincide con lo que ves en pantalla, corrígelo aquí antes de redactar."}</p>
+          <textarea class="jobfill-confirm-input" spellcheck="false"></textarea>
+          ${contextLine}
+          <div class="jobfill-confirm-actions">
+            <button class="jobfill-confirm-ok" type="button">✨ Redactar respuesta</button>
+            <button class="jobfill-confirm-cancel" type="button">Cancelar</button>
+          </div>
+          ${isAmbiguous || jobContext?.uncertain ? "" : `<label class="jobfill-confirm-skip">
+            <input type="checkbox" class="jobfill-confirm-skip-input">
+            No volver a preguntar (se puede reactivar en opciones)
+          </label>`}
+        </div>`;
+
+      shadow.append(style, overlay);
+      attachToTopLayerHost(host);
+
+      const input = shadow.querySelector(".jobfill-confirm-input");
+      const skipBox = shadow.querySelector(".jobfill-confirm-skip-input");
+      input.value = questionText;
+      input.focus();
+      input.setSelectionRange(input.value.length, input.value.length);
+
+      let settled = false;
+      const close = result => {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKeydown, true);
+        host.remove();
+        resolve(result);
+      };
+
+      function onKeydown(e) {
+        if (e.key === "Escape") {
+          e.stopPropagation();
+          close(null);
+        } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+          e.stopPropagation();
+          accept();
+        }
+      }
+
+      function accept() {
+        const edited = input.value.trim();
+        if (!edited) {
+          input.focus();
+          return;
+        }
+        // skipBox no existe en el caso ambiguo (ahí siempre se pregunta).
+        if (skipBox && skipBox.checked) {
+          // Persistir la preferencia; si el guardado falla, la confirmación
+          // simplemente seguirá apareciendo — nunca se pierde la respuesta.
+          try {
+            chrome.storage.local.set({ confirmQuestionBeforeAi: false });
+          } catch (e) {
+            console.warn("[JobFill AI] No se pudo guardar la preferencia:", e);
+          }
+        }
+        // La oferta elegida se devuelve junto con la pregunta: el usuario puede
+        // haber corregido cuál es el puesto en el mismo diálogo.
+        const select = shadow.querySelector(".jobfill-context-select");
+        const chosen = select ? candidates[parseInt(select.value, 10)] : null;
+        close({ question: edited, chosenContext: chosen || null });
+      }
+
+      shadow.querySelector(".jobfill-confirm-ok").addEventListener("click", accept);
+      shadow.querySelector(".jobfill-confirm-cancel").addEventListener("click", () => close(null));
+      // Clic fuera del cuadro = cancelar, como en cualquier modal.
+      overlay.addEventListener("click", e => { if (e.target === overlay) close(null); });
+      document.addEventListener("keydown", onKeydown, true);
+    });
+  }
+
+  /**
+   * Detecta todas las preguntas abiertas visibles en la página, con la misma
+   * heurística que ya decide cuándo mostrar el botón ✨ individual (ver el
+   * listener de `focusin`). Dos campos que resuelven al MISMO enunciado se
+   * excluyen ambos del lote — mismo criterio de "ambiguo" que en el flujo de
+   * una sola pregunta: adivinar a cuál pertenece produciría una respuesta
+   * convincente sobre el campo equivocado.
+   */
+  function detectAnswerableQuestions() {
+    const candidates = Array.from(
+      document.querySelectorAll("textarea, [contenteditable='true'], input[type='text'], input:not([type])")
+    ).filter(el => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      if (el.tagName === "INPUT") {
+        const ctx = getFieldContext(el);
+        return ctx.length > 25 && /(describa|por qu[eé]|cu[aá]l|cu[aá]ntos|why|how|explain|tell|resume|cu[eé]ntanos)/i.test(ctx);
+      }
+      return true;
+    });
+
+    const byQuestion = new Map();
+    for (const el of candidates) {
+      const question = extractHumanQuestion(el);
+      if (!question || question.length < 3) continue;
+      byQuestion.set(question, byQuestion.has(question) ? "ambiguous" : el);
+    }
+
+    const items = [];
+    for (const [question, elOrFlag] of byQuestion) {
+      if (elOrFlag === "ambiguous") continue;
+      items.push({ el: elOrFlag, question });
+    }
+    return items;
+  }
+
+  /**
+   * Recuadro de revisión del lote: lista TODAS las preguntas detectadas para
+   * que el usuario confirme que coinciden con el formulario real antes de
+   * gastar la única llamada agrupada — mismo espíritu que el diálogo de "¿es
+   * esta la pregunta?" de una sola pregunta, pero para el lote completo.
+   */
+  function confirmBatchQuestions(items) {
+    return new Promise(resolve => {
+      const host = document.createElement("div");
+      host.className = "jobfill-dialog-host";
+      const shadow = host.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = CONFIRM_DIALOG_STYLES + COVERAGE_DIALOG_STYLES;
+
+      const row = (item, idx) => `
+        <label class="jobfill-term" style="align-items: flex-start;">
+          <input type="checkbox" data-idx="${idx}" checked>
+          <textarea class="jobfill-confirm-input jobfill-batch-row" data-idx="${idx}" spellcheck="false" rows="2">${escapeHtml(item.question)}</textarea>
+        </label>`;
+
+      const overlay = document.createElement("div");
+      overlay.className = "jobfill-overlay";
+      overlay.innerHTML = `
+        <div class="jobfill-confirm" role="dialog" aria-modal="true" aria-label="Confirmar preguntas a responder">
+          <h3>¿Son estas las preguntas a responder?</h3>
+          <p>Se detectaron ${items.length} pregunta${items.length > 1 ? "s" : ""} abierta${items.length > 1 ? "s" : ""} en este formulario. Desmarca las que no correspondan y corrige el texto si hace falta — se responden todas con una sola llamada.</p>
+          <div class="jobfill-group"><div class="jobfill-terms">${items.map(row).join("")}</div></div>
+          <div class="jobfill-confirm-actions">
+            <button class="jobfill-confirm-ok" type="button">✨ Responder todas</button>
+            <button class="jobfill-confirm-cancel" type="button">Cancelar</button>
+          </div>
+        </div>`;
+
+      shadow.append(style, overlay);
+      attachToTopLayerHost(host);
+
+      let settled = false;
+      const close = result => {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKeydown, true);
+        host.remove();
+        resolve(result);
+      };
+      function onKeydown(e) { if (e.key === "Escape") { e.stopPropagation(); close(null); } }
+
+      shadow.querySelector(".jobfill-confirm-ok").addEventListener("click", () => {
+        const rows = [...shadow.querySelectorAll(".jobfill-term")];
+        const picked = [];
+        rows.forEach((rowEl, idx) => {
+          const checked = rowEl.querySelector("input[type='checkbox']").checked;
+          if (!checked) return;
+          const editedText = rowEl.querySelector("textarea").value.trim();
+          if (editedText.length < 3) return;
+          picked.push({ el: items[idx].el, question: editedText });
+        });
+        close(picked.length ? picked : null);
+      });
+      shadow.querySelector(".jobfill-confirm-cancel").addEventListener("click", () => close(null));
+      overlay.addEventListener("click", e => { if (e.target === overlay) close(null); });
+      document.addEventListener("keydown", onKeydown, true);
+    });
+  }
+
+  /**
+   * Punto de entrada del botón "Responder todas": detecta, confirma, pregunta
+   * habilidades no respaldadas UNA vez por formulario y manda un único
+   * ASK_CLAUDE_AI_BATCH — la alternativa a llamar a la API una vez por campo.
+   */
+  async function handleAnswerAllQuestions(btn) {
+    const allDetected = detectAnswerableQuestions();
+    if (!allDetected.length) {
+      showToast("No se detectaron preguntas abiertas en este formulario.", "info");
+      return;
+    }
+
+    // Tope de seguridad de coste: una página con muchos textareas (un foro
+    // embebido, un editor de perfil completo) haría un prompt enorme en una
+    // sola llamada, que es justo lo que este modo existe para evitar. Se
+    // avisa en vez de recortar en silencio: el usuario decide si responde el
+    // resto en una segunda tanda.
+    const MAX_BATCH_QUESTIONS = 12;
+    const detected = allDetected.slice(0, MAX_BATCH_QUESTIONS);
+    if (allDetected.length > detected.length) {
+      showToast(`Se detectaron ${allDetected.length} preguntas; se responderán las primeras ${detected.length} para no disparar el coste.`, "info");
+    }
+
+    const picked = await confirmBatchQuestions(detected);
+    if (!picked) {
+      showToast("Redacción por lote cancelada.", "info");
+      return;
+    }
+
+    const jobContext = await resolveJobContext();
+
+    let confirmedSkills = [];
+    try {
+      const unbackedPreview = await previewUnbackedTerms(jobContext);
+      if (unbackedPreview.length) {
+        const skillPick = await confirmSkillsBeforeGenerating(unbackedPreview);
+        if (skillPick && skillPick.length) {
+          confirmedSkills = skillPick;
+          await addSkillsToProfile(confirmedSkills);
+        }
+      }
+    } catch (e) {
+      console.warn("[JobFill AI] No se pudo previsualizar habilidades para el lote:", e);
+    }
+
+    const items = picked.map((item, idx) => ({
+      id: `q${idx}`,
+      question: item.question,
+      maxCharacters: detectFieldCharacterLimit(item.el),
+      minCharacters: detectFieldMinimumLength(item.el)
+    }));
+
+    const originalText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = `Redactando ${items.length} respuestas...`;
+
+    try {
+      const response = await new Promise((resolve, reject) => {
+        let settled = false;
+        const safetyTimer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          reject(new Error("Tiempo de espera agotado esperando el lote de respuestas."));
+        }, 90000);
+        try {
+          chrome.runtime.sendMessage({
+            type: "ASK_CLAUDE_AI_BATCH",
+            payload: {
+              items,
+              jobTitle: jobContext.title,
+              companyName: jobContext.company,
+              jobDescription: jobContext.description,
+              mustCover: confirmedSkills
+            }
+          }, res => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(safetyTimer);
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message || "Error al comunicar con la extensión."));
+            } else {
+              resolve(res);
+            }
+          });
+        } catch (e) {
+          if (!settled) { settled = true; clearTimeout(safetyTimer); reject(e); }
+        }
+      });
+
+      if (!response || !response.success) {
+        throw new Error(response?.error || "El service worker no pudo responder el lote.");
+      }
+
+      const resultsById = new Map(response.results.map(r => [r.id, r.answer]));
+      let filledCount = 0;
+      picked.forEach((item, idx) => {
+        const answer = resultsById.get(`q${idx}`);
+        if (!answer) return;
+        const maxCharacters = items[idx].maxCharacters;
+        const finalAnswer = maxCharacters ? enforceSafeCharacterLimit(answer, maxCharacters) : answer;
+        setElementValue(item.el, finalAnswer);
+        rememberGeneratedAnswer(item.el, finalAnswer);
+        item.el.classList.add("jobfill-highlight-ai");
+        setTimeout(() => item.el.classList.remove("jobfill-highlight-ai"), 2500);
+        filledCount++;
+      });
+
+      const missing = response.missingIds?.length || 0;
+      showToast(
+        `✨ ${filledCount} respuesta${filledCount === 1 ? "" : "s"} redactada${filledCount === 1 ? "" : "s"} con una sola llamada.` +
+          (missing ? ` (${missing} sin respuesta, revísalas manualmente)` : ""),
+        filledCount ? "success" : "error"
+      );
+
+      // No se ofrece "reescribir incluyéndolos" aquí: eso significaría una
+      // segunda llamada a la API, justo lo que este modo agrupado evita. Se
+      // avisa igual de qué quedó fuera, para que el usuario lo agregue a mano.
+      const omitted = response.coverage?.omitted || [];
+      if (omitted.length) {
+        showToast(`💡 Tu perfil respalda esto y ninguna respuesta lo mencionó: ${omitted.join(", ")}.`, "info");
+      }
+    } catch (err) {
+      console.error("[JobFill AI] Error en el lote de respuestas:", err);
+      showToast(err?.message || "Error al invocar Claude IA en modo lote.", "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = originalText;
+    }
+  }
+
+  async function handleGenerateAiAnswer(textarea, btn) {
+    const extractedQuestion = extractHumanQuestion(textarea);
+    if (!extractedQuestion || extractedQuestion.length < 3) {
+      showToast("No se pudo identificar la pregunta asociada a este campo.", "error");
+      return;
+    }
+
+    // Salvavidas genérico (no atado a ningún sitio): si otro campo visible de la
+    // página resuelve exactamente a la misma pregunta, la extracción está
+    // devolviendo un texto compartido en vez del enunciado propio de este campo.
+    // Es la firma exacta del fallo de HiringRoom — donde los 4 campos caían al
+    // placeholder "Ingresa tu respuesta..." — y ocurriría igual en cualquier otro
+    // formulario sin marcado semántico. Generar igualmente produce una respuesta
+    // impecable que contesta otra cosa: un fallo silencioso que el usuario solo
+    // detecta releyendo.
+    const isAmbiguous = Array.from(
+      document.querySelectorAll("textarea, [contenteditable='true']")
+    ).some(other => {
+      if (other === textarea) return false;
+      const rect = other.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) return false;
+      return extractHumanQuestion(other) === extractedQuestion;
+    });
+
+    if (isAmbiguous) {
+      console.warn("[JobFill AI] Pregunta ambigua: varios campos resuelven a", JSON.stringify(extractedQuestion));
+    }
+    console.log("[JobFill AI] Campo:", textarea.name || textarea.id || "(sin nombre)", "| Pregunta interpretada:", JSON.stringify(extractedQuestion));
+
+    // Confirmación previa (activada por defecto): el usuario ve el enunciado que
+    // se interpretó y lo acepta o lo corrige. Es lo que convierte un fallo de
+    // extracción en algo visible y reparable en el momento, en vez de una
+    // respuesta impecable que contesta otra pregunta.
+    let askBeforeGenerating = true;
+    try {
+      const prefs = await chrome.storage.local.get("confirmQuestionBeforeAi");
+      askBeforeGenerating = prefs.confirmQuestionBeforeAi !== false;
+    } catch (e) {
+      // Si el storage falla, se pregunta: ante la duda, que decida el usuario.
+      console.warn("[JobFill AI] No se pudo leer la preferencia de confirmación:", e);
+    }
+
+    // Se resuelve ANTES del diálogo para poder mostrar con qué oferta se va a
+    // redactar: si el contexto viene de la caché y es de otro puesto, el usuario
+    // lo ve aquí. Sin mostrarlo, una oferta cacheada equivocada produce una
+    // respuesta convincente sobre el puesto que no es — el mismo fallo silencioso
+    // que la pregunta mal extraída.
+    let jobContext = await resolveJobContext();
+    if (jobContext.fromCache) {
+      console.log("[JobFill AI] Usando contexto de oferta cacheado:", jobContext.title);
+    }
+
+    let questionText = extractedQuestion;
+    // Se pregunta también cuando no se pudo determinar a qué oferta pertenece
+    // este formulario: elegir por nuestra cuenta entre varias sería adivinar, y
+    // el error resultante es invisible (una respuesta impecable sobre otro puesto).
+    if (askBeforeGenerating || isAmbiguous || jobContext.uncertain) {
+      // El caso ambiguo SIEMPRE pregunta, aunque la confirmación esté desactivada:
+      // ahí se sabe que la extracción es poco fiable, y el diálogo es la vía de
+      // reparación. Desactivar la confirmación silencia el caso normal, no este.
+      const confirmed = await confirmQuestionWithUser(extractedQuestion, isAmbiguous, jobContext);
+      if (!confirmed) {
+        showToast("Redacción cancelada.", "info");
+        return;
+      }
+      questionText = confirmed.question;
+      if (confirmed.chosenContext) {
+        jobContext = {
+          ...jobContext,
+          title: confirmed.chosenContext.title,
+          company: confirmed.chosenContext.company,
+          description: confirmed.chosenContext.description,
+          capturedAt: confirmed.chosenContext.capturedAt
+        };
+      }
+    }
+
+    // Se pregunta ANTES de generar qué pide la oferta que el perfil no
+    // respalda — no después, con el texto ya escrito sobre una habilidad sin
+    // confirmar (ver confirmSkillsBeforeGenerating). Comprobación local, sin
+    // llamar a Claude: no cuesta tokens ni tiempo de red.
+    let confirmedSkills = [];
+    let askedSkillTerms = [];
+    try {
+      const unbackedPreview = await previewUnbackedTerms(jobContext);
+      if (unbackedPreview.length) {
+        askedSkillTerms = unbackedPreview;
+        const picked = await confirmSkillsBeforeGenerating(unbackedPreview);
+        if (picked && picked.length) {
+          confirmedSkills = picked;
+          await addSkillsToProfile(confirmedSkills);
+        }
+      }
+    } catch (e) {
+      console.warn("[JobFill AI] No se pudo previsualizar habilidades no respaldadas:", e);
+    }
+
+    const maxCharacters = detectFieldCharacterLimit(textarea);
+    const minCharacters = detectFieldMinimumLength(textarea);
+
+    btn.classList.add("jobfill-loading");
+    btn.title = `Generando respuesta a: "${questionText.slice(0, 120)}"${maxCharacters ? ` (máx ${maxCharacters} car.)` : ""}`;
+
+    const basePayload = {
+      question: questionText,
+      fieldType: "textarea",
+      jobTitle: jobContext.title,
+      companyName: jobContext.company,
+      jobDescription: jobContext.description,
+      maxCharacters,
+      minCharacters,
+      previousAnswers: getPreviousAnswers(textarea),
+      mustCover: confirmedSkills
+    };
+
+    const applyAnswer = answer => {
+      const finalAnswer = maxCharacters ? enforceSafeCharacterLimit(answer, maxCharacters) : answer;
+      setElementValue(textarea, finalAnswer);
+      rememberGeneratedAnswer(textarea, finalAnswer);
+      textarea.classList.add("jobfill-highlight-ai");
+      setTimeout(() => textarea.classList.remove("jobfill-highlight-ai"), 2500);
+      showToast(`✨ Respuesta redactada (${finalAnswer.length}${maxCharacters ? `/${maxCharacters}` : ""} caracteres).`, "success");
+      return finalAnswer;
+    };
+
+    try {
+      const result = await requestClaudeAnswer(basePayload);
+      applyAnswer(result.answer);
+
+      // Verificación de cobertura: qué requisitos de la oferta quedaron fuera de
+      // la respuesta. Se hace DESPUÉS de rellenar para que el usuario ya tenga
+      // algo utilizable aunque descarte la revisión. Solo mira `omitted` (lo
+      // que el perfil respalda pero el texto no mencionó): "unbacked" ya se
+      // preguntó ANTES de generar, así que se descarta aquí para no repetir
+      // la misma pregunta sobre lo que el usuario ya contestó (sí o no).
+      const postGenCoverage = {
+        omitted: result.coverage?.omitted || [],
+        unbacked: (result.coverage?.unbacked || []).filter(
+          t => !askedSkillTerms.some(a => a.toLowerCase() === t.toLowerCase())
+        )
+      };
+      const decision = await reviewRequirementCoverage(postGenCoverage, jobContext.description);
+
+      if (decision && decision.terms.length) {
+        btn.classList.add("jobfill-loading");
+        const improved = await requestClaudeAnswer({ ...basePayload, mustCover: decision.terms });
+        applyAnswer(improved.answer);
+
+        if (decision.termsToSaveInProfile.length) {
+          await addSkillsToProfile(decision.termsToSaveInProfile);
+        }
+      }
+
+      removeAiButton();
+    } catch (err) {
+      console.error("[JobFill AI] Error al generar la respuesta:", err);
+      showToast(err?.message || "Error al invocar Claude IA.", "error");
+    } finally {
+      btn.classList.remove("jobfill-loading");
+      btn.innerHTML = `<span>✨</span>`;
+      btn.title = "Redactar con Claude IA";
+    }
+  }
+
+  /**
+   * Envuelve la llamada al service worker en una promesa, con su watchdog.
+   *
+   * Se necesita encadenar llamadas (generar → revisar cobertura → regenerar
+   * incluyendo lo confirmado), y con callbacks anidados ese flujo se vuelve
+   * ilegible y duplica el manejo de errores en cada nivel.
+   */
+  function requestClaudeAnswer(payload) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+
+      const safetyTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        reject(new Error("Tiempo de espera agotado (65s) esperando a Claude. Revisa tu conexión a internet."));
+      }, 65000);
+
+      const finish = fn => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(safetyTimer);
+        fn();
+      };
+
+      try {
+        chrome.runtime.sendMessage({ type: "ASK_CLAUDE_AI", payload }, response => {
+          finish(() => {
+            if (chrome.runtime.lastError) {
+              const msg = chrome.runtime.lastError.message || "";
+              console.error("[JobFill AI] chrome.runtime.lastError:", msg);
+              const orphaned = /context invalidated|extension context|receiving end does not exist|message port closed/i.test(msg);
+              reject(new Error(orphaned
+                ? "Esta pestaña perdió la conexión con la extensión. Recarga la página (F5) y vuelve a intentarlo."
+                : (msg || "Error al comunicar con la extensión. Recarga la pestaña.")));
+              return;
+            }
+
+            if (response && response.success && response.answer) {
+              resolve({ answer: response.answer, coverage: response.coverage });
+            } else {
+              reject(new Error(response?.error || "El service worker se cerró antes de responder. Recarga la extensión en chrome://extensions e inténtalo de nuevo."));
+            }
+          });
+        });
+      } catch (err) {
+        // sendMessage lanza de forma síncrona cuando este content script quedó
+        // huérfano: pasa siempre que se recarga la extensión con la pestaña abierta.
+        finish(() => {
+          const orphaned = /context invalidated|extension context|receiving end does not exist/i.test(err?.message || "");
+          reject(new Error(orphaned
+            ? "La extensión se recargó y esta pestaña quedó desconectada. Recarga la página (F5) y vuelve a intentarlo."
+            : `Error al invocar Claude IA: ${err?.message || err}`));
+        });
+      }
+    });
+  }
+
+  /**
+   * Computación local en el service worker (sin llamar a Claude): qué pide la
+   * oferta que el perfil no respalda. Se usa para preguntar ANTES de generar.
+   * Watchdog corto porque no hay red de por medio, solo comparación de texto.
+   */
+  function previewUnbackedTerms(jobContext) {
+    return new Promise(resolve => {
+      let settled = false;
+      const safetyTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        resolve([]);
+      }, 5000);
+
+      try {
+        chrome.runtime.sendMessage({
+          type: "PREVIEW_UNBACKED_TERMS",
+          payload: { jobTitle: jobContext.title, jobDescription: jobContext.description }
+        }, response => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(safetyTimer);
+          // Sin bloquear el flujo de redacción por esto: si falla, simplemente
+          // no se pregunta nada por adelantado (mismo resultado que antes de
+          // que existiera este paso).
+          resolve(response?.success ? (response.unbacked || []) : []);
+        });
+      } catch (e) {
+        if (!settled) {
+          settled = true;
+          clearTimeout(safetyTimer);
+          resolve([]);
+        }
+      }
+    });
+  }
+
+  /**
+   * Añade al perfil las capacidades que el usuario confirmó tener y que no
+   * estaban registradas. Ataca la causa de fondo: el perfil guardado va por
+   * detrás de la experiencia real, así que cada confirmación lo pone al día y
+   * la próxima postulación ya parte con ese dato.
+   */
+  async function addSkillsToProfile(terms) {
+    try {
+      // `candidateBase.skills` es único (ya no hay un `profiles[]` duplicado
+      // que mantener sincronizado) — el rediseño de datos simplificó esto de
+      // "escribir en dos sitios a la vez" a un solo guardado.
+      const stored = await chrome.storage.local.get("candidateBase");
+      const candidateBase = stored.candidateBase || {};
+      const current = (candidateBase.skills || "").trim();
+      const existing = current.split(/[,;\n]/).map(s => s.trim().toLowerCase()).filter(Boolean);
+      const additions = terms.filter(t => !existing.includes(t.toLowerCase()));
+      if (!additions.length) return;
+
+      const merged = current ? `${current}, ${additions.join(", ")}` : additions.join(", ");
+      await chrome.storage.local.set({ candidateBase: { ...candidateBase, skills: merged } });
+      showToast(`Añadido a tu perfil: ${additions.join(", ")}.`, "info");
+    } catch (e) {
+      // No es crítico: la respuesta ya se generó con esos términos.
+      console.warn("[JobFill AI] No se pudo actualizar el perfil:", e);
+    }
+  }
+
+  /**
+   * Captura manual del cargo: dispara con el botón del widget, el atajo de
+   * teclado, o el botón configurable del mouse remapeado a ese atajo.
+   *
+   * Reemplaza la captura automática (MutationObserver + debounce) que existía
+   * antes: en páginas con DOM muy dinámico esa captura periódica competía con
+   * el botón ✨ por los mismos ciclos de re-adjuntado y era la raíz del bug de
+   * "el botón no hace nada" que se depuró en Laborum. Al ser manual, la
+   * captura solo ocurre en el instante exacto que el usuario decide, y el
+   * resultado se le muestra ANTES de guardarse — nunca queda la duda de si de
+   * verdad extrajo el cargo correcto.
+   *
+   * DOM primero (gratis, exacto); la visión de Claude sobre un recorte de
+   * pantalla alrededor del cursor es el respaldo, solo cuando el DOM no dio
+   * ningún título.
+   */
+  async function manualCaptureJobContext(btn) {
+    if (btn) {
+      btn.disabled = true;
+      btn.dataset.originalText = btn.textContent;
+      btn.textContent = "Leyendo página...";
+    }
+
+    try {
+      const { text: description, reliable } = extractJobDescriptionWithSource();
+      const domTitle = extractJobTitle();
+
+      if (domTitle) {
+        openJobContextPanel({
+          title: domTitle,
+          company: extractCompanyName(),
+          description: reliable ? description : "",
+          source: "dom"
+        });
+        return;
+      }
+
+      // Respaldo: el DOM no dio ningún título. Se recorta la captura de
+      // pantalla alrededor del cursor — se asume que el usuario pulsó el
+      // botón/atajo estando cerca del título del puesto en pantalla, que es la
+      // instrucción que el propio flujo debería darle si esto falla seguido.
+      if (btn) btn.textContent = "Leyendo pantalla...";
+      const visionResult = await new Promise((resolve, reject) => {
+        try {
+          chrome.runtime.sendMessage({
+            type: "CAPTURE_JOB_TITLE_NEAR_MOUSE",
+            payload: { x: lastMouseX, y: lastMouseY, dpr: window.devicePixelRatio || 1 }
+          }, response => {
+            if (chrome.runtime.lastError) {
+              reject(new Error(chrome.runtime.lastError.message || "Error al comunicar con la extensión."));
+            } else {
+              resolve(response);
+            }
+          });
+        } catch (e) {
+          reject(e);
+        }
+      });
+
+      if (!visionResult?.success) {
+        showToast(visionResult?.error || "No se pudo identificar el cargo en esta página. Acércate al título con el mouse antes de pulsar el botón.", "error");
+        return;
+      }
+
+      openJobContextPanel({
+        title: visionResult.title,
+        company: "",
+        description: "",
+        source: "vision"
+      });
+    } catch (e) {
+      console.error("[JobFill AI] Error en la captura manual del cargo:", e);
+      showToast(`Error al capturar el cargo: ${e?.message || e}`, "error");
+    } finally {
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = btn.dataset.originalText || "📄 Guardar cargo";
+      }
+    }
+  }
+
+  /**
+   * Panel de revisión/edición del cargo capturado. Nunca se guarda a ciegas:
+   * el usuario ve exactamente lo que se extrajo (por DOM o por visión) y puede
+   * corregirlo antes de confirmar — es la garantía de que "el cargo en caché"
+   * es realmente el cargo, no una suposición del extractor.
+   */
+  function openJobContextPanel(initial) {
+    const host = document.createElement("div");
+    host.className = "jobfill-dialog-host";
+    const shadow = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
+    style.textContent = CONFIRM_DIALOG_STYLES;
+
+    const sourceLabel = initial.source === "vision"
+      ? "🖼️ Leído de la captura de pantalla cerca del cursor — revisa que sea correcto."
+      : initial.source === "cache"
+        ? "📄 Cargo guardado actualmente."
+        : "📄 Leído del DOM de esta página.";
+
+    const overlay = document.createElement("div");
+    overlay.className = "jobfill-overlay";
+    overlay.innerHTML = `
+      <div class="jobfill-confirm" role="dialog" aria-modal="true" aria-label="Revisar cargo capturado">
+        <h3>📄 Cargo capturado</h3>
+        <p class="jobfill-panel-source">${escapeHtml(sourceLabel)}</p>
+
+        <div class="jobfill-field">
+          <label for="jf-panel-title">Cargo</label>
+          <input type="text" id="jf-panel-title" spellcheck="false">
+        </div>
+        <div class="jobfill-field">
+          <label for="jf-panel-company">Empresa</label>
+          <input type="text" id="jf-panel-company" spellcheck="false">
+        </div>
+        <div class="jobfill-field">
+          <label for="jf-panel-desc">Descripción de la oferta (opcional, mejora las respuestas)</label>
+          <textarea id="jf-panel-desc" spellcheck="false"></textarea>
+        </div>
+
+        <div class="jobfill-confirm-actions">
+          <button class="jobfill-confirm-ok" type="button">✓ Guardar cargo</button>
+          <button class="jobfill-confirm-cancel" type="button">Cancelar</button>
+          ${initial.source === "cache" ? `<button class="jobfill-confirm-danger" type="button">Descartar</button>` : ""}
+        </div>
+      </div>`;
+
+    shadow.append(style, overlay);
+    attachToTopLayerHost(host);
+
+    const titleInput = shadow.querySelector("#jf-panel-title");
+    const companyInput = shadow.querySelector("#jf-panel-company");
+    const descInput = shadow.querySelector("#jf-panel-desc");
+    titleInput.value = initial.title || "";
+    companyInput.value = initial.company || "";
+    descInput.value = initial.description || "";
+    titleInput.focus();
+
+    const close = () => host.remove();
+
+    shadow.querySelector(".jobfill-confirm-cancel").addEventListener("click", close);
+    overlay.addEventListener("click", e => { if (e.target === overlay) close(); });
+    document.addEventListener("keydown", function onKeydown(e) {
+      if (e.key === "Escape") { document.removeEventListener("keydown", onKeydown); close(); }
+    });
+
+    const dangerBtn = shadow.querySelector(".jobfill-confirm-danger");
+    if (dangerBtn) {
+      dangerBtn.addEventListener("click", async () => {
+        try {
+          const contexts = await loadJobContexts();
+          await saveJobContexts(contexts.filter(c => c.url !== initial.url));
+          await refreshCacheChip();
+          showToast("Cargo descartado.", "info");
+        } catch (e) {
+          console.warn("[JobFill AI] No se pudo descartar el cargo:", e);
+        }
+        close();
+      });
+    }
+
+    shadow.querySelector(".jobfill-confirm-ok").addEventListener("click", async () => {
+      const title = titleInput.value.trim();
+      if (!title) {
+        titleInput.focus();
+        return;
+      }
+
+      const entry = {
+        title,
+        company: companyInput.value.trim(),
+        description: descInput.value.trim(),
+        url: initial.url || location.href,
+        host: location.hostname,
+        capturedAt: Date.now()
+      };
+
+      try {
+        const contexts = await loadJobContexts();
+        const deduped = contexts.filter(c => c.url !== entry.url && !(c.title === entry.title && c.host === entry.host));
+        const saved = await saveJobContexts([entry, ...deduped]);
+        await refreshCacheChip();
+        if (!saved) {
+          // A propósito NO se cierra el panel: guarda lo que el usuario ya
+          // escribió (título corregido, descripción) para que pueda
+          // reintentar sin volver a teclearlo todo.
+          showToast("No se pudo guardar el cargo (almacenamiento lleno o pestaña desconectada). Recarga la página e inténtalo de nuevo.", "error");
+          return;
+        }
+        showToast(`✓ Cargo guardado: "${entry.title}"${entry.company ? ` en ${entry.company}` : ""}.`, "success");
+      } catch (e) {
+        console.error("[JobFill AI] No se pudo guardar el cargo:", e);
+        showToast("No se pudo guardar el cargo.", "error");
+      }
+      close();
+    });
+  }
+
+  /**
+   * Actualiza el chip "Cargo en caché" del widget flotante con la oferta más
+   * reciente guardada. Se llama tras guardar/descartar y al iniciar el widget,
+   * para que el chip nunca muestre un cargo que ya no está vigente.
+   */
+  async function refreshCacheChip() {
+    const chip = document.querySelector(".jobfill-cache-chip");
+    if (!chip) return;
+
+    const contexts = await loadJobContexts();
+    const latest = contexts[0]; // loadJobContexts ya ordena por más reciente
+
+    if (!latest) {
+      chip.hidden = true;
+      return;
+    }
+
+    chip.hidden = false;
+    chip.querySelector(".jobfill-cache-chip-text").textContent =
+      `📄 ${latest.title}${latest.company ? ` — ${latest.company}` : ""}`;
+    chip.dataset.contextUrl = latest.url;
+  }
+
+  function showToast(message, type = "info") {
+    const existing = document.querySelector(".jobfill-toast");
+    if (existing) existing.remove();
+
+    const toast = document.createElement("div");
+    toast.className = `jobfill-toast jobfill-toast-${type}`;
+    
+    let icon = "ℹ️";
+    if (type === "success") icon = "✅";
+    if (type === "error") icon = "⚠️";
+
+    toast.innerHTML = `<span>${icon}</span><span>${message}</span>`;
+    attachToTopLayerHost(toast);
+
+    setTimeout(() => {
+      toast.style.opacity = "0";
+      toast.style.transform = "translateX(30px)";
+      setTimeout(() => toast.remove(), 350);
+    }, 3800);
+  }
+
+  function initFloatingWidget() {
+    if (widgetDismissed) return;
+
+    // El observer que dispara esto corre en CADA mutación del documento —
+    // salir aquí si el widget ya existe evita repetir, en páginas ajenas muy
+    // activas, el trabajo más caro de abajo (extractJobTitle recorre ~20
+    // selectores) en cada tick.
+    if (document.querySelector(".jobfill-floating-container")) return;
+
+    // "Guardar cargo" existe justamente para usarse ANTES de que exista el
+    // formulario: en portales como Workday, la página de la oferta y la del
+    // formulario de postulación son rutas distintas, así que exigir un
+    // formulario aquí escondía la herramienta en la única página donde tiene
+    // sentido capturar el cargo. Se muestra si hay campos de formulario O si
+    // la página resuelve a un título de oferta reconocible (misma detección
+    // que ya usa la captura manual, verificada contra el DOM real).
+    const hasForms = document.querySelector("input, textarea, select, form");
+    if (!hasForms && !extractJobTitle()) return;
+
+    const container = document.createElement("div");
+    container.className = "jobfill-floating-container";
+
+    // Orden de inserción = orden visual (columna anclada por abajo: el primer
+    // hijo queda arriba). El botón de cerrar va primero — arriba de TODO,
+    // separado físicamente del pill — porque vivía como una "x" de 18px
+    // incrustada dentro del pill: al fallar el clic por poco, caía en el pill
+    // y disparaba el autorrelleno sin querer. Debajo va el chip de cargo en
+    // caché (si hay uno), luego captura, luego el pill de autorrelleno.
+    const closeBtn = document.createElement("button");
+    closeBtn.type = "button";
+    closeBtn.className = "jobfill-widget-close";
+    closeBtn.textContent = "✕";
+    closeBtn.title = "Cerrar (vuelve a aparecer si recargas la página)";
+    closeBtn.addEventListener("click", () => {
+      widgetDismissed = true;
+      container.remove();
+    });
+
+    const chip = document.createElement("div");
+    chip.className = "jobfill-cache-chip";
+    chip.hidden = true;
+    chip.title = "Ver / editar el cargo guardado";
+    chip.innerHTML = `<span class="jobfill-cache-chip-text"></span>`;
+    chip.addEventListener("click", async () => {
+      const contexts = await loadJobContexts();
+      const latest = contexts[0];
+      if (!latest) return;
+      openJobContextPanel({ ...latest, source: "cache" });
+    });
+
+    const answerAllBtn = document.createElement("button");
+    answerAllBtn.type = "button";
+    answerAllBtn.className = "jobfill-capture-btn";
+    answerAllBtn.textContent = "✨ Responder todas";
+    answerAllBtn.title = "Detecta todas las preguntas abiertas del formulario y las responde con una sola llamada a Claude IA";
+    answerAllBtn.addEventListener("click", () => handleAnswerAllQuestions(answerAllBtn));
+
+    const captureBtn = document.createElement("button");
+    captureBtn.type = "button";
+    captureBtn.className = "jobfill-capture-btn";
+    captureBtn.textContent = "📄 Guardar cargo";
+    captureBtn.title = "Lee el cargo de esta página y lo guarda para usarlo al postular (atajo: Ctrl+Shift+0, configurable en chrome://extensions/shortcuts)";
+    captureBtn.addEventListener("click", () => manualCaptureJobContext(captureBtn));
+
+    const pill = document.createElement("div");
+    pill.className = "jobfill-floating-pill";
+    pill.innerHTML = `
+      <span class="jobfill-pill-icon">⚡</span>
+      <span>JobFill AI</span>
+    `;
+    pill.addEventListener("click", () => executeAutofill());
+
+    container.appendChild(closeBtn);
+    container.appendChild(chip);
+    container.appendChild(answerAllBtn);
+    container.appendChild(captureBtn);
+    container.appendChild(pill);
+    attachToTopLayerHost(container);
+    ensureTopLayerWatcher();
+
+    refreshCacheChip();
+  }
+
+  document.addEventListener("focusin", (e) => {
+    const el = e.target;
+    if (!el) return;
+
+    if (el.tagName === "TEXTAREA" || el.tagName === "TRIX-EDITOR" || el.isContentEditable) {
+      attachAiButtonToTextarea(el);
+    } else if (el.tagName === "INPUT" && (el.type === "text" || !el.type)) {
+      const ctx = getFieldContext(el);
+      // If the text input is a question / description field
+      if (ctx.length > 25 && /(describa|por qu[eé]|cu[aá]l|cu[aá]ntos|why|how|explain|tell|resume|cu[eé]ntanos)/i.test(ctx)) {
+        attachAiButtonToTextarea(el);
+      }
+    }
+  });
+
+  document.addEventListener("click", (e) => {
+    // Un clic dentro de un diálogo propio (confirmar pregunta, cobertura,
+    // panel de cargo) llega aquí retargeteado al host del Shadow DOM, que no
+    // es ni el botón AI ni el campo activo — sin este guard, cualquier clic en
+    // "Aceptar" del diálogo borraba el botón ANTES de que el código volviera a
+    // usarlo para mostrar el spinner de "cargando", dejándolo aplicado a un
+    // nodo ya desprendido del documento (por eso el spinner nunca se veía).
+    if (e.target.closest && e.target.closest(".jobfill-dialog-host")) return;
+    if (currentAiBtn && !currentAiBtn.contains(e.target) && e.target !== currentActiveTarget) {
+      removeAiButton();
+    }
+  });
+
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === "TRIGGER_AUTOFILL") {
+      executeAutofill().then(res => sendResponse(res));
+      return true;
+    }
+
+    if (message.type === "CAPTURE_JOB_CONTEXT_HOTKEY") {
+      // El atajo de teclado (Ctrl+Shift+0 por defecto, o el botón del mouse
+      // remapeado a esa combinación) dispara la misma captura manual que el
+      // botón del widget — se le pasa `null` como botón porque no hay uno
+      // visible que poner en estado "cargando".
+      manualCaptureJobContext(null);
+      return false;
+    }
+  });
+
+  // La captura del cargo ya NO es automática (ver manualCaptureJobContext): en
+  // páginas con DOM muy dinámico, la captura periódica que corría antes en
+  // cada mutación competía por los mismos ciclos de re-adjuntado con el botón
+  // ✨ y era la raíz de un bug real ("el botón no hace nada", depurado en
+  // Laborum). Lo único que se sigue vigilando en segundo plano es el envío de
+  // la postulación, para descartar del caché la oferta ya enviada — es una
+  // lectura, casi nunca escribe, y no compite por el mismo DOM que el botón.
+  let submissionCheckTimer = null;
+  function scheduleSubmissionCheck() {
+    clearTimeout(submissionCheckTimer);
+    submissionCheckTimer = setTimeout(() => {
+      if (pageShowsSubmissionSignal()) clearJobContextIfSubmitted();
+    }, 1500);
+  }
+
+  // Dynamic MutationObserver to monitor LinkedIn Easy Apply / Getonbrd modals & step transitions
+  const observer = new MutationObserver(() => {
+    initFloatingWidget();
+    // Cubre las SPA: en LinkedIn o Getonbrd la pantalla de "postulación
+    // enviada" aparece sin recargar la página, así que un chequeo único al
+    // cargar nunca la vería.
+    scheduleSubmissionCheck();
+  });
+  observer.observe(document.body, { childList: true, subtree: true });
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initFloatingWidget);
+  } else {
+    initFloatingWidget();
+  }
+})();

@@ -1,0 +1,238 @@
+/* JobFill AI - Injected Content Styles */
+
+.jobfill-floating-container {
+  position: fixed;
+  bottom: 24px;
+  right: 24px;
+  z-index: 2147483640;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 8px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  user-select: none;
+}
+
+.jobfill-floating-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
+  color: #ffffff;
+  padding: 10px 16px;
+  border-radius: 9999px;
+  box-shadow: 0 4px 20px rgba(79, 70, 229, 0.4), 0 2px 6px rgba(0, 0, 0, 0.15);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  backdrop-filter: blur(8px);
+}
+
+.jobfill-floating-pill:hover {
+  transform: translateY(-2px) scale(1.03);
+  box-shadow: 0 8px 25px rgba(79, 70, 229, 0.5), 0 4px 10px rgba(0, 0, 0, 0.2);
+  background: linear-gradient(135deg, #4338ca 0%, #6d28d9 100%);
+}
+
+.jobfill-floating-pill:active {
+  transform: translateY(0) scale(0.98);
+}
+
+.jobfill-pill-icon {
+  font-size: 15px;
+  line-height: 1;
+}
+
+/* Botón propio, separado del pill (que dispara el autorrelleno al clic) —
+   antes era una "x" de 18px incrustada DENTRO del pill, y un clic que fallaba
+   por poco caía en el pill y disparaba el autorrelleno sin querer. */
+.jobfill-widget-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: rgba(15, 23, 42, 0.55);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  font-size: 12px;
+  color: #f1f5f9;
+  opacity: 0.75;
+  cursor: pointer;
+  transition: opacity 0.2s, background 0.2s, transform 0.2s;
+  align-self: flex-end;
+}
+
+.jobfill-widget-close:hover {
+  opacity: 1;
+  background: rgba(15, 23, 42, 0.85);
+  transform: translateY(-1px);
+}
+
+.jobfill-capture-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 9999px;
+  background: #0f172a;
+  color: #f1f5f9;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 12.5px;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  transition: transform 0.2s ease, border-color 0.2s ease;
+}
+
+.jobfill-capture-btn:hover {
+  transform: translateY(-2px);
+  border-color: rgba(99, 102, 241, 0.6);
+}
+
+.jobfill-capture-btn:disabled {
+  opacity: 0.7;
+  cursor: default;
+  transform: none;
+}
+
+.jobfill-cache-chip {
+  display: inline-flex;
+  align-items: center;
+  max-width: 260px;
+  padding: 7px 13px;
+  border-radius: 9999px;
+  background: rgba(99, 102, 241, 0.16);
+  border: 1px solid rgba(99, 102, 241, 0.4);
+  color: #e0e7ff;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: border-color 0.2s ease;
+}
+
+.jobfill-cache-chip:hover {
+  border-color: rgba(99, 102, 241, 0.8);
+}
+
+/* Una regla de autor (esta hoja) siempre gana sobre la del navegador para
+   [hidden], sin importar la especificidad — así que sin esta regla explícita,
+   el `display: inline-flex` de arriba dejaría el chip visible incluso con
+   `hidden = true`. */
+.jobfill-cache-chip[hidden] {
+  display: none;
+}
+
+.jobfill-cache-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.jobfill-ai-btn {
+  position: absolute;
+  z-index: 2147483645;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  background: linear-gradient(135deg, #0ea5e9 0%, #6366f1 100%);
+  color: #ffffff;
+  border-radius: 50%;
+  font-size: 13px;
+  line-height: 1;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  box-shadow: 0 3px 12px rgba(14, 165, 233, 0.35);
+  cursor: pointer;
+  border: 1px solid rgba(255, 255, 255, 0.25);
+  transition: all 0.2s ease;
+  animation: jobfill-fade-in 0.2s ease-out;
+}
+
+.jobfill-ai-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px rgba(14, 165, 233, 0.5);
+  background: linear-gradient(135deg, #0284c7 0%, #4f46e5 100%);
+}
+
+.jobfill-ai-btn.jobfill-loading {
+  pointer-events: none;
+  opacity: 0.85;
+  background: #475569;
+}
+
+.jobfill-ai-btn.jobfill-loading > span {
+  visibility: hidden;
+}
+
+.jobfill-ai-btn.jobfill-loading::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  margin: -5px 0 0 -5px;
+  border: 2px solid #fff;
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: jobfill-spin 0.6s linear infinite;
+}
+
+.jobfill-toast {
+  position: fixed;
+  top: 24px;
+  right: 24px;
+  z-index: 2147483647;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 18px;
+  border-radius: 10px;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  color: #f8fafc;
+  background: #0f172a;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.3), 0 4px 8px rgba(0, 0, 0, 0.2);
+  animation: jobfill-slide-in 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+.jobfill-toast.jobfill-toast-success { border-left: 4px solid #10b981; }
+.jobfill-toast.jobfill-toast-info { border-left: 4px solid #6366f1; }
+.jobfill-toast.jobfill-toast-error { border-left: 4px solid #ef4444; }
+
+.jobfill-highlight-success {
+  outline: 2px solid #10b981 !important;
+  background-color: rgba(16, 185, 129, 0.08) !important;
+  transition: background-color 0.4s ease, outline 0.4s ease;
+}
+
+.jobfill-highlight-ai {
+  outline: 2px solid #6366f1 !important;
+  background-color: rgba(99, 102, 241, 0.08) !important;
+  transition: background-color 0.4s ease, outline 0.4s ease;
+}
+
+@keyframes jobfill-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes jobfill-slide-in {
+  from { opacity: 0; transform: translateX(30px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes jobfill-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
