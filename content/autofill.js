@@ -4328,6 +4328,12 @@
     .jf-preview-bar .warn { color: #fbbf24; }
     .jf-paper { display: block; margin: 0 auto; width: 8.5in; min-height: 11in; box-sizing: border-box; padding: 1.27cm; background: #fff; box-shadow: 0 10px 30px -10px rgba(2, 6, 23, 0.6); }
     .jf-preview-empty { font-size: 12.5px; color: #cbd5e1; }
+    .jf-revise { margin-top: 14px; }
+    .jf-revise label { display: block; font-size: 12.5px; font-weight: 600; color: #e2e8f0; margin-bottom: 6px; }
+    .jf-revise textarea { box-sizing: border-box; width: 100%; min-height: 64px; resize: vertical; padding: 9px 11px; border-radius: 10px; border: 1px solid rgba(148, 163, 184, 0.3); background: #1e293b; color: #f8fafc; font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .jf-revise textarea:focus { outline: 2px solid #818cf8; outline-offset: 1px; }
+    .jf-revise-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; font-size: 11.5px; color: #94a3b8; }
+    .jf-revise-row button { flex: 0 0 auto; }
     .jf-register { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(148, 163, 184, 0.18); }
     [hidden] { display: none !important; }`;
 
@@ -4347,6 +4353,14 @@
         <p class="jf-detail"></p>
         <div class="jf-result" hidden></div>
         <div class="jf-preview" hidden></div>
+        <div class="jf-revise" hidden>
+          <label for="jf-revise-text">✎ ¿Quieres cambiar algo del CV?</label>
+          <textarea id="jf-revise-text" maxlength="1000" placeholder="Ej: acorta el resumen, pon MAZA antes que MedInfo, usa &quot;APIs REST&quot; como dice la oferta…"></textarea>
+          <div class="jf-revise-row">
+            <span>Se aplica solo con hechos de tu BASE y vuelve a pasar por el verificador.</span>
+            <button class="jobfill-confirm-cancel" type="button" data-act="revise">✎ Aplicar cambio</button>
+          </div>
+        </div>
         <div class="jf-register" hidden>
           <div class="jobfill-field"><label for="jf-ap-empresa">Empresa</label><input type="text" id="jf-ap-empresa" spellcheck="false"></div>
           <div class="jobfill-field"><label for="jf-ap-cargo">Cargo</label><input type="text" id="jf-ap-cargo" spellcheck="false"></div>
@@ -4373,6 +4387,9 @@
       setStep(step, detail = "") {
         const idx = order.indexOf(step);
         if (idx === -1) return;
+        // Un solo paso activo: al pedir un cambio el flujo vuelve de
+        // "Revisar" a "Verificar"/"Ajustar".
+        shadow.querySelectorAll(".jf-steps li.is-active").forEach(li => li.classList.replace("is-active", "is-done"));
         order.forEach((id, i) => {
           const li = $s(`[data-step="${id}"]`);
           if (i < idx && li.classList.contains("is-active")) li.classList.replace("is-active", "is-done");
@@ -4459,11 +4476,29 @@
         btn.hidden = false;
         btn.onclick = onOpen;
       },
+      showRevise(onSubmit) {
+        const box = $s(".jf-revise");
+        const text = $s("#jf-revise-text");
+        const btn = $s('[data-act="revise"]');
+        box.hidden = false;
+        btn.disabled = false;
+        btn.onclick = () => {
+          const value = text.value.trim();
+          if (!value) { text.focus(); return; }
+          onSubmit(value);
+          text.value = "";
+        };
+      },
+      /** Oculta lo que depende del CV mostrado mientras se genera otro. */
+      hideReviewActions() {
+        for (const act of ["attach", "open", "download", "retry"]) $s(`[data-act="${act}"]`).hidden = true;
+        $s(".jf-revise").hidden = true;
+      },
       showAttach(onAttach) {
         const btn = $s('[data-act="attach"]');
         btn.hidden = false;
         btn.disabled = false;
-        btn.onclick = () => { btn.hidden = true; onAttach(); };
+        btn.onclick = () => { btn.hidden = true; $s(".jf-revise").hidden = true; onAttach(); };
       },
       showResult(lines) {
         const box = $s(".jf-result");
@@ -4691,8 +4726,13 @@
     // Cada intento pide al worker que adapte; "Reintentar" repite con
     // `resume: true` y el worker sigue desde su punto de control (no vuelve a
     // adaptar ni a gastar lo que ya salió bien).
+    const requestChange = cambio => {
+      ui.setStep("revisar", "Aplicando tu cambio…");
+      attempt({ resume: true, cambio });
+    };
+
     const attempt = async (payload) => {
-      ui.hideRetry();
+      ui.hideReviewActions();
       ui.clearResult();
       btn.disabled = true;
       try {
@@ -4712,6 +4752,7 @@
               : "Ábrelo en el Postulador de claude.ai para ajustarlo a mano; el formulario no se tocó." }
           ]);
           ui.showPreview(res.html, { paginas: res.paginas });
+          ui.showRevise(requestChange);
           if (res.canRetry) ui.showRetry("↻ Intentar otro ajuste", () => { ui.setStep("ajustar", "Pidiendo otro ajuste…"); attempt({ resume: true }); });
           return;
         }
@@ -4722,6 +4763,7 @@
         ui.showPreview(res.html, { paginas: res.paginas });
         ui.showDownload(() => downloadPdf(res.base64, res.archivo));
         ui.showOpen(() => openPdf(res.base64));
+        ui.showRevise(requestChange);
         ui.showAttach(() => completeApplyFlow(ui, res, { empresa, cargo }).catch(err => {
           ui.markError();
           clearFlowDetail(ui);
@@ -4747,7 +4789,8 @@
   function cvSummaryLines(res) {
     const warnings = res.hallazgos.filter(h => h.nivel !== "error").map(h => h.detalle);
     return [
-      { text: `✓ CV ${res.perfil} adaptado${res.ajustado ? " (con un ajuste automático)" : ""} y guardado en tu vault: cv/generados/${res.archivo}`, tone: "ok" },
+      { text: `✓ CV ${res.perfil} adaptado${res.cambios ? ` con ${res.cambios === 1 ? "tu cambio" : `tus ${res.cambios} cambios`}` : ""}${res.ajustado ? " (con un ajuste automático)" : ""} y guardado en tu vault: cv/generados/${res.archivo}`, tone: "ok" },
+      res.nota ? { text: `Sobre tu cambio: ${res.nota}`, tone: "warn" } : null,
       res.cobertura ? { text: `Requisitos de la oferta respaldados por tu grafo: ${res.cobertura}` } : null,
       res.faltantes?.length ? { text: "Sin respaldo en tu BASE (no se mencionan en el CV):", tone: "warn", items: res.faltantes } : null,
       warnings.length ? { text: "Avisos del verificador:", tone: "warn", items: warnings } : null

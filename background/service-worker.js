@@ -817,7 +817,7 @@ async function writeApplyCheckpoint(tabId, cp) {
 
 chrome.tabs.onRemoved.addListener(tabId => { writeApplyCheckpoint(tabId, null).catch(() => {}); });
 
-async function adaptCvForOffer({ oferta, empresa, cargo, resume = false }, tabId) {
+async function adaptCvForOffer({ oferta, empresa, cargo, resume = false, cambio = "" }, tabId) {
   let currentStep = "contexto";
   const progress = (step, detail = "") => {
     currentStep = step;
@@ -830,6 +830,10 @@ async function adaptCvForOffer({ oferta, empresa, cargo, resume = false }, tabId
     cp = await readApplyCheckpoint(tabId);
     if (!cp) throw new Error("No quedó un intento anterior que retomar (pasaron más de 30 min o se cerró la pestaña). Pulsa 🚀 Postular de nuevo.");
     ({ oferta, empresa, cargo } = cp.input);
+    // "✎ Pedir cambio": queda pendiente hasta aplicarse, así un Reintentar
+    // tras un fallo lo aplica en vez de devolver el CV anterior.
+    const pedido = String(cambio || "").trim().slice(0, JobFillCv.CAMBIO_MAX);
+    if (pedido) cp.cambioPendiente = pedido;
   } else {
     cp = { input: { oferta, empresa, cargo } };
     await writeApplyCheckpoint(tabId, null);
@@ -838,6 +842,7 @@ async function adaptCvForOffer({ oferta, empresa, cargo, resume = false }, tabId
   const save = async patch => { Object.assign(cp, patch); await writeApplyCheckpoint(tabId, cp); };
 
   try {
+    await writeApplyCheckpoint(tabId, cp);
     return await runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, getStep: () => currentStep });
   } catch (err) {
     // Lo ya pagado queda guardado: el error se puede reintentar desde aquí.
@@ -860,7 +865,9 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
   // copiar empresa y cargo exactos aunque la descripción no los repita.
   const ofertaCompleta = `${empresa ? `Empresa: ${empresa}\n` : ""}${cargo ? `Cargo: ${cargo}\n` : ""}\n${oferta}`;
 
-  progress("contexto", "Leyendo tu BASE y tus CVs base…");
+  // Con un cambio pedido, el diálogo sigue en "Revisar" (no vuelve al paso 1).
+  if (cp.cambioPendiente) progress("revisar", "Leyendo tu BASE para aplicar el cambio…");
+  else progress("contexto", "Leyendo tu BASE y tus CVs base…");
   const ctx = await vaultCall("cv_contexto", {});
   if (!Array.isArray(ctx?.perfiles) || !ctx.perfiles.length) {
     throw new Error("Tu vault no tiene CVs base (cv/base/*.md): el Postulador los necesita para adaptar.");
@@ -904,6 +911,18 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
   }).then(b => save({ brechas: b }).then(() => b))
     .catch(err => { console.warn("[JobFill AI] brechas falló:", err); return null; });
 
+  // Cambio pedido desde la vista previa: se aplica sobre el CV actual y
+  // desde ahí el camino es el mismo (verificar, ajustar si hace falta, PDF).
+  if (cp.cambioPendiente) {
+    progress("revisar", "Aplicando tu cambio con las reglas de tu vault…");
+    const revisado = await ask(JobFillCv.buildRevisePrompt(ctx, cp.markdown, cp.cambioPendiente, ofertaCompleta), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
+    if (!revisado?.markdown) throw new Error("La IA no devolvió el CV con el cambio. Intenta de nuevo.");
+    await save({
+      markdown: revisado.markdown, validacion: null, fixRounds: 0, retryFix: false,
+      cambioPendiente: null, nota: String(revisado.nota || "").trim(), cambios: (cp.cambios || 0) + 1
+    });
+  }
+
   let validacion = cp.validacion;
   if (!validacion) {
     progress("validar", "Revisando reglas y que quepa en 1 página…");
@@ -933,6 +952,8 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
     cargo: adaptado.cargo || cargo || "",
     area: adaptado.area || "",
     ajustado: (cp.fixRounds || 0) > 0,
+    cambios: cp.cambios || 0,
+    nota: cp.nota || "",
     hallazgos: (validacion?.hallazgos || []).map(h => ({ nivel: h.nivel, detalle: h.detalle })),
     paginas: validacion?.paginas,
     // HTML con la MISMA plantilla del PDF (lo devuelve cv_validar): la vista
