@@ -13,6 +13,9 @@
   // exponen una API mínima (JobFillFrame, abajo) que el service worker llama.
   const IS_TOP_FRAME = (() => { try { return window.top === window; } catch (e) { return false; } })();
 
+  // Selectores por portal y elección de opciones (content/portals.js).
+  const Portals = self.JobFillPortals;
+
   let activeProfile = null;
   let currentAiBtn = null;
 
@@ -629,133 +632,150 @@
     }
   }
 
-  /**
-   * Dispara `trigger` (clic en un botón, tipear en un input) y devuelve el
-   * `[role="listbox"]` que aparece COMO CONSECUENCIA — nunca "el primero del
-   * documento". Puede haber más de uno montado (otro campo del mismo tipo ya
-   * abierto, o un widget vecino sin relación); a diferencia del combobox de
-   * Greenhouse, aquí no siempre hay texto tecleado con el que comparar el
-   * contenido (un botón como "Degree" no escribe nada), así que se
-   * distingue por APARICIÓN: el que no estaba antes de disparar la acción.
-   */
-  async function openListboxVia(trigger) {
-    const before = new Set(document.querySelectorAll('[role="listbox"]'));
-    await trigger();
-    await new Promise(r => setTimeout(r, 350));
-    const after = Array.from(document.querySelectorAll('[role="listbox"]'));
-    return after.find(lb => !before.has(lb)) || null;
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+
+  function isShown(node) {
+    if (!node || !node.isConnected) return false;
+    const r = node.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && getComputedStyle(node).visibility !== "hidden";
+  }
+
+  /** Listbox que el control declara con aria-controls/aria-owns (puede existir desde antes, oculto). */
+  function controlledListbox(el) {
+    const ids = `${el.getAttribute("aria-controls") || ""} ${el.getAttribute("aria-owns") || ""}`.trim().split(/\s+/).filter(Boolean);
+    for (const id of ids) {
+      const node = rootOf(el).getElementById(id) || document.getElementById(id);
+      const lb = node && (node.getAttribute("role") === "listbox" ? node : node.querySelector('[role="listbox"]'));
+      if (isShown(lb)) return lb;
+    }
+    return null;
   }
 
   /**
-   * Rellena un widget "botón que abre un listbox" (patrón ARIA
-   * `aria-haspopup="listbox"` — el "Degree" de Workday es el caso real que lo
-   * motivó, pero el patrón es común a varias librerías de componentes). No
-   * escribe nada: abre el listbox, deja que `matcher` elija cuál opción
-   * corresponde de las que el sitio ofrece realmente, y hace clic en ella. Si
-   * `matcher` no encuentra ninguna, se cierra el listbox sin tocar nada —
-   * mismo criterio de "sin pruebas suficientes, no adivinar" que el resto del
-   * motor.
+   * Abre la lista de un dropdown personalizado y devuelve su
+   * `[role="listbox"]` — el que aparece COMO CONSECUENCIA (o el que el
+   * control declara con aria-controls), nunca "el primero del documento":
+   * puede haber otro montado de un campo vecino.
+   *
+   * Cada librería abre con un evento distinto: MUI y react-select con
+   * mousedown, Workday / Headless UI / Angular Material con click. Se prueba
+   * primero mousedown y, solo si no apareció nada, click (hacer ambos
+   * seguidos cerraría la lista en las que alternan).
    */
-  async function fillListboxButtonField(button, matcher) {
-    try {
-      const listbox = await openListboxVia(async () => button.click());
-      if (!listbox) return false;
+  async function openListboxFor(el) {
+    const before = new Set(document.querySelectorAll('[role="listbox"]'));
+    const fresh = () => controlledListbox(el) || Array.from(document.querySelectorAll('[role="listbox"]')).find(lb => !before.has(lb) && isShown(lb)) || null;
+    el.focus?.({ preventScroll: true });
+    el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, composed: true, button: 0, pointerType: "mouse" }));
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, composed: true, button: 0 }));
+    await wait(220);
+    let lb = fresh();
+    if (lb) return lb;
+    el.click();
+    await wait(350);
+    lb = fresh();
+    if (lb) return lb;
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", bubbles: true, cancelable: true, composed: true }));
+    await wait(250);
+    return fresh();
+  }
 
+  function closeListbox(el, listbox) {
+    const esc = new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true, composed: true });
+    (listbox.querySelector('[role="option"]') || listbox).dispatchEvent(esc);
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true, composed: true }));
+    setTimeout(() => { if (isShown(listbox)) el.click(); }, 120);
+  }
+
+  /**
+   * Rellena un dropdown personalizado (Workday, MUI, Angular Material,
+   * Headless UI, cualquier `aria-haspopup="listbox"` o `role="combobox"` que
+   * no es un input): abre la lista, `pickIndex` elige entre las opciones que
+   * el sitio ofrece de verdad y se hace clic en esa. Sin opción que calce,
+   * se cierra sin tocar nada.
+   */
+  async function fillDropdown(el, pickIndex) {
+    try {
+      const listbox = await openListboxFor(el);
+      if (!listbox) return false;
       const options = Array.from(listbox.querySelectorAll('[role="option"]'));
-      const target = options.find(o => matcher(o.textContent.trim()));
-      if (!target) {
-        button.click(); // cierra el listbox sin elegir nada
+      const index = pickIndex(options.map(o => ({ text: (o.getAttribute("aria-label") || o.textContent || "").trim(), value: o.getAttribute("data-value") || "" })));
+      const option = options[index];
+      if (!option || option.getAttribute("aria-disabled") === "true") {
+        closeListbox(el, listbox);
         return false;
       }
-
-      target.click();
+      option.scrollIntoView?.({ block: "nearest" });
+      option.click();
+      await wait(150);
+      // Radix y otras eligen en pointerup, no en click.
+      if (option.isConnected && isShown(listbox) && option.getAttribute("aria-selected") !== "true") {
+        option.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, composed: true, button: 0, pointerType: "mouse" }));
+        option.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, composed: true, button: 0 }));
+        await wait(120);
+      }
+      if (isShown(listbox)) closeListbox(el, listbox);
+      el.classList.add("jobfill-highlight-success");
+      setTimeout(() => el.classList.remove("jobfill-highlight-success"), 2500);
       return true;
     } catch (e) {
-      // Mismo criterio que el combobox: un widget que se comporta distinto a
-      // lo esperado deja el campo sin tocar, nunca tumba la pasada completa.
-      console.warn("[JobFill AI] No se pudo usar el listbox del botón:", e);
+      // Un widget que se comporta distinto a lo esperado deja el campo sin
+      // tocar, nunca tumba la pasada completa.
+      console.warn("[JobFill AI] No se pudo usar el dropdown:", e);
       return false;
     }
   }
 
   /**
-   * Caso concreto de `fillListboxButtonField`: el "Degree" de Workday. Solo
-   * actúa si el contexto del botón matchea la misma regla `degree` que ya usa
-   * el motor genérico — así una futura regla de FIELD_RULES para "degree" se
-   * sigue aplicando aquí sin duplicar el patrón.
+   * El "Degree" de Workday (y otros ATS): un NIVEL estandarizado, no el
+   * nombre de la carrera — se clasifica el perfil y se busca esa categoría
+   * entre las opciones reales. Solo actúa si el contexto matchea la regla
+   * `degree` del motor genérico.
    */
-  async function tryFillCustomListboxButton(el, profile, textContext) {
-    if (el.tagName !== "BUTTON" || el.getAttribute("aria-haspopup") !== "listbox") return false;
-
+  async function tryFillDegreeDropdown(el, profile, textContext) {
     const degreeRule = FIELD_RULES.find(r => r.key === "degree");
     if (!degreeRule || !degreeRule.regex.test(textContext)) return false;
-
     const level = classifyDegreeLevel(profile.degree || "");
     if (!level) return false;
-
-    return fillListboxButtonField(el, text => findMatchingDegreeOptionIndex([text], level) === 0);
+    return fillDropdown(el, options => findMatchingDegreeOptionIndex(options.map(o => o.text), level));
   }
 
+  /**
+   * Elige en un <select> la opción que corresponde a `targetText` (ver
+   * JobFillPortals.pickOptionIndex: nunca elige el placeholder).
+   */
   function setSelectValue(select, targetText) {
     if (!select || !targetText) return false;
-    const targetNorm = normalizeText(targetText);
-    const targetWords = targetNorm.split(" ").filter(w => w.length > 1);
-
     const options = Array.from(select.options);
-    let matchedOption = null;
+    return selectOptionAt(select, Portals.pickOptionIndex(options.map(o => ({ text: o.text, value: o.value })), targetText));
+  }
 
-    // 1. Exact match on value or text
-    for (let opt of options) {
-      const optTextNorm = normalizeText(opt.text);
-      const optValNorm = normalizeText(opt.value);
-      if (optTextNorm === targetNorm || optValNorm === targetNorm) {
-        matchedOption = opt;
-        break;
-      }
-    }
+  /** Marca la opción `index` del <select> y avisa a la página (y a Select2/Chosen/bootstrap-select). */
+  function selectOptionAt(select, index) {
+    if (index < 0 || !select.options[index]) return false;
+    select.selectedIndex = index;
+    select.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    // Chosen solo se redibuja con su evento propio (jQuery lo escucha como
+    // un evento nativo más). Select2 y bootstrap-select ya escuchan "change".
+    select.dispatchEvent(new Event("chosen:updated", { bubbles: true }));
+    const visible = enhancedSelectUi(select) || select;
+    visible.classList.add("jobfill-highlight-success");
+    setTimeout(() => visible.classList.remove("jobfill-highlight-success"), 2500);
+    return true;
+  }
 
-    // 2. Substring match
-    if (!matchedOption) {
-      for (let opt of options) {
-        const optTextNorm = normalizeText(opt.text);
-        if (optTextNorm.includes(targetNorm) || targetNorm.includes(optTextNorm)) {
-          matchedOption = opt;
-          break;
-        }
-      }
-    }
-
-    // 3. CEFR Language Level Detection (e.g. A1, A2, B1, B2, C1, C2)
-    if (!matchedOption) {
-      const cefrMatch = targetText.match(/\b([ABC][12])\b/i);
-      if (cefrMatch) {
-        const level = cefrMatch[1].toUpperCase();
-        matchedOption = options.find(opt => opt.text.toUpperCase().includes(level) || opt.value.toUpperCase().includes(level));
-      }
-    }
-
-    // 4. Token overlap score
-    if (!matchedOption && targetWords.length > 0) {
-      let maxScore = 0;
-      for (let opt of options) {
-        const optNorm = normalizeText(opt.text) + " " + normalizeText(opt.value);
-        const score = targetWords.filter(w => optNorm.includes(w)).length;
-        if (score > maxScore) {
-          maxScore = score;
-          matchedOption = opt;
-        }
-      }
-    }
-
-    if (matchedOption) {
-      select.value = matchedOption.value;
-      select.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-      select.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-      select.classList.add("jobfill-highlight-success");
-      setTimeout(() => select.classList.remove("jobfill-highlight-success"), 2500);
-      return true;
-    }
-    return false;
+  /**
+   * UI visible de un <select> "mejorado" por un plugin (Select2, Chosen,
+   * bootstrap-select, Tom Select), que deja el <select> real oculto. Choices.js
+   * no se incluye: borra del <select> las opciones no elegidas, así que
+   * escribir ahí no sirve.
+   */
+  function enhancedSelectUi(select) {
+    const next = select.nextElementSibling;
+    if (next && next.matches(".select2, .select2-container, .chosen-container, .ts-wrapper")) return next;
+    const wrap = select.closest(".bootstrap-select");
+    return wrap || null;
   }
 
   /**
@@ -997,6 +1017,17 @@
     if (fieldset) {
       const legend = fieldset.querySelector("legend, [role='heading'], .fb-form-element-label, .t-14, .label");
       if (legend && legend.innerText) label.push(legend.innerText);
+      // La pregunta del grupo suele vivir FUERA de él y enlazada por ARIA
+      // (MUI RadioGroup, radios dibujados con role=radio).
+      const groupLabel = fieldset.getAttribute("aria-label");
+      if (groupLabel) label.push(groupLabel);
+      const groupLabelledBy = fieldset.getAttribute("aria-labelledby");
+      if (groupLabelledBy) {
+        groupLabelledBy.split(/\s+/).forEach(id => {
+          const node = id && rootOf(el).getElementById(id);
+          if (node && node.innerText) label.push(node.innerText);
+        });
+      }
     }
 
     const labelledBy = el.getAttribute("aria-labelledby") || el.getAttribute("aria-describedby");
@@ -1090,15 +1121,42 @@
   }
 
   const AUTOFILLABLE_SELECTOR =
-    "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']):not([type='file']), textarea, select, trix-editor, [contenteditable='true'], button[aria-haspopup='listbox']";
+    "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']):not([type='file']), textarea, select, trix-editor, [contenteditable='true'], " +
+    // Controles personalizados: dropdowns (Workday, MUI, Angular Material,
+    // Headless UI) y radios/checkbox dibujados con divs (role=radio/checkbox).
+    "button[aria-haspopup='listbox'], [role='button'][aria-haspopup='listbox'], [role='combobox']:not(input), mat-select, [role='radio']:not(input), [role='checkbox']:not(input)";
 
-  function isFillableVisible(el) {
-    if (el.disabled || el.readOnly) return false;
+  function isBoxVisible(el) {
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return false;
     const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-    return true;
+    return !(style.display === "none" || style.visibility === "hidden" || style.opacity === "0");
+  }
+
+  function isFillableVisible(el) {
+    if (el.disabled || el.readOnly || el.getAttribute("aria-disabled") === "true") return false;
+    if (isBoxVisible(el)) return true;
+    // Radios y checkbox con estilo propio: el input real está oculto (opacity
+    // 0, 0×0) y lo que se ve es su <label>.
+    const type = (el.type || "").toLowerCase();
+    if (el.tagName === "INPUT" && (type === "radio" || type === "checkbox")) {
+      const label = el.labels?.[0] || el.closest("label");
+      return Boolean(label && isBoxVisible(label));
+    }
+    // <select> oculto por Select2/Chosen/bootstrap-select: se ve su UI.
+    if (el.tagName === "SELECT") {
+      const ui = enhancedSelectUi(el);
+      return Boolean(ui && isBoxVisible(ui));
+    }
+    return false;
+  }
+
+  /**
+   * Controles personalizados que contienen su propio input (patrón ARIA 1.1:
+   * div role=combobox > input) se rellenan por el input, no por el div.
+   */
+  function isWrapperOfInput(el) {
+    return el.tagName !== "INPUT" && el.getAttribute("role") === "combobox" && Boolean(el.querySelector("input:not([type='hidden'])"));
   }
 
   /**
@@ -1115,27 +1173,28 @@
       const textContext = [contextParts.label, contextParts.attrs, contextParts.nearby].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
       const normContext = normalizeText(textContext);
       const inputType = (el.type || "").toLowerCase();
+      const kind = choiceKind(el);
 
-      // Un botón que abre un listbox (patrón ARIA `aria-haspopup="listbox"` —
-      // el "Degree" de Workday es el caso real) no encaja en nada del motor
-      // de abajo: no tiene `.value` que escribir ni es un <select> nativo. Se
-      // resuelve aparte y se sale enseguida.
-      if (el.tagName === "BUTTON") {
-        return await tryFillCustomListboxButton(el, profile, textContext);
-      }
+      // Dropdown personalizado con la pregunta de estudios: nivel, no carrera.
+      if (kind === "dropdown" && await tryFillDegreeDropdown(el, profile, textContext)) return true;
 
       let ruleMatched = false;
 
       const applyRuleValue = async (val) => {
-        if (el.tagName === "SELECT") {
+        if (kind === "select") {
           return setSelectValue(el, val);
         }
-        if (inputType === "radio" || inputType === "checkbox") {
+        if (kind === "dropdown") {
+          return fillDropdown(el, options => Portals.pickOptionIndex(options, val));
+        }
+        if (kind === "radio" || kind === "checkbox") {
           if (val === "yes" || val === "true" || val === true) {
-            if (/yes|s[ií]|true/i.test(el.value || textContext)) {
-              el.checked = true;
-              el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-              return true;
+            // Un checkbox suelto ("Estoy autorizado a trabajar en Chile") se
+            // marca; en un grupo de radios solo la opción "Sí"/"Yes".
+            const own = choiceOptionText(el);
+            const isYesOption = matchesAnyOptionVariant(own, ["yes", "si", "true", "1"]);
+            if (isYesOption || (kind === "checkbox" && !matchesAnyOptionVariant(own, ["no", "false"]))) {
+              return checkChoice(el);
             }
           }
           return false;
@@ -1225,8 +1284,11 @@
           if (!cf.value) continue;
           const searchTerms = `${cf.label || ""} ${cf.keywords || ""}`;
           if (matchesQaAdvanced(textContext, searchTerms)) {
-            if (el.tagName === "SELECT") {
-              return setSelectValue(el, cf.value);
+            if (kind === "select") return setSelectValue(el, cf.value);
+            if (kind === "dropdown") return fillDropdown(el, options => Portals.pickOptionIndex(options, cf.value));
+            if (kind === "radio" || kind === "checkbox") {
+              if (Portals.pickOptionIndex([choiceOptionText(el)], cf.value) !== 0) continue;
+              return checkChoice(el);
             }
             setElementValue(el, cf.value);
             return true;
@@ -1250,7 +1312,7 @@
       // RADIO_GROUP_FIELDS): el motor genérico de arriba solo sabe marcar una
       // opción cuando el valor es literalmente "yes" — nunca "no", y nunca un
       // enum de 3+ alternativas (modalidad, género).
-      if (!ruleMatched && (inputType === "radio" || inputType === "checkbox")) {
+      if (!ruleMatched && kind !== "text") {
         for (const field of RADIO_GROUP_FIELDS) {
           if (!field.groupRegex.test(textContext) && !field.groupRegex.test(normContext)) continue;
 
@@ -1263,10 +1325,13 @@
           const variants = field.optionVariants[answer];
           if (!variants) break; // valor guardado fuera de la tabla esperada
 
-          if (matchesAnyOptionVariant(el.value || textContext, variants)) {
-            el.checked = true;
-            el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-            ruleMatched = true;
+          // Mismo campo como <select> o dropdown ("Sí"/"No", "Remoto"…).
+          if (kind === "select") {
+            ruleMatched = selectOptionAt(el, Portals.pickVariantIndex(Array.from(el.options).map(o => ({ text: o.text, value: o.value })), variants));
+          } else if (kind === "dropdown") {
+            ruleMatched = await fillDropdown(el, options => Portals.pickVariantIndex(options, variants));
+          } else if (matchesAnyOptionVariant(choiceOptionText(el) || textContext, variants)) {
+            ruleMatched = checkChoice(el);
           }
           break;
         }
@@ -1287,8 +1352,12 @@
     for (const el of inputs) {
       const isRequired = el.required || el.getAttribute("aria-required") === "true";
       if (!isRequired) continue;
-      const type = (el.type || "").toLowerCase();
-      if (type === "radio" || type === "checkbox") continue;
+      const kind = choiceKind(el);
+      if (kind === "radio" || kind === "checkbox") continue;
+      if (kind === "dropdown") {
+        if (!dropdownHasValue(el)) missing.push({ el, label: readableFieldLabel(el) });
+        continue;
+      }
       const value = el.isContentEditable ? el.innerText : el.value;
       if (value && value.trim()) continue;
       missing.push({ el, label: readableFieldLabel(el) });
@@ -1384,8 +1453,14 @@
    */
   function fieldAlreadyHasValue(el) {
     const type = (el.type || "").toLowerCase();
+    const kind = choiceKind(el);
 
-    if (el.tagName === "BUTTON") return false; // listbox ARIA: lo decide su propio flujo
+    if (kind === "dropdown") return dropdownHasValue(el);
+    if (kind === "radio" && el.tagName !== "INPUT") {
+      const group = el.closest("[role='radiogroup']");
+      return group ? Boolean(group.querySelector("[aria-checked='true']")) : el.getAttribute("aria-checked") === "true";
+    }
+    if (kind === "checkbox" && el.tagName !== "INPUT") return el.getAttribute("aria-checked") === "true";
     if (el.tagName === "TRIX-EDITOR" || el.isContentEditable) return Boolean((el.innerText || "").trim());
     if (el.tagName === "SELECT") {
       // La opción 0 suele ser el placeholder ("Selecciona…"): solo cuenta
@@ -1403,6 +1478,67 @@
     // Un prefijo de país precargado ("+56", "+1") no es un teléfono cargado.
     if (type === "tel" && /^\+?\d{0,4}$/.test(value)) return false;
     return value.length > 0;
+  }
+
+  /**
+   * Tipo de control, sin importar cómo esté dibujado: "select" (nativo),
+   * "dropdown" (personalizado), "radio", "checkbox" (nativos o role=) o "text".
+   */
+  function choiceKind(el) {
+    const tag = el.tagName;
+    const type = (el.type || "").toLowerCase();
+    const role = el.getAttribute?.("role") || "";
+    if (tag === "SELECT") return "select";
+    if (tag === "INPUT") return type === "radio" || type === "checkbox" ? type : "text";
+    if (role === "radio" || role === "checkbox") return role;
+    if (tag === "TEXTAREA" || tag === "TRIX-EDITOR" || el.isContentEditable) return "text";
+    if (tag === "MAT-SELECT" || role === "combobox" || el.getAttribute?.("aria-haspopup") === "listbox") return "dropdown";
+    return "text";
+  }
+
+  /**
+   * ¿El dropdown personalizado ya tiene algo elegido? Se mira el texto que
+   * muestra (sin el placeholder "Select One"/"Selecciona…"), las clases de
+   * "vacío" de Angular Material y el input oculto que acompaña a MUI.
+   */
+  function dropdownHasValue(el) {
+    if (/\bmat-(?:mdc-)?select-empty\b/.test(el.className || "")) return false;
+    const hidden = el.parentElement?.querySelector("input[aria-hidden='true'], input.MuiSelect-nativeInput");
+    if (hidden) return Boolean((hidden.value || "").trim());
+    const text = (el.innerText || el.textContent || "").replace(/[\u200b\u00a0]/g, " ").trim();
+    return Boolean(text) && !self.JobFillPortals.isPlaceholderOption(text.split("\n")[0]);
+  }
+
+  /** Texto de UNA opción de un grupo: su value y su propia etiqueta ("1 Sí"), no la pregunta. */
+  function choiceOptionText(el) {
+    if (el.tagName === "INPUT") {
+      const label = el.labels?.[0] || el.closest("label");
+      return `${el.value || ""} ${label ? label.innerText || "" : ""}`.trim();
+    }
+    return (el.getAttribute("aria-label") || el.innerText || el.textContent || "").trim();
+  }
+
+  /**
+   * Marca un radio/checkbox. Con `click()` y no con `checked = true`: React,
+   * Vue y Angular escuchan el click en estos controles, así que un
+   * `checked = true` se veía marcado pero el formulario no se enteraba.
+   */
+  function checkChoice(el) {
+    if (el.tagName === "INPUT") {
+      if (el.checked) return true;
+      el.click();
+      if (!el.checked) {
+        el.checked = true;
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      }
+    } else if (el.getAttribute("aria-checked") !== "true") {
+      el.click();
+    }
+    const visible = el.tagName === "INPUT" && !isBoxVisible(el) ? (el.labels?.[0] || el.closest("label") || el) : el;
+    visible.classList.add("jobfill-highlight-success");
+    setTimeout(() => visible.classList.remove("jobfill-highlight-success"), 2500);
+    return true;
   }
 
   async function fillFieldSafely(el, profile) {
@@ -1466,7 +1602,7 @@
    * Shadow DOM abierto (web components de SuccessFactors, SmartRecruiters…).
    */
   function collectFillableFields() {
-    return Portals.deepQuerySelectorAll(AUTOFILLABLE_SELECTOR, document, isOwnUi).filter(isFillableVisible);
+    return Portals.deepQuerySelectorAll(AUTOFILLABLE_SELECTOR, document, isOwnUi).filter(el => !isWrapperOfInput(el) && isFillableVisible(el));
   }
 
   /**
@@ -4283,8 +4419,6 @@
     $s('[data-act="close"]').addEventListener("click", () => ui.close());
     return ui;
   }
-
-  const Portals = self.JobFillPortals;
 
   /** Hosts de la propia extensión: la búsqueda profunda no entra en ellos. */
   function isOwnUi(el) {

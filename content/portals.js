@@ -160,7 +160,86 @@
     return { frameId: null, reason: filled ? filled.result.reason : "no se identificó con certeza cuál es el campo del CV" };
   }
 
+  /* ─── Opciones de listas (select nativo y dropdowns personalizados) ─── */
+
+  function normOption(text) {
+    return String(text || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase()
+      .replace(/[\u200b\u00a0]/g, " ").replace(/[^a-z0-9+#.\s]/g, " ").replace(/\s+/g, " ").trim();
+  }
+
+  /**
+   * Texto de "todavía no eligió nada": "Select...", "Seleccione", "-- Elige --",
+   * "Choose one", "Please select". También vacío. Es la opción 0 de casi
+   * todos los <select> y el texto de un dropdown personalizado sin valor.
+   */
+  const PLACEHOLDER_RE = /^(?:-+\s*)?(?:select|seleccion|selecciona|seleccione|elige|elija|escoge|choose|pick|please select|por favor|none selected|ninguno seleccionado|opcion|option)\b|^-+$|^\.{3}$/i;
+
+  function isPlaceholderOption(text) {
+    const n = normOption(text);
+    return !n || PLACEHOLDER_RE.test(n) || PLACEHOLDER_RE.test(String(text || "").trim());
+  }
+
+  function escapeRe(s) {
+    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  }
+
+  /**
+   * Índice de la opción que corresponde a `target`, o -1. Nunca elige un
+   * placeholder. Orden de confianza:
+   *   1. igual (texto o value) · 2. contiene / contenido, como palabra y luego
+   *   como texto (4+ letras)
+   *   3. nivel CEFR (B2) · 4. más palabras en común (mínimo 1)
+   * `options` es [{ text, value }] o una lista de textos.
+   */
+  function pickOptionIndex(options, target) {
+    const opts = (options || []).map(o => (typeof o === "string" ? { text: o, value: "" } : { text: o.text || "", value: o.value || "" }));
+    const t = normOption(target);
+    if (!t) return -1;
+    const usable = opts.map((o, i) => ({ i, text: normOption(o.text), value: normOption(o.value), raw: o.text }))
+      .filter(o => !isPlaceholderOption(o.raw) && (o.text || o.value));
+
+    let hit = usable.find(o => o.text === t || (o.value && o.value === t));
+    if (hit) return hit.i;
+
+    const wordIn = (needle, hay) => needle.length > 1 && new RegExp(`(?:^|\\s)${escapeRe(needle)}(?:\\s|$)`).test(hay);
+    hit = usable.find(o => o.text && (wordIn(t, o.text) || wordIn(o.text, t)));
+    if (hit) return hit.i;
+
+    // Contiene sin límite de palabra ("Chile" ⊂ "Chilean"), solo con 4+ letras.
+    hit = usable.find(o => o.text && ((t.length >= 4 && o.text.includes(t)) || (o.text.length >= 4 && t.includes(o.text))));
+    if (hit) return hit.i;
+
+    const cefr = String(target).match(/\b([ABC][12])\b/i);
+    if (cefr) {
+      hit = usable.find(o => new RegExp(`\\b${cefr[1]}\\b`, "i").test(`${o.text} ${o.value}`));
+      if (hit) return hit.i;
+    }
+
+    const words = t.split(" ").filter(w => w.length > 2);
+    let best = -1, bestScore = 0;
+    for (const o of usable) {
+      const hay = ` ${o.text} ${o.value} `;
+      const score = words.filter(w => hay.includes(` ${w} `)).length;
+      if (score > bestScore) { bestScore = score; best = o.i; }
+    }
+    return best;
+  }
+
+  /** Índice de la opción cuyo texto es una de las variantes (palabra completa): "Sí"/"Yes" para yes. */
+  function pickVariantIndex(options, variants) {
+    const texts = (options || []).map(o => normOption(typeof o === "string" ? o : `${o.text || ""} ${o.value || ""}`));
+    return texts.findIndex((text, i) => {
+      const raw = typeof options[i] === "string" ? options[i] : options[i].text;
+      if (isPlaceholderOption(raw)) return false;
+      return variants.some(v => new RegExp(`(?:^|\\s)${escapeRe(normOption(v))}(?:\\s|$)`).test(text));
+    });
+  }
+
   root.JobFillPortals = {
+    PLACEHOLDER_RE,
+    isPlaceholderOption,
+    pickOptionIndex,
+    pickVariantIndex,
     pickCvFrame,
     PORTAL_CV_SELECTORS,
     DROPZONE_SELECTOR,

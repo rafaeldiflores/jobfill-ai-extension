@@ -2770,6 +2770,54 @@ it("Portals: picks the frame that holds the CV field, and defers multi-step form
   for (const sel of P.PORTAL_CV_SELECTORS) assert.ok(typeof sel === "string" && sel.length > 3);
 });
 
+it("Form controls: picks the right option in native and custom dropdowns, never the placeholder", () => {
+  const P = loadRealPortals();
+  assert.strictEqual(P.pickOptionIndex(["Selecciona...", "Chile", "Argentina"], "Chile"), 1);
+  assert.strictEqual(P.pickOptionIndex([{ text: "Seleccione", value: "" }, { text: "Chilean", value: "cl" }], "Chile"), 1, "contiene con 4+ letras");
+  assert.strictEqual(P.pickOptionIndex(["--", "Básico (A2)", "Intermedio (B1)", "Avanzado (B2)"], "B2"), 3, "nivel CEFR");
+  assert.strictEqual(P.pickOptionIndex(["Seleccione", "Ingeniería Civil en Informática", "Otra"], "Ingeniería en Informática"), 1);
+  assert.strictEqual(P.pickOptionIndex(["Select...", "Bachelor of Science", "Master"], "Ingeniería"), -1, "sin calce no adivina");
+  assert.strictEqual(P.pickOptionIndex([{ text: "", value: "" }, { text: "Sí", value: "1" }], "Chile"), -1, "una opción vacía nunca calza");
+  // Sí/No: "yes" no calza por texto; se resuelve con las variantes del grupo.
+  assert.strictEqual(P.pickOptionIndex(["Seleccione", "Sí", "No"], "yes"), -1);
+  assert.strictEqual(P.pickVariantIndex(["Seleccione", "Sí", "No"], ["yes", "si", "true"]), 1);
+  assert.strictEqual(P.pickVariantIndex(["Select One", "Yes", "No"], ["no", "false"]), 2);
+  assert.strictEqual(P.pickVariantIndex(["Noruega", "No"], ["no"]), 1, "palabra completa: Noruega no es No");
+  for (const t of ["Select One", "Selecciona…", "-- Elige --", "Seleccione una opción", "Choose...", "", "---"]) assert.ok(P.isPlaceholderOption(t), t);
+  for (const t of ["Chile", "Noruega", "Sí", "Optimismo"]) assert.ok(!P.isPlaceholderOption(t), t);
+});
+
+it("Form controls: custom radios, checkboxes and dropdowns count as filled when they already have a choice", () => {
+  const src = sliceRealSource("function fieldAlreadyHasValue(el)", "async function fillFieldSafely(el, profile)");
+  loadRealPortals();
+  const self = globalThis; // eslint-disable-line no-unused-vars
+  const has = eval(`const CSS = { escape: s => s };\n${src}\nfieldAlreadyHasValue;`);
+  const node = (tagName, attrs = {}, extra = {}) => ({ tagName, getAttribute: a => (a in attrs ? attrs[a] : null), closest: () => null, className: "", ...extra });
+
+  // Workday: botón con "Select One" = vacío; con un valor = respetado.
+  assert.strictEqual(has(node("BUTTON", { "aria-haspopup": "listbox" }, { innerText: "Select One" })), false);
+  assert.strictEqual(has(node("BUTTON", { "aria-haspopup": "listbox" }, { innerText: "LinkedIn" })), true);
+  // MUI: el input oculto hermano manda.
+  const muiParent = v => ({ querySelector: () => ({ value: v }) });
+  assert.strictEqual(has(node("DIV", { role: "combobox" }, { innerText: "\u200b", parentElement: muiParent("") })), false);
+  assert.strictEqual(has(node("DIV", { role: "combobox" }, { innerText: "Chile", parentElement: muiParent("CL") })), true);
+  // Angular Material vacío.
+  assert.strictEqual(has(node("MAT-SELECT", {}, { className: "mat-mdc-select mat-mdc-select-empty", innerText: "País" })), false);
+  // role=radio: basta con que el grupo tenga uno marcado.
+  const group = { querySelector: sel => (sel.includes("aria-checked='true'") ? {} : null) };
+  assert.strictEqual(has(node("DIV", { role: "radio", "aria-checked": "false" }, { closest: () => group })), true);
+  assert.strictEqual(has(node("DIV", { role: "radio", "aria-checked": "false" })), false);
+  assert.strictEqual(has(node("DIV", { role: "checkbox", "aria-checked": "true" })), true);
+});
+
+it("Form controls: radios are checked with a real click (React/Vue see it) and the group question is read from aria-labelledby", () => {
+  const src = readSourceText(path.join(__dirname, "..", "content", "autofill.js"));
+  assert.match(src, /if \(el\.checked\) return true;\n      el\.click\(\);/, "checkChoice hace click en vez de solo checked = true");
+  assert.doesNotMatch(src, /el\.checked = true;\n\s+el\.dispatchEvent\(new Event\("change", \{ bubbles: true, composed: true \}\)\);\n\s+ruleMatched = true;/, "ya no queda el camino viejo que React ignoraba");
+  assert.match(src, /const groupLabelledBy = fieldset\.getAttribute\("aria-labelledby"\);/);
+  assert.match(src, /\[role='combobox'\]:not\(input\), mat-select, \[role='radio'\]:not\(input\), \[role='checkbox'\]:not\(input\)/);
+});
+
 it("Portals: content script runs in every frame, portals.js loads first, widget only in the top frame", () => {
   const manifest = JSON.parse(readSourceText(path.join(__dirname, "..", "manifest.json")));
   const cs = manifest.content_scripts[0];
