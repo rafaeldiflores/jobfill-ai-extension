@@ -661,12 +661,40 @@ async function syncFromVault() {
 }
 
 /** Llama una herramienta del postulador con el auth guardado y persiste el token renovado. */
-async function vaultCall(name, args) {
-  const { vaultAuth } = await chrome.storage.local.get("vaultAuth");
-  if (!vaultAuth) throw new Error("Conecta JobFill AI a tu vault en Opciones → Fuente de verdad.");
-  const { data, auth } = await JobFillVault.callWithAuth(vaultAuth, name, args);
-  if (auth !== vaultAuth) await chrome.storage.local.set({ vaultAuth: auth });
-  return data;
+/*
+ * Límite del postulador: cada cv_validar y cv_generar_pdf abre un Chrome en
+ * Cloudflare Browser Rendering, que limita los navegadores nuevos por minuto
+ * ("Unable to create new browser: code: 429: Rate limit exceeded"). Un flujo
+ * con ajuste y un "Pedir cambio" abre 4-5 seguidos. Se espera y se reintenta
+ * la MISMA llamada; nunca se trata como un problema del CV.
+ */
+const VAULT_RATE_LIMIT_WAITS_MS = [20000, 40000];
+
+function isVaultRateLimit(err) {
+  return /\b429\b|rate limit|too many requests/i.test(String(err?.message || ""));
+}
+
+async function vaultCall(name, args, { onWait } = {}) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const { vaultAuth } = await chrome.storage.local.get("vaultAuth");
+      if (!vaultAuth) throw new Error("Conecta JobFill AI a tu vault en Opciones → Fuente de verdad.");
+      const { data, auth } = await JobFillVault.callWithAuth(vaultAuth, name, args);
+      if (auth !== vaultAuth) await chrome.storage.local.set({ vaultAuth: auth });
+      return data;
+    } catch (err) {
+      if (!isVaultRateLimit(err)) throw err;
+      err.rateLimited = true;
+      const waitMs = VAULT_RATE_LIMIT_WAITS_MS[attempt];
+      if (waitMs === undefined) {
+        err.message = `Tu postulador llegó al límite de navegadores por minuto de Cloudflare (lo usa para medir y generar el PDF). Espera un minuto y pulsa Reintentar. Detalle: ${err.message}`;
+        throw err;
+      }
+      console.warn(`[JobFill AI] ${name}: límite de navegadores de Cloudflare; reintento ${attempt + 1}/${VAULT_RATE_LIMIT_WAITS_MS.length} en ${waitMs / 1000} s.`);
+      try { onWait?.({ waitMs, attempt: attempt + 1 }); } catch (e) { /* solo informativo */ }
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
 }
 
 /**
@@ -801,23 +829,6 @@ const APPLY_CHECKPOINT_TTL_MS = 30 * 60 * 1000;
 // "Reintentar" sobre un CV que sigue sin pasar hace uno más).
 const MAX_FIX_ROUNDS = 1;
 
-/**
- * cv_validar que nunca tumba el flujo por el CONTENIDO: si el postulador
- * rechaza el CV (frontmatter roto, sección que falta…), se devuelve como un
- * hallazgo de error y el ajuste automático lo corrige con ese detalle. Solo
- * los fallos reales (red, sesión del vault) se propagan, y esos se pueden
- * reintentar.
- */
-async function validateCv(markdown) {
-  try {
-    return await vaultCall("cv_validar", { markdown });
-  } catch (err) {
-    if (!err.toolError) throw err;
-    console.warn("[JobFill AI] El postulador rechazó el CV; pasa al ajuste:", err.message);
-    return { ok: false, hallazgos: [{ nivel: "error", detalle: err.message }], paginas: null, html: "" };
-  }
-}
-
 async function readApplyCheckpoint(tabId) {
   const all = (await chrome.storage.session.get(APPLY_CHECKPOINT_KEY))[APPLY_CHECKPOINT_KEY] || {};
   const cp = all[tabId];
@@ -899,17 +910,30 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
   const repair = (md, anterior) => JobFillCv.normalizeCvMarkdown(md, JobFillCv.tituloDePerfil(anterior) || tituloBase);
   // Un punto de control guardado antes de esta reparación también se arregla.
   if (cp.markdown && repair(cp.markdown, cp.markdown) !== cp.markdown) {
-    await save({ markdown: repair(cp.markdown, cp.markdown), validacion: null });
+    await save({ markdown: repair(cp.markdown, cp.markdown), pdf: null, rechazo: null });
   }
 
   // Si Claude pide esperar (límite por minuto), el diálogo lo muestra en el
   // paso en curso en vez de quedarse "pegado" sin explicación.
+  // Esperas por el límite de navegadores del postulador, visibles en el diálogo.
+  const onWait = ({ waitMs, attempt }) => progress(getStep(), `Tu postulador está al límite de navegadores por minuto (Cloudflare). Reintento ${attempt} en ${Math.round(waitMs / 1000)} s…`);
   const onRetry = ({ waitMs, attempt }) => progress(getStep(), `Claude pidió esperar por el límite de uso por minuto de tu cuenta. Reintento ${attempt} en ${Math.round(waitMs / 1000)} s…`);
-  const ask = async (prompt, { model, max_tokens, timeoutMs }) => {
+  // Cada llamada pide salida estructurada con su esquema: JSON válido
+  // garantizado por la API (antes un salto de línea crudo dentro del CV
+  // rompía JSON.parse: "Bad control character in string literal").
+  // REGLAS + BASE van como `system` cacheado (idéntico en adaptar, ajustar y
+  // pedir cambio, y entre ofertas): desde la 2ª llamada se leen de caché, a
+  // ~10% del costo y sin contar para el límite de tokens por minuto.
+  const cvSystem = [{ type: "text", text: JobFillCv.buildCvSystem(ctx), cache_control: { type: "ephemeral" } }];
+  const ask = async (prompt, { model, max_tokens, timeoutMs, schema, cached = false }) => {
     const data = await callAnthropicMessagesApi({
-      ai, model, max_tokens, timeoutMs, onRetry,
+      ai, model, max_tokens, timeoutMs, onRetry, jsonSchema: JobFillCv.SCHEMAS[schema],
+      ...(cached ? { system: cvSystem } : {}),
       messages: [{ role: "user", content: [{ type: "text", text: prompt }] }]
     });
+    if (data?.stop_reason === "max_tokens") {
+      throw new Error("La respuesta de la IA se cortó por largo (max_tokens). Pulsa Reintentar.");
+    }
     return JobFillCv.parseJsonReply(extractTextFromResponse(data));
   };
 
@@ -917,7 +941,7 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
     let perfil = ctx.perfiles[0].perfil;
     if (ctx.perfiles.length > 1) {
       progress("perfil", "Eligiendo el CV base que mejor calza…");
-      const r = await ask(JobFillCv.buildProfilePickPrompt(ctx.perfiles, ofertaCompleta), { model: MODEL_SIMPLE, max_tokens: 100, timeoutMs: 30000 });
+      const r = await ask(JobFillCv.buildProfilePickPrompt(ctx.perfiles, ofertaCompleta), { model: MODEL_SIMPLE, max_tokens: 100, timeoutMs: 30000, schema: "perfil" });
       perfil = JobFillCv.resolvePerfil(ctx.perfiles, r);
     }
     await save({ perfil });
@@ -926,14 +950,14 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
 
   if (!cp.adaptado) {
     progress("adaptar", `Adaptando tu CV ${perfil} a la oferta (suele tardar 30–60 s)…`);
-    const adaptado = await ask(JobFillCv.buildAdaptPrompt(ctx, perfil, ofertaCompleta), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
+    const adaptado = await ask(JobFillCv.buildAdaptPrompt(ctx, perfil, ofertaCompleta, { cached: true }), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000, schema: "adaptar", cached: true });
     if (!adaptado?.markdown) throw new Error("La IA no devolvió el CV adaptado. Intenta de nuevo.");
     await save({ adaptado, markdown: repair(adaptado.markdown, ""), fixRounds: 0 });
   }
   const adaptado = cp.adaptado;
 
-  // Brechas en paralelo con la validación: es evidencia del grafo para el
-  // Tracker, no bloquea el PDF si el grafo no responde.
+  // Brechas en paralelo con la generación: es evidencia del grafo para el
+  // Tracker (no abre navegador), no bloquea el PDF si el grafo no responde.
   const brechasPromise = cp.brechas !== undefined ? Promise.resolve(cp.brechas) : vaultCall("brechas", {
     requisitos: (adaptado.keywords_oferta || []).filter(k => typeof k === "string" && k.trim()),
     oferta: ofertaCompleta.slice(0, 9000)
@@ -941,69 +965,121 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
     .catch(err => { console.warn("[JobFill AI] brechas falló:", err); return null; });
 
   // Cambio pedido desde la vista previa: se aplica sobre el CV actual y
-  // desde ahí el camino es el mismo (verificar, ajustar si hace falta, PDF).
+  // desde ahí el camino es el mismo (generar = verificar, ajustar si falla).
   if (cp.cambioPendiente) {
     progress("revisar", "Aplicando tu cambio con las reglas de tu vault…");
-    const revisado = await ask(JobFillCv.buildRevisePrompt(ctx, cp.markdown, cp.cambioPendiente, ofertaCompleta), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
+    const revisado = await ask(JobFillCv.buildRevisePrompt(ctx, cp.markdown, cp.cambioPendiente, ofertaCompleta, { cached: true }), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000, schema: "cambio", cached: true });
     if (!revisado?.markdown) throw new Error("La IA no devolvió el CV con el cambio. Intenta de nuevo.");
     await save({
-      markdown: repair(revisado.markdown, cp.markdown), validacion: null, fixRounds: 0, retryFix: false,
+      markdown: repair(revisado.markdown, cp.markdown), pdf: null, rechazo: null, fixRounds: 0, retryFix: false,
       cambioPendiente: null, nota: String(revisado.nota || "").trim(), cambios: (cp.cambios || 0) + 1
     });
   }
 
-  let validacion = cp.validacion;
-  if (!validacion) {
-    progress("validar", "Revisando reglas y que quepa en 1 página…");
-    validacion = await validateCv(cp.markdown);
-    await save({ validacion });
-  }
+  const resumenBase = () => ({
+    perfil,
+    empresa: adaptado.empresa || empresa || "",
+    cargo: adaptado.cargo || cargo || ""
+  });
+  const nombre = JobFillCv.pdfFileName(resumenBase());
+
+  /*
+   * Generar = verificar. cv_generar_pdf del Worker ya revisa las reglas
+   * (lintCv) y que quepa en 1 página, y se niega a generar si algo falla.
+   * Antes se llamaba además a cv_validar antes y después del ajuste: el
+   * mismo chequeo 2-3 veces, cada uno abriendo un Chrome en Cloudflare (el
+   * 429 "Unable to create new browser"). Ahora: 1 navegador si el CV pasa,
+   * 2 si hace falta el ajuste.
+   */
+  const generar = async (detalle) => {
+    progress("pdf", detalle);
+    await paceBrowserCall(ms => progress("pdf", `Pausa de ${Math.round(ms / 1000)} s para no saturar tu postulador (Cloudflare)…`));
+    try {
+      const pdf = await vaultCall("cv_generar_pdf", { markdown: cp.markdown, nombre }, { onWait });
+      if (!pdf?.base64) throw new Error("El postulador no devolvió el PDF.");
+      await save({ pdf: { archivo: pdf.archivo || `${nombre}.pdf`, base64: pdf.base64 }, rechazo: null });
+    } catch (err) {
+      // Solo un rechazo del CONTENIDO va al ajuste; red, sesión y límite de
+      // navegadores se propagan (y se pueden reintentar).
+      if (!err.toolError || err.rateLimited) throw err;
+      await save({ pdf: null, rechazo: JobFillCv.hallazgosDeRechazo(err.message) });
+    }
+  };
+
+  if (!cp.pdf && !cp.rechazo) await generar("Verificando reglas y 1 página, y generando el PDF…");
 
   // Un ajuste por intento: el primero en el flujo normal; "Reintentar" sobre
   // un CV que sigue sin pasar concede uno más.
   const fixBudget = (cp.fixRounds || 0) < MAX_FIX_ROUNDS || cp.retryFix;
-  if (!validacion?.ok && fixBudget) {
-    progress("ajustar", "Ajustando el CV a las reglas…");
-    const fix = await ask(JobFillCv.buildFixPrompt(ctx, cp.markdown, validacion), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
+  if (cp.rechazo && fixBudget) {
+    progress("ajustar", "Ajustando el CV a lo que rechazó tu verificador…");
+    const fix = await ask(JobFillCv.buildFixPrompt(ctx, cp.markdown, cp.rechazo, { cached: true }), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000, schema: "ajustar", cached: true });
     await save({ fixRounds: (cp.fixRounds || 0) + 1, retryFix: false });
     if (fix?.markdown) {
-      await save({ markdown: repair(fix.markdown, cp.markdown), validacion: null });
-      progress("ajustar", "Revisando de nuevo el CV ajustado…");
-      validacion = await validateCv(cp.markdown);
-      await save({ validacion });
+      await save({ markdown: repair(fix.markdown, cp.markdown), rechazo: null });
+      await generar("Verificando de nuevo y generando el PDF…");
     }
   }
 
   const brechas = await brechasPromise;
+  const header = await cvPreviewHeader();
   const resumen = {
-    perfil,
-    empresa: adaptado.empresa || empresa || "",
-    cargo: adaptado.cargo || cargo || "",
+    ...resumenBase(),
     area: adaptado.area || "",
     ajustado: (cp.fixRounds || 0) > 0,
     cambios: cp.cambios || 0,
     nota: cp.nota || "",
-    hallazgos: (validacion?.hallazgos || []).map(h => ({ nivel: h.nivel, detalle: h.detalle })),
-    paginas: validacion?.paginas,
-    // HTML con la MISMA plantilla del PDF (lo devuelve cv_validar): la vista
-    // previa que el usuario revisa antes de adjuntar.
-    html: typeof validacion?.html === "string" ? validacion.html : "",
+    hallazgos: (cp.rechazo?.hallazgos || []).map(h => ({ nivel: h.nivel, detalle: h.detalle })),
+    // Si el Worker generó el PDF, el CV cumple las reglas y ocupa 1 página.
+    paginas: cp.pdf ? 1 : undefined,
+    // Vista previa armada aquí, sin abrir otro navegador: misma estructura y
+    // CSS que la plantilla del Worker. El PDF exacto: "Abrir PDF".
+    html: JobFillCv.renderCvPreviewHtml(cp.markdown, header),
     cobertura: JobFillCv.coberturaTexto(brechas, adaptado.keywords_cubiertas),
     faltantes: (brechas?.requisitos || []).filter(q => q.nivel === "brecha").map(q => q.termino)
   };
 
-  if (!validacion?.ok) {
-    // El punto de control queda: "Reintentar ajuste" pide una ronda más.
+  if (!cp.pdf) {
+    // El punto de control queda: "Intentar otro ajuste" pide una ronda más.
     await save({ retryFix: true });
     return { success: true, ok: false, canRetry: true, ...resumen };
   }
 
-  progress("pdf", "Generando el PDF y guardándolo en tu vault…");
-  const nombre = JobFillCv.pdfFileName(resumen);
-  const pdf = await vaultCall("cv_generar_pdf", { markdown: cp.markdown, nombre });
-  if (!pdf?.base64) throw new Error("El postulador no devolvió el PDF.");
+  return { success: true, ok: true, ...resumen, archivo: cp.pdf.archivo, base64: cp.pdf.base64 };
+}
 
-  return { success: true, ok: true, ...resumen, archivo: pdf.archivo || `${nombre}.pdf`, base64: pdf.base64 };
+/*
+ * Pausa entre llamadas que abren un Chrome en el postulador (cv_generar_pdf):
+ * Cloudflare Browser Rendering limita los navegadores nuevos por minuto. Se
+ * guarda la hora de la última en chrome.storage.session para que valga
+ * también entre pestañas y si el service worker se durmió.
+ */
+const BROWSER_CALL_GAP_MS = 20000;
+const LAST_BROWSER_CALL_KEY = "lastBrowserCallAt";
+
+async function paceBrowserCall(onPause) {
+  const last = (await chrome.storage.session.get(LAST_BROWSER_CALL_KEY))[LAST_BROWSER_CALL_KEY] || 0;
+  const waitMs = last + BROWSER_CALL_GAP_MS - Date.now();
+  if (waitMs > 500) {
+    try { onPause?.(waitMs); } catch (e) { /* solo informativo */ }
+    await new Promise(r => setTimeout(r, waitMs));
+  }
+  await chrome.storage.session.set({ [LAST_BROWSER_CALL_KEY]: Date.now() });
+}
+
+/** Encabezado de la vista previa desde "Mis datos" (el del PDF sale de cv/encabezado.md). */
+async function cvPreviewHeader() {
+  const { candidateBase } = await chrome.storage.local.get("candidateBase");
+  const p = candidateBase || {};
+  const links = [["Portafolio", p.portfolioUrl || p.websiteUrl], ["LinkedIn", p.linkedinUrl], ["GitHub", p.githubUrl]]
+    .filter(([, url]) => url).map(([etiqueta, url]) => ({ etiqueta, url }));
+  return {
+    nombre: String(p.fullName || `${p.firstName || ""} ${p.lastName || ""}`).trim().toUpperCase(),
+    ubicacion: [p.city, p.country].filter(Boolean).join(", "),
+    telefono: p.phone || "",
+    email: p.email || "",
+    links
+  };
 }
 
 /** Registra la postulación actual en el Tracker del vault (postulacion_guardar). */
@@ -1127,7 +1203,7 @@ function arrayBufferToBase64(buffer) {
  * max_tokens — con presupuestos pequeños se agotan antes de emitir texto y la
  * respuesta llega vacía. Aquí siempre queremos texto directo y acotado.
  */
-async function callAnthropicMessagesApi({ ai, model, system, messages, max_tokens = 1500, timeoutMs, onRetry }) {
+async function callAnthropicMessagesApi({ ai, model, system, messages, max_tokens = 1500, timeoutMs, onRetry, jsonSchema }) {
   return JobFillAi.callAi(ai, {
     model,
     system,
@@ -1135,7 +1211,8 @@ async function callAnthropicMessagesApi({ ai, model, system, messages, max_token
     max_tokens,
     thinking: { type: "disabled" },
     ...(timeoutMs ? { timeoutMs } : {}),
-    ...(onRetry ? { onRetry } : {})
+    ...(onRetry ? { onRetry } : {}),
+    ...(jsonSchema ? { jsonSchema } : {})
   });
 }
 
