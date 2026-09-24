@@ -2765,7 +2765,7 @@ it("Apply flow: attaches the PDF only to the CV field, never to cover letters, a
   assert.match(src, /:not\(\[type='file'\]\), textarea/, "el autorrelleno no intenta escribir texto en campos de archivo");
 
   const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
-  assert.match(sw, /if \(!validacion\?\.ok\) \{\n(?:\s*\/\/.*\n)*\s*await save\(\{ retryFix: true \}\);\n\s*return \{ success: true, ok: false/, "un CV que no pasa el verificador no genera PDF");
+  assert.match(sw, /if \(!cp\.pdf\) \{\n(?:\s*\/\/.*\n)*\s*await save\(\{ retryFix: true \}\);\n\s*return \{ success: true, ok: false/, "un CV que el verificador rechaza no entrega PDF");
   assert.match(sw, /importScripts\([^)]*"\/shared\/cv-adapter\.js"[^)]*"\/content\/portals\.js"\)/);
 });
 
@@ -2861,7 +2861,7 @@ it("Apply flow: pauses on a preview of the CV and only attaches after the user c
   assert.match(sanitize, /\/\^on\/i\.test\(attr\.name\)/);
   assert.match(sanitize, /querySelectorAll\("img"\)/);
   const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
-  assert.match(sw, /html: typeof validacion\?\.html === "string" \? validacion\.html : ""/, "el worker entrega el HTML de cv_validar");
+  assert.match(sw, /html: JobFillCv\.renderCvPreviewHtml\(cp\.markdown, header\)/, "el worker entrega la vista previa armada localmente");
 });
 
 it("Apply flow: a requested change keeps the vault rules, uses only BASE facts and goes back through the verifier", () => {
@@ -2882,8 +2882,8 @@ it("Apply flow: a requested change keeps the vault rules, uses only BASE facts a
 
   const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
   // El cambio deja el CV sin validar: vuelve a pasar por cv_validar (y al ajuste) antes de otro PDF.
-  assert.match(sw, /markdown: repair\(revisado\.markdown, cp\.markdown\), validacion: null, fixRounds: 0/);
-  assert.ok(sw.indexOf("cp.cambioPendiente) {") < sw.indexOf("let validacion = cp.validacion;"), "el cambio se aplica antes de validar");
+  assert.match(sw, /markdown: repair\(revisado\.markdown, cp\.markdown\), pdf: null, rechazo: null, fixRounds: 0/);
+  assert.ok(sw.indexOf("cp.cambioPendiente) {") < sw.indexOf("if (!cp.pdf && !cp.rechazo) await generar("), "el cambio se aplica antes de verificar y generar");
 });
 
 it("CV from the AI: the frontmatter is rebuilt so the Worker's YAML parser always finds a text titulo", () => {
@@ -2925,22 +2925,85 @@ it("Company names lose the portal noise glued to them (Follow, dates, 'Last repl
   for (const ok of ["Mayo Clinic", "Hace Group", "Posted Labs", "BCI", ""]) assert.strictEqual(P.cleanCompanyName(ok), ok);
 });
 
-it("Postulador rejecting the CV content becomes a verifier finding for the automatic fix, not a crash", () => {
+it("One browser per CV: cv_generar_pdf verifies; a content rejection goes to the fix, never cv_validar twice", () => {
   const V = loadRealVaultClient();
   let err = null;
-  try { V.parseToolResult({ isError: true, content: [{ type: "text", text: 'El CV necesita "titulo" en el frontmatter (subtítulo bajo el nombre).' }] }); } catch (e) { err = e; }
+  try { V.parseToolResult({ isError: true, content: [{ type: "text", text: "Error: No se genera: Falta la sección EDUCACIÓN · ocupa 2 páginas (sobran ~3 líneas)" }] }); } catch (e) { err = e; }
   assert.ok(err && err.toolError === true, "un rechazo de la herramienta queda marcado como toolError");
 
+  const C = loadRealCvAdapter();
+  const r = C.hallazgosDeRechazo(err.message);
+  assert.deepStrictEqual(r.hallazgos.map(h => h.detalle), ["Falta la sección EDUCACIÓN", "ocupa 2 páginas (sobran ~3 líneas)"]);
+  assert.strictEqual(r.lineasDeMas, 3, "el ajuste sabe cuántas líneas borrar");
+  assert.match(C.buildFixPrompt({}, "## CV", r, { cached: true }), /Sobran ~3 líneas/);
+
   const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
-  const validate = sw.slice(sw.indexOf("async function validateCv"), sw.indexOf("async function readApplyCheckpoint"));
-  assert.match(validate, /if \(!err\.toolError\) throw err;/, "red o sesión siguen siendo errores");
-  assert.match(validate, /return \{ ok: false, hallazgos: \[\{ nivel: "error", detalle: err\.message \}\]/);
-  // El flujo valida siempre con validateCv y repara todo CV que devuelve la IA.
-  const flow = sw.slice(sw.indexOf("async function runAdaptCvSteps"), sw.indexOf("/** Registra la postulación actual"));
-  assert.doesNotMatch(flow, /vaultCall\("cv_validar"/);
+  const flow = sw.slice(sw.indexOf("async function runAdaptCvSteps"), sw.indexOf("async function paceBrowserCall"));
+  assert.doesNotMatch(flow, /"cv_validar"/, "sin chequeo previo duplicado: el Worker verifica al generar");
+  assert.strictEqual((flow.match(/await generar\(/g) || []).length, 2, "1 generación + 1 tras el ajuste, como máximo");
+  assert.match(flow, /if \(!err\.toolError \|\| err\.rateLimited\) throw err;/, "red, sesión y límite de navegadores no son problemas del CV");
+  assert.match(flow, /await paceBrowserCall\(/, "pausa entre navegadores");
   for (const src of ["adaptado.markdown", "revisado.markdown", "fix.markdown"]) {
     assert.match(flow, new RegExp(`repair\\(${src.replace(".", "\\.")}`), `${src} pasa por repair`);
   }
+  // Límite de navegadores de Cloudflare: espera y reintenta la misma llamada.
+  assert.match(sw, /const VAULT_RATE_LIMIT_WAITS_MS = \[20000, 40000\];/);
+  assert.match(sw, /const BROWSER_CALL_GAP_MS = 20000;/);
+});
+
+it("Tokens: RULES + BASE go once as a cached system block, not repeated in adapt/fix/change prompts", () => {
+  const C = loadRealCvAdapter();
+  const ctx = { base: "# BASE\n- [px-01] Logro real único", perfiles: [{ perfil: "AI", markdown: "---\ntitulo: \"Ing | AI\"\n---\nCV" }], instrucciones: null, reglas: { titulo_profesional: "Ingeniero en Informática", fechas_fijas: {}, nunca_incluir: ["Ghost HUD"] } };
+  const system = C.buildCvSystem(ctx);
+  assert.match(system, /Logro real único/);
+  assert.match(system, /Ghost HUD/);
+  for (const prompt of [
+    C.buildAdaptPrompt(ctx, "AI", "Oferta Python", { cached: true }),
+    C.buildFixPrompt(ctx, "## CV", { hallazgos: [] }, { cached: true }),
+    C.buildRevisePrompt(ctx, "## CV", "acorta", "Oferta Python", { cached: true })
+  ]) {
+    assert.doesNotMatch(prompt, /Logro real único/, "la BASE no se repite");
+    assert.doesNotMatch(prompt, /Ghost HUD/, "las reglas no se repiten");
+  }
+  // Sin cached, siguen completos (compatibilidad).
+  assert.match(C.buildAdaptPrompt(ctx, "AI", "Oferta"), /Logro real único/);
+  const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
+  assert.match(sw, /const cvSystem = \[\{ type: "text", text: JobFillCv\.buildCvSystem\(ctx\), cache_control: \{ type: "ephemeral" \} \}\];/);
+});
+
+it("Structured outputs: every CV call asks for a JSON schema; raw newlines inside strings no longer break parsing", () => {
+  const C = loadRealCvAdapter();
+  for (const [name, schema] of Object.entries(C.SCHEMAS)) {
+    assert.strictEqual(schema.type, "object", name);
+    assert.strictEqual(schema.additionalProperties, false, `${name}: additionalProperties false (lo exige la API)`);
+    assert.deepStrictEqual([...schema.required].sort(), Object.keys(schema.properties).sort(), `${name}: todo required`);
+  }
+  // El error real: "Bad control character in string literal in JSON at position 135".
+  const bad = '{"empresa": "3IT",\n "markdown": "---\ntitulo: \\"X\\"\n---\n## RESUMEN\n\tTexto"}';
+  assert.throws(() => JSON.parse(bad), /control character/i);
+  assert.deepStrictEqual({ ...C.parseJsonReply(bad) }, { empresa: "3IT", markdown: '---\ntitulo: "X"\n---\n## RESUMEN\n\tTexto' });
+  assert.throws(() => C.parseJsonReply('{"markdown": "sin cerrar'), /JSON/);
+
+  const ai = loadRealAiClient();
+  const settings = ai.readAiSettings({ claudeApiKey: "sk-ant-x", vertexApiKey: "AQ.k" });
+  const schema = C.SCHEMAS.ajustar;
+  const body = { max_tokens: 100, messages: [{ role: "user", content: "x" }], output_config: { format: { type: "json_schema", schema } } };
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(ai.buildRequests(settings, "anthropic", "claude-sonnet-5", body)[0].body.output_config)), { format: { type: "json_schema", schema: JSON.parse(JSON.stringify(schema)) } });
+  assert.strictEqual(ai.buildRequests(settings, "gemini", "claude-sonnet-5", body)[0].body.generationConfig.responseMimeType, "application/json", "en Gemini, JSON garantizado");
+  const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
+  for (const schemaName of ["perfil", "adaptar", "ajustar", "cambio"]) assert.match(sw, new RegExp(`schema: "${schemaName}"`));
+});
+
+it("Local CV preview: same structure as the Worker template, escaped, no browser needed", () => {
+  const C = loadRealCvAdapter();
+  const html = C.renderCvPreviewHtml('---\ntitulo: "Ing | AI <b>x</b>"\n---\n## RESUMEN PROFESIONAL\nTexto con **negrita**.\n## EXPERIENCIA PROFESIONAL\n### Dev | MAZA (May 2024 – Presente)\n- **RAG:** Implementé <script>alert(1)</script>',
+    { nombre: "ANA PÉREZ", ubicacion: "Santiago, Chile", telefono: "+56 9", email: "a@b.cl", links: [{ etiqueta: "GitHub", url: "github.com/ana" }] });
+  assert.match(html, /<h1>ANA PÉREZ<\/h1>/);
+  assert.match(html, /<div class="subtitulo">Ing \| AI &lt;b&gt;x&lt;\/b&gt;<\/div>/);
+  assert.match(html, /<section><h2>RESUMEN PROFESIONAL<\/h2><p>Texto con <strong>negrita<\/strong>\.<\/p><\/section>/);
+  assert.match(html, /<h3>Dev \| MAZA \(May 2024 – Presente\)<\/h3><ul><li><strong>RAG:<\/strong> Implementé &lt;script&gt;/);
+  assert.match(html, /GitHub: <a href="https:\/\/github\.com\/ana">github\.com\/ana<\/a>/);
+  assert.doesNotMatch(html, /<script>/);
 });
 
 it("Number inputs get a clean number (RUT body, phone digits) or are left alone", () => {

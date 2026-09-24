@@ -4307,9 +4307,10 @@
     ["contexto", "Leer tu BASE y CVs base"],
     ["perfil", "Elegir el CV base"],
     ["adaptar", "Adaptar el CV a la oferta"],
-    ["validar", "Verificar reglas y 1 página"],
-    ["ajustar", "Ajustar lo que no pasa"],
-    ["pdf", "Generar el PDF (queda en tu vault)"],
+    // Tu postulador verifica reglas y 1 página AL generar el PDF (un solo
+    // navegador); el ajuste corre solo si lo rechaza.
+    ["pdf", "Verificar y generar el PDF (queda en tu vault)"],
+    ["ajustar", "Ajustar lo que no pasa (solo si hace falta)"],
     ["revisar", "Revisar el CV (tú decides si se adjunta)"],
     ["adjuntar", "Adjuntar el PDF al formulario"],
     ["rellenar", "Autorrellenar el formulario"]
@@ -4451,7 +4452,7 @@
         const bar = document.createElement("div");
         bar.className = "jf-preview-bar";
         const title = document.createElement("span");
-        title.textContent = "Vista previa (misma plantilla del PDF)";
+        title.textContent = "Vista previa del contenido · el PDF exacto: ↗ Abrir PDF";
         const pages = document.createElement("span");
         if (paginas) {
           pages.textContent = paginas === 1 ? "1 página" : `${paginas} páginas`;
@@ -4756,7 +4757,7 @@
         }
 
         if (!res.ok) {
-          ui.finishSteps("validar");
+          ui.finishSteps("ajustar");
           ui.showResult([
             { text: "✗ El CV adaptado no pasa las reglas de tu verificador, así que no se generó el PDF.", tone: "err", items: res.hallazgos.filter(h => h.nivel === "error").map(h => h.detalle) },
             { text: res.canRetry

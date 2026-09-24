@@ -150,6 +150,12 @@
         thinkingConfig: geminiModel.thinkingConfig
       }
     };
+    // Salida estructurada pedida para Claude (output_config.format): en
+    // Gemini, JSON garantizado con responseMimeType. El esquema no se traduce
+    // (el de Gemini es otro dialecto); la forma la fija el prompt.
+    if (body.output_config?.format?.type === "json_schema") {
+      request.generationConfig.responseMimeType = "application/json";
+    }
     if (body.system) {
       const systemParts = toGeminiParts(body.system);
       if (systemParts.length) request.systemInstruction = { parts: systemParts };
@@ -387,12 +393,15 @@
    * `thinking` solo se envía a Anthropic; Gemini se configura por modelo
    * (ver GEMINI_MODELS).
    */
-  async function callAi(settings, { model, system, messages, max_tokens = 1500, thinking, timeoutMs = DEFAULT_TIMEOUT_MS, onRetry }) {
+  async function callAi(settings, { model, system, messages, max_tokens = 1500, thinking, timeoutMs = DEFAULT_TIMEOUT_MS, onRetry, jsonSchema }) {
     const problem = aiSettingsProblem(settings);
     if (problem) throw new Error(problem);
 
     const body = { max_tokens, messages };
     if (system) body.system = system;
+    // Salida estructurada: la API garantiza JSON válido que cumple el esquema
+    // (sin saltos de línea crudos dentro de los strings, que rompían JSON.parse).
+    if (jsonSchema) body.output_config = { format: { type: "json_schema", schema: jsonSchema } };
 
     if (settings.provider === "gemini") {
       return callProvider(settings, "gemini", { model, body, timeoutMs, onRetry });
