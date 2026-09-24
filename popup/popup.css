@@ -253,3 +253,86 @@ body {
   color: #a5b4fc;
   text-decoration: underline;
 }
+
+/* ─── Interruptor global ─────────────────────────────────────────────── */
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.power-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+}
+
+/* El checkbox real queda accesible (teclado, lector de pantalla); solo se
+   oculta visualmente y el track dibuja el estado. */
+.power-switch input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+}
+
+.power-track {
+  position: relative;
+  width: 34px;
+  height: 20px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.3);
+  border: 1px solid var(--border-color);
+  transition: background 0.2s ease;
+}
+
+.power-thumb {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #f8fafc;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+  transition: transform 0.2s ease;
+}
+
+.power-switch input:checked + .power-track {
+  background: var(--primary-gradient);
+}
+
+.power-switch input:checked + .power-track .power-thumb {
+  transform: translateX(14px);
+}
+
+.power-switch input:focus-visible + .power-track {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.power-label {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  min-width: 52px;
+}
+
+.disabled-banner {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: #fde68a;
+  background: rgba(245, 158, 11, 0.12);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.disabled-banner[hidden] { display: none; }
+
+/* Apagada: la acción principal se ve y se comporta como no disponible. */
+.popup-container.is-disabled .action-card {
+  opacity: 0.45;
+  pointer-events: none;
+}

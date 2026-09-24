@@ -10,4 +10,4 @@ Cuando se requiera interactuar con la API de Anthropic o modificar lógica de mo
 
 Estos IDs están completos tal cual: **nunca agregar sufijos de fecha** (`-20251001` y similares son inválidos y devuelven 404).
 
-Está terminantemente prohibido hacer fallbacks a modelos como `claude-3-opus`, `claude-3-sonnet` clásico, `claude-2.1`, etc.
+**Respaldo con Gemini (pedido explícito del usuario):** además de Claude, la extensión puede usar Gemini vía Vertex AI (modo express, API key) como respaldo cuando Claude se queda sin saldo, o como modelo principal si el usuario lo elige. El mapeo vive SOLO en `GEMINI_MODELS` de `shared/ai-client.js`: **Gemini 3.8 Flash** para ambos (`gemini-3.8-flash`, luego `gemini-3.8-flash-preview`), con `gemini-2.5-flash` como último recurso si el ID de 3.8 no existe en el modo express. El resto del código sigue usando únicamente los dos IDs de Claude de arriba.

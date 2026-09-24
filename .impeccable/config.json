@@ -2,16 +2,6 @@
   "detector": {
     "ignoreRules": [],
     "ignoreFiles": [],
-    "ignoreValues": [
-      {
-        "rule": "side-tab",
-        "value": "*",
-        "files": [
-          "content/autofill.css"
-        ],
-        "createdAt": "2026-09-02T05:49:57.499Z",
-        "reason": "Left border on .jobfill-toast-success/info/error is the color-coded status indicator for a transient toast notification (paired with the status icon), not a decorative accent on a content card. Pre-existing pattern, not introduced this session."
-      }
-    ]
+    "ignoreValues": []
   }
 }

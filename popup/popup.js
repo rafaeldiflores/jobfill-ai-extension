@@ -13,6 +13,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   const aiStatusBadge = document.getElementById("aiStatusBadge");
 
   const popupCvProfileSelect = document.getElementById("popupCvProfileSelect");
+  const enabledToggle = document.getElementById("extensionEnabledToggle");
+  const enabledLabel = document.getElementById("extensionEnabledLabel");
+  const disabledBanner = document.getElementById("disabledBanner");
+  const popupContainer = document.querySelector(".popup-container");
 
   // Load storage
   let storedData = await chrome.storage.local.get(null);
@@ -56,8 +60,11 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
     }
 
-    if (storedData.claudeApiKey && storedData.claudeApiKey.trim().length > 10) {
-      aiStatusBadge.textContent = "Claude IA Activo";
+    if (JobFillAi.hasAiCredentials(storedData)) {
+      const ai = JobFillAi.readAiSettings(storedData);
+      aiStatusBadge.textContent = ai.provider === "gemini"
+        ? "Gemini IA Activo"
+        : JobFillAi.hasGeminiFallback(ai) ? "Claude IA Activo (+ Gemini)" : "Claude IA Activo";
       aiStatusBadge.classList.remove("inactive");
     } else {
       aiStatusBadge.textContent = "IA Sin Configurar";
@@ -66,6 +73,27 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   updatePopupUI();
+
+  /**
+   * Interruptor global. El estado vive en `extensionEnabled` de
+   * chrome.storage.local (ausente = activa): el content script de cada
+   * pestaña y el service worker escuchan ese cambio y reaccionan al instante,
+   * sin recargar páginas.
+   */
+  function renderEnabledState(enabled) {
+    enabledToggle.checked = enabled;
+    enabledLabel.textContent = enabled ? "Activa" : "Apagada";
+    disabledBanner.hidden = enabled;
+    popupContainer.classList.toggle("is-disabled", !enabled);
+    btnAutofill.disabled = !enabled;
+  }
+  renderEnabledState(storedData.extensionEnabled !== false);
+
+  enabledToggle.addEventListener("change", async () => {
+    const enabled = enabledToggle.checked;
+    renderEnabledState(enabled);
+    await chrome.storage.local.set({ extensionEnabled: enabled });
+  });
 
   if (popupCvProfileSelect) {
     popupCvProfileSelect.addEventListener("change", async () => {
@@ -84,6 +112,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   // Handle Autofill trigger
   btnAutofill.addEventListener("click", async () => {
+    if (!enabledToggle.checked) return;
     setStatus("Analizando formulario...", "info");
     
     try {

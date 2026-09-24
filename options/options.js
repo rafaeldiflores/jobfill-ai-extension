@@ -8,6 +8,19 @@
  * NUNCA asumir que content[0] es el bloque de texto: si el modelo razona, los
  * primeros bloques son de tipo "thinking" y content[0].text es undefined.
  */
+/**
+ * Escapa un valor del usuario antes de meterlo en un template de innerHTML.
+ * Las tarjetas de Q&A, campos flexibles, cargos y proyectos se arman con
+ * `value="${...}"` y `<textarea>${...}</textarea>`: sin escapar, un valor con
+ * comillas (`Proyecto "MAZA"`) cortaba el atributo y el resto se PERDÍA al
+ * guardar, y un `</textarea>` en una respuesta rompía la tarjeta entera.
+ */
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
 function extractClaudeText(data) {
   const blocks = Array.isArray(data?.content) ? data.content : [];
   return blocks
@@ -25,7 +38,10 @@ function extractClaudeText(data) {
  * como la cadena "on" que FormData produce, no como booleano).
  */
 const GLOBAL_SETTING_KEYS = [
+  "aiProvider",
   "claudeApiKey",
+  "vertexApiKey",
+  "aiFallbackToGemini",
   "claudeModel",
   "claudeModelSimple",
   "aiTone",
@@ -44,6 +60,18 @@ const GLOBAL_SETTING_KEYS = [
  * CV — estas dos funciones son el único puente hacia/desde el esquema real.
  */
 const CV_INDEX_OWN_FIELDS = ["id", "name", "targetRole", "keywords"];
+
+/** Etiquetas legibles de los campos que se pueden completar desde un .md. */
+const MD_FIELD_LABELS = {
+  fullName: "Nombre completo", firstName: "Nombre", middleName: "Segundo nombre", lastName: "Apellidos",
+  lastNamePaternal: "Apellido paterno", lastNameMaternal: "Apellido materno", email: "Email", phone: "Teléfono",
+  linkedinUrl: "LinkedIn", githubUrl: "GitHub", portfolioUrl: "Portafolio", city: "Ciudad", country: "País",
+  englishLevel: "Nivel de inglés", noticePeriod: "Disponibilidad", degree: "Título", university: "Institución",
+  skills: "Habilidades"
+};
+
+/** Credenciales que nunca salen ni entran por un archivo de respaldo. */
+const BACKUP_EXCLUDED_KEYS = ["claudeApiKey", "vertexApiKey", "vertexProjectId", "vertexRegion", "vaultAuth"];
 
 /** `candidateBase` + cada `cvIndexes[]` → un array de objetos "con forma de perfil". */
 function profilesFromCandidateData(candidateBase, cvIndexes) {
@@ -114,6 +142,34 @@ document.addEventListener("DOMContentLoaded", async () => {
   const btnTestClaude = document.getElementById("btnTestClaude");
   const claudeTestResult = document.getElementById("claudeTestResult");
   const claudeApiKeyInput = document.getElementById("claudeApiKey");
+  const aiProviderSelect = document.getElementById("aiProvider");
+  const vertexApiKeyInput = document.getElementById("vertexApiKey");
+  const btnToggleVertexKey = document.getElementById("btnToggleVertexKey");
+  const aiFallbackCheckbox = document.getElementById("aiFallbackToGemini");
+  const geminiFallbackGroup = document.getElementById("geminiFallbackGroup");
+
+  /**
+   * Ajustes de IA tal como están AHORA en los inputs (aunque no se hayan
+   * guardado): "Probar Conexión" y "Estructurar CV" deben usar lo que el
+   * usuario acaba de escribir, no lo último guardado.
+   */
+  function aiSettingsFromDOM() {
+    return JobFillAi.readAiSettings({
+      aiProvider: aiProviderSelect?.value,
+      claudeApiKey: claudeApiKeyInput?.value,
+      vertexApiKey: vertexApiKeyInput?.value,
+      aiFallbackToGemini: aiFallbackCheckbox ? aiFallbackCheckbox.checked : true
+    });
+  }
+
+  /** El respaldo con Gemini solo tiene sentido cuando Claude es el principal. */
+  function syncProviderFields() {
+    if (geminiFallbackGroup) geminiFallbackGroup.hidden = aiProviderSelect?.value === "gemini";
+  }
+  aiProviderSelect?.addEventListener("change", () => {
+    syncProviderFields();
+    claudeTestResult.className = "api-test-badge";
+  });
   const btnAddQa = document.getElementById("btnAddQa");
   const qaList = document.getElementById("qaList");
   const btnAddCustomField = document.getElementById("btnAddCustomField");
@@ -148,6 +204,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   const cvProgressPercentage = document.getElementById("cvProgressPercentage");
   const cvProgressFill = document.getElementById("cvProgressFill");
 
+  let localMarkdownSources = [];
+  // Términos vetados por las reglas del vault: la vista del .md debe mostrar
+  // exactamente lo mismo que el service worker le enviará a la IA.
+  let vaultVetoed = [];
   let localProfiles = [];
   let activeProfileId = "prof_default";
   let localQA = [];
@@ -162,11 +222,16 @@ document.addEventListener("DOMContentLoaded", async () => {
       tabPanels.forEach(p => p.classList.remove("active"));
 
       item.classList.add("active");
-      const targetTab = item.getAttribute("data-tab");
-      const panel = document.getElementById(targetTab);
-      if (panel) panel.classList.add("active");
+      // Un ítem puede mostrar VARIAS secciones apiladas ("Mis datos" agrupa
+      // contacto, redes, experiencia, educación y legal): antes eran cinco
+      // pestañas separadas para datos que se llenan de una sola vez.
+      item.getAttribute("data-tab").split(/\s+/).forEach(id => {
+        document.getElementById(id)?.classList.add("active");
+      });
 
       tabTitle.textContent = item.querySelector("span:last-child").textContent;
+      document.querySelector(".main-content")?.scrollTo({ top: 0 });
+      if (item.getAttribute("data-tab") === "tab-home") renderSetupChecklist();
     });
   });
 
@@ -191,6 +256,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (storedData) {
     // Load Global API Key & Global Settings
     if (storedData.claudeApiKey && claudeApiKeyInput) claudeApiKeyInput.value = storedData.claudeApiKey;
+    if (aiProviderSelect) aiProviderSelect.value = storedData.aiProvider === "gemini" ? "gemini" : "anthropic";
+    if (storedData.vertexApiKey && vertexApiKeyInput) vertexApiKeyInput.value = storedData.vertexApiKey;
+    if (aiFallbackCheckbox) aiFallbackCheckbox.checked = storedData.aiFallbackToGemini !== false;
+    syncProviderFields();
     if (storedData.aiTone && document.getElementById("aiTone")) document.getElementById("aiTone").value = storedData.aiTone;
     if (storedData.customAiInstructions && document.getElementById("customAiInstructions")) document.getElementById("customAiInstructions").value = storedData.customAiInstructions;
     // Sin valor guardado, la confirmación va activada (el checkbox ya viene
@@ -218,7 +287,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         email: storedData.email || "",
         phone: storedData.phone || "",
         country: storedData.country || "Chile",
-        city: storedData.city || "Santiago",
+        city: storedData.city || "",
         address: storedData.address || "",
         postalCode: storedData.postalCode || "",
         linkedinUrl: storedData.linkedinUrl || "",
@@ -245,7 +314,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           email: storedData.email || "",
           phone: storedData.phone || "",
           country: storedData.country || "Chile",
-          city: storedData.city || "Santiago",
+          city: storedData.city || "",
           address: storedData.address || "",
           postalCode: storedData.postalCode || "",
           linkedinUrl: storedData.linkedinUrl || "",
@@ -269,6 +338,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     loadActiveProfileIntoDOM();
     renderGlobalProfileSelector();
+    renderSetupChecklist();
   }
 
   // Profile-Centric DOM Load
@@ -299,6 +369,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     localQA = current.customQA ? [...current.customQA] : [];
     localCustomFields = current.customFields ? [...current.customFields] : [];
     localCvDatabase = current.cvDatabase || { rawText: "", experiences: [], projects: [], education: [] };
+    localMarkdownSources = Array.isArray(current.markdownSources) ? [...current.markdownSources] : [];
+    renderMarkdownSources();
 
     renderQaList();
     renderCustomFieldsList();
@@ -325,6 +397,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     current.customQA = extractQaFromDOM();
     current.customFields = extractCustomFieldsFromDOM();
     current.cvDatabase = extractCvDatabaseFromDOM();
+    current.markdownSources = localMarkdownSources;
   }
 
   function renderGlobalProfileSelector() {
@@ -379,10 +452,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       renderGlobalProfileSelector();
       loadActiveProfileIntoDOM();
 
-      showSaveFeedback(`✨ Nuevo índice creado: "${name.trim()}" — hereda tu CV. Ajusta sus keywords para distinguirlo.`);
+      scheduleSave();
 
       // Switch to CV tab automatically (ahí viven las keywords/título objetivo).
-      const cvTabBtn = document.querySelector('[data-tab="tab-cv"]');
+      const cvTabBtn = document.querySelector('[data-tab="tab-profiles"]');
       if (cvTabBtn) cvTabBtn.click();
     });
   }
@@ -395,7 +468,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (newName && newName.trim()) {
         current.name = newName.trim();
         renderGlobalProfileSelector();
-        showSaveFeedback("✓ Perfil renombrado");
+        scheduleSave();
       }
     });
   }
@@ -412,21 +485,28 @@ document.addEventListener("DOMContentLoaded", async () => {
         activeProfileId = localProfiles[0].id;
         renderGlobalProfileSelector();
         loadActiveProfileIntoDOM();
-        showSaveFeedback("✓ Perfil eliminado");
+        scheduleSave();
       }
     });
   }
 
-  // Save profile form submission
-  profileForm.addEventListener("submit", async (e) => {
-    e.preventDefault();
-
+  /**
+   * Guarda TODO (perfil compartido, índices y ajustes globales). Antes solo
+   * ocurría al pulsar "Guardar Cambios" — y el formulario exigía email y
+   * teléfono (`required`), así que ni siquiera se podía guardar la API key
+   * sin completarlos. Ahora se guarda solo, unos instantes después de cada
+   * cambio (ver scheduleSave).
+   */
+  async function persistAll() {
     saveActiveProfileFromDOM();
     syncSharedFieldsAcrossProfiles(localProfiles.find(p => p.id === activeProfileId), localProfiles);
 
     const storagePayload = {
       ...candidateDataFromProfiles(localProfiles, activeProfileId),
+      aiProvider: aiProviderSelect?.value === "gemini" ? "gemini" : "anthropic",
       claudeApiKey: claudeApiKeyInput?.value?.trim() || "",
+      vertexApiKey: vertexApiKeyInput?.value?.trim() || "",
+      aiFallbackToGemini: aiFallbackCheckbox ? aiFallbackCheckbox.checked : true,
       aiTone: document.getElementById("aiTone")?.value || "profesional y persuasivo",
       customAiInstructions: document.getElementById("customAiInstructions")?.value || "",
       // El content script trata cualquier valor distinto de false como "sí
@@ -436,85 +516,112 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     await chrome.storage.local.set(storagePayload);
     renderGlobalProfileSelector();
-    showSaveFeedback("✓ ¡Todos los datos del perfil guardados con éxito!");
+    showSaveFeedback("✓ Guardado");
+    if (document.getElementById("tab-home")?.classList.contains("active")) renderSetupChecklist();
+  }
+
+  let saveTimer = null;
+  function scheduleSave() {
+    clearTimeout(saveTimer);
+    saveStatus.textContent = "Guardando…";
+    saveStatus.classList.add("show");
+    saveTimer = setTimeout(() => { persistAll().catch(err => showSaveFeedback(`⚠️ No se pudo guardar: ${err.message}`)); }, 600);
+  }
+
+  profileForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    clearTimeout(saveTimer);
+    await persistAll();
   });
 
+  // Autoguardado: cualquier cambio en el formulario. Los <input type=file>
+  // se excluyen: su "cambio" es elegir un archivo, que tiene su propio flujo.
+  profileForm.addEventListener("input", e => { if (e.target.type !== "file") scheduleSave(); });
+  profileForm.addEventListener("change", e => { if (e.target.type !== "file") scheduleSave(); });
+
+  document.addEventListener("keydown", e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+      e.preventDefault();
+      clearTimeout(saveTimer);
+      persistAll();
+    }
+  });
+
+  let feedbackTimer = null;
   function showSaveFeedback(msg) {
+    clearTimeout(feedbackTimer);
     saveStatus.textContent = msg;
     saveStatus.classList.add("show");
-    setTimeout(() => {
+    feedbackTimer = setTimeout(() => {
       saveStatus.classList.remove("show");
     }, 2500);
   }
 
   // Toggle API Key visibility
-  btnToggleKey.addEventListener("click", () => {
-    if (claudeApiKeyInput.type === "password") {
-      claudeApiKeyInput.type = "text";
-      btnToggleKey.textContent = "🔒";
-    } else {
-      claudeApiKeyInput.type = "password";
-      btnToggleKey.textContent = "👁️";
-    }
-  });
+  function wireVisibilityToggle(button, input) {
+    button?.addEventListener("click", () => {
+      const reveal = input.type === "password";
+      input.type = reveal ? "text" : "password";
+      button.textContent = reveal ? "🔒" : "👁️";
+    });
+  }
+  wireVisibilityToggle(btnToggleKey, claudeApiKeyInput);
+  wireVisibilityToggle(btnToggleVertexKey, vertexApiKeyInput);
 
-  // Test Claude API Key
+  // Probar conexión: cada proveedor configurado POR SEPARADO, con los dos
+  // modelos que usa la extensión. Se llama a `callProvider` y no a `callAi`
+  // a propósito: `callAi` saltaría a Gemini si Claude no tiene saldo, y la
+  // prueba diría "OK" escondiendo justo el problema que hay que ver.
   btnTestClaude.addEventListener("click", async () => {
-    const key = claudeApiKeyInput.value.trim();
-    // El modelo ya no se elige a mano: el enrutado por tipo de pregunta vive en
-    // el service worker. Aqui solo se prueba que la API Key funcione.
-    const model = "claude-sonnet-5";
-
-    if (!key) {
-      claudeTestResult.textContent = "⚠️ Ingresa una API Key primero.";
+    const ai = aiSettingsFromDOM();
+    const problem = JobFillAi.aiSettingsProblem(ai);
+    if (problem) {
+      claudeTestResult.textContent = `⚠️ ${problem}`;
       claudeTestResult.className = "api-test-badge show error";
       return;
     }
 
-    claudeTestResult.textContent = "⏳ Conectando directamente con Anthropic API...";
+    const providers = [];
+    if (ai.anthropicKey) providers.push("anthropic");
+    if (ai.geminiKey) providers.push("gemini");
+
+    claudeTestResult.textContent = `⏳ Probando ${providers.map(JobFillAi.describeProvider).join(" y ")}...`;
     claudeTestResult.className = "api-test-badge show";
 
-    const cleanKey = key.replace(/[\r\n\t\s"']/g, "").trim();
-    const endpointModel = model.includes("haiku") ? "claude-haiku-4-5" : "claude-sonnet-5";
-
-    try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "x-api-key": cleanKey,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
-          "anthropic-dangerous-direct-browser-access": "true"
-        },
-        body: JSON.stringify({
-          model: endpointModel,
-          max_tokens: 20,
-          thinking: { type: "disabled" },
-          messages: [{ role: "user", content: "Hola Claude, responde únicamente con 'OK' para verificar la conexión." }]
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        const reply = extractClaudeText(data) || "(sin texto)";
-        claudeTestResult.textContent = `✅ ¡Conexión exitosa con Claude (${model})! Respuesta: "${reply}"`;
-        claudeTestResult.className = "api-test-badge show success";
-        await chrome.storage.local.set({ claudeApiKey: cleanKey });
-      } else {
-        const errData = await response.json().catch(() => ({}));
-        const msg = errData?.error?.message || `Error ${response.status}: ${response.statusText}`;
-        if (response.status === 401) {
-          claudeTestResult.textContent = "❌ Error 401: API Key inválida o expirada. Cópiala de console.anthropic.com";
-        } else if (response.status === 429) {
-          claudeTestResult.textContent = "❌ Error 429: Saldo agotado en tu cuenta de Anthropic. Recarga saldo en console.anthropic.com";
-        } else {
-          claudeTestResult.textContent = `❌ Error Anthropic (${response.status}): ${msg}`;
+    const results = [];
+    for (const provider of providers) {
+      for (const model of [JobFillAi.MODEL_SONNET, JobFillAi.MODEL_HAIKU]) {
+        try {
+          const data = await JobFillAi.callProvider(ai, provider, {
+            model,
+            body: {
+              max_tokens: 20,
+              messages: [{ role: "user", content: "Responde únicamente con 'OK' para verificar la conexión." }],
+              ...(provider === "anthropic" ? { thinking: { type: "disabled" } } : {})
+            },
+            timeoutMs: 30000
+          });
+          results.push({ provider, label: data._model, ok: true, reply: extractClaudeText(data) || "(sin texto)" });
+        } catch (err) {
+          results.push({ provider, label: `${JobFillAi.describeProvider(provider)} · ${model}`, ok: false, error: err.message });
         }
-        claudeTestResult.className = "api-test-badge show error";
       }
-    } catch (err) {
-      claudeTestResult.textContent = `❌ Error de red / conexión: ${err.message}`;
-      claudeTestResult.className = "api-test-badge show error";
+    }
+
+    const primaryOk = results.filter(r => r.provider === ai.provider).every(r => r.ok);
+    claudeTestResult.textContent = results
+      .map(r => r.ok ? `✅ ${r.label}: "${r.reply}"` : `❌ ${r.label}: ${r.error}`)
+      .join("  ·  ");
+    claudeTestResult.className = `api-test-badge show ${results.every(r => r.ok) ? "success" : "error"}`;
+
+    // Se persisten las credenciales solo si el proveedor PRINCIPAL respondió.
+    if (primaryOk) {
+      await chrome.storage.local.set({
+        aiProvider: ai.provider,
+        claudeApiKey: ai.anthropicKey,
+        vertexApiKey: ai.geminiKey,
+        aiFallbackToGemini: ai.fallbackToGemini
+      });
     }
   });
 
@@ -535,9 +642,9 @@ document.addEventListener("DOMContentLoaded", async () => {
           <label>Palabras clave (separadas por coma):</label>
           <button type="button" class="btn-delete-qa" data-idx="${idx}">✕ Eliminar</button>
         </div>
-        <input type="text" class="qa-keywords-input" value="${qa.keywords || ""}" placeholder="ej: motivacion, por que quieres trabajar, why work here">
+        <input type="text" class="qa-keywords-input" value="${escapeHtml(qa.keywords)}" placeholder="ej: motivacion, por que quieres trabajar, why work here">
         <label style="margin-top: 4px;">Respuesta predefinida:</label>
-        <textarea class="qa-answer-input" rows="3" placeholder="Escribe tu respuesta aquí...">${qa.answer || ""}</textarea>
+        <textarea class="qa-answer-input" rows="3" placeholder="Escribe tu respuesta aquí...">${escapeHtml(qa.answer)}</textarea>
       `;
       qaList.appendChild(card);
     });
@@ -548,6 +655,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         localQA = extractQaFromDOM();
         localQA.splice(idx, 1);
         renderQaList();
+        scheduleSave();
       });
     });
   }
@@ -588,13 +696,13 @@ document.addEventListener("DOMContentLoaded", async () => {
           <label><strong>Nombre / Etiqueta del Campo:</strong></label>
           <button type="button" class="btn-delete-cf" data-idx="${idx}">✕ Eliminar</button>
         </div>
-        <input type="text" class="cf-label-input" value="${cf.label || ""}" placeholder="Ej: Licencia de Conducir, Renta Líquida, Nacionalidad">
+        <input type="text" class="cf-label-input" value="${escapeHtml(cf.label)}" placeholder="Ej: Licencia de Conducir, Renta Líquida, Nacionalidad">
         
         <label style="margin-top: 6px;"><strong>Valor a rellenar:</strong></label>
-        <input type="text" class="cf-value-input" value="${cf.value || ""}" placeholder="Ej: Clase B al día / $2.000.000 CLP / Chilena">
+        <input type="text" class="cf-value-input" value="${escapeHtml(cf.value)}" placeholder="Ej: Clase B al día / $2.000.000 CLP / Chilena">
 
         <label style="margin-top: 6px;"><strong>Palabras clave y sinónimos (separadas por comas):</strong></label>
-        <input type="text" class="cf-keywords-input" value="${cf.keywords || ""}" placeholder="Ej: licencia, conducir, driver license, carnet conducir">
+        <input type="text" class="cf-keywords-input" value="${escapeHtml(cf.keywords)}" placeholder="Ej: licencia, conducir, driver license, carnet conducir">
       `;
       customFieldsList.appendChild(card);
     });
@@ -605,6 +713,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         localCustomFields = extractCustomFieldsFromDOM();
         localCustomFields.splice(idx, 1);
         renderCustomFieldsList();
+        scheduleSave();
       });
     });
   }
@@ -736,6 +845,13 @@ document.addEventListener("DOMContentLoaded", async () => {
 
       const fileName = file.name.toLowerCase();
 
+      // Un .md es fuente de verdad, no un CV que haya que interpretar con IA.
+      if (fileName.endsWith(".md") || fileName.endsWith(".markdown")) {
+        e.target.value = "";
+        await importMarkdownFiles([file]);
+        return;
+      }
+
       if (fileName.endsWith(".pdf") || file.type === "application/pdf") {
         cvParseStatus.textContent = `⏳ Extrayendo texto del documento PDF "${file.name}"...`;
         cvParseStatus.className = "api-test-badge show";
@@ -831,15 +947,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   }
 
-  async function parseCvWithClaudeOrFallback(cvText, apiKey, model) {
-    if (!apiKey || !apiKey.trim()) {
-      fallbackToLocalParsing(cvText, "Sin API Key");
+  async function parseCvWithClaudeOrFallback(cvText, ai, model) {
+    if (!JobFillAi.hasAiCredentials(ai)) {
+      fallbackToLocalParsing(cvText, "Sin credenciales de Claude");
       return;
     }
-
-    const cleanKey = apiKey.replace(/[\r\n\t\s"']/g, "").trim();
-    const isHaiku = (model || "").toLowerCase().includes("haiku");
-    const targetModel = isHaiku ? "claude-haiku-4-5" : "claude-sonnet-5";
 
     const systemPrompt = `Eres un sistema experto en análisis y estructuración de Currículum Vitae profesional para postulaciones laborales.
 Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON válido con la siguiente estructura completa (sin markdown, sin explicaciones):
@@ -893,66 +1005,49 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
     let lastErrorMsg = "";
 
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s — Claude needs time for full CV analysis
-
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "x-api-key": cleanKey,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
-          "anthropic-dangerous-direct-browser-access": "true"
-        },
-        body: JSON.stringify({
-          model: targetModel,
-          max_tokens: 3000,
-          thinking: { type: "disabled" },
-          system: systemPrompt,
-          messages: [{ role: "user", content: `Analiza y extrae TODOS los datos personales, contacto, resumen, habilidades y Base de Datos del siguiente CV:\n\n${cvText}` }]
-        }),
-        signal: controller.signal
+      // max_tokens holgado: el JSON de un CV con varios cargos y proyectos
+      // supera fácilmente 3000 tokens, y un JSON cortado a la mitad no parsea
+      // y termina en el parser local (mucho peor) sin que se note por qué.
+      const data = await JobFillAi.callAi(ai, {
+        model,
+        max_tokens: 8000,
+        thinking: { type: "disabled" },
+        system: systemPrompt,
+        messages: [{ role: "user", content: `Analiza y extrae TODOS los datos personales, contacto, resumen, habilidades y Base de Datos del siguiente CV:\n\n${cvText}` }],
+        timeoutMs: 90000
       });
 
-      clearTimeout(timeoutId);
+      const rawReply = extractClaudeText(data);
+      const cleaned = rawReply.replace(/```json/gi, "").replace(/```/g, "").trim();
 
-      if (response.ok) {
-        const data = await response.json();
-        const rawReply = extractClaudeText(data);
-        const cleaned = rawReply.replace(/```json/gi, "").replace(/```/g, "").trim();
-
-        let parsed;
-        try {
-          parsed = JSON.parse(cleaned);
-        } catch (jsonErr) {
-          console.warn("Claude returned invalid JSON, falling back to local parser:", cleaned.slice(0, 200));
-          fallbackToLocalParsing(cvText, "Claude devolvió JSON inválido");
-          return;
-        }
-
-        parsed.rawText = cvText;
-        parsed.parsedAt = new Date().toISOString();
-
-        localCvDatabase = {
-          rawText: cvText,
-          parsedAt: parsed.parsedAt,
-          experiences: parsed.experiences || [],
-          projects: parsed.projects || [],
-          education: parsed.education || []
-        };
-        renderCvDatabase();
-
-        // Populate entire profile fields across all tabs
-        applyFullProfileExtraction(parsed, cvText);
-
-        completeProgress(true, `✅ [100%] ¡Perfil completo y Base de Datos autocompletados con éxito por Claude! (${localCvDatabase.experiences.length} cargos, ${localCvDatabase.projects.length} proyectos)`);
+      let parsed;
+      try {
+        parsed = JSON.parse(cleaned);
+      } catch (jsonErr) {
+        console.warn("Claude returned invalid JSON, falling back to local parser:", cleaned.slice(0, 200));
+        fallbackToLocalParsing(cvText, "Claude devolvió JSON inválido");
         return;
       }
 
-      const errData = await response.json().catch(() => ({}));
-      lastErrorMsg = errData?.error?.message || `Error ${response.status}`;
+      parsed.rawText = cvText;
+      parsed.parsedAt = new Date().toISOString();
+
+      localCvDatabase = {
+        rawText: cvText,
+        parsedAt: parsed.parsedAt,
+        experiences: parsed.experiences || [],
+        projects: parsed.projects || [],
+        education: parsed.education || []
+      };
+      renderCvDatabase();
+
+      // Populate entire profile fields across all tabs
+      applyFullProfileExtraction(parsed, cvText);
+
+      completeProgress(true, `✅ [100%] ¡Perfil completo y Base de Datos autocompletados con éxito por Claude! (${localCvDatabase.experiences.length} cargos, ${localCvDatabase.projects.length} proyectos)`);
+      return;
     } catch (err) {
-      lastErrorMsg = err.name === "AbortError" ? "Timeout de 45s con Claude (CV muy largo o red lenta)" : (err.message || "Error de red");
+      lastErrorMsg = err.message || "Error de red";
     }
 
     // Claude call failed or timed out: activate instant local fallback
@@ -962,8 +1057,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
   if (btnParseCvToDb) {
     btnParseCvToDb.addEventListener("click", async () => {
       const text = resumeTextInput.value.trim();
-      let currentApiKey = claudeApiKeyInput?.value?.trim();
-      const currentModel = "claude-sonnet-5";
+      const currentModel = JobFillAi.MODEL_SONNET;
 
       if (!text || text.length < 20) {
         cvParseStatus.textContent = "⚠️ Pega el texto de tu CV o sube un archivo antes de estructurarlo.";
@@ -976,13 +1070,10 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
 
       saveActiveProfileFromDOM();
 
-      if (!currentApiKey) {
-        const stored = await chrome.storage.local.get("claudeApiKey");
-        if (stored && stored.claudeApiKey) {
-          currentApiKey = stored.claudeApiKey.trim();
-        }
-      } else {
-        await chrome.storage.local.set({ claudeApiKey: currentApiKey });
+      // Lo escrito en la pestaña de IA manda; si está vacío, se usa lo guardado.
+      let currentAi = aiSettingsFromDOM();
+      if (!JobFillAi.hasAiCredentials(currentAi)) {
+        currentAi = JobFillAi.readAiSettings(await chrome.storage.local.get(null));
       }
 
       startProgressSimulation();
@@ -990,7 +1081,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
 
       // Execute parsing with automatic fallback and guaranteed error recovery
       try {
-        await parseCvWithClaudeOrFallback(text, currentApiKey, currentModel);
+        await parseCvWithClaudeOrFallback(text, currentAi, currentModel);
       } catch (fatalErr) {
         console.error("Fatal CV parsing error:", fatalErr);
         try {
@@ -1492,28 +1583,28 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
           <div class="cv-exp-grid">
             <div>
               <label>Empresa:</label>
-              <input type="text" class="cv-exp-company" value="${exp.company || ""}" placeholder="Ej: Tech Corp">
+              <input type="text" class="cv-exp-company" value="${escapeHtml(exp.company)}" placeholder="Ej: Tech Corp">
             </div>
             <div>
               <label>Cargo / Rol:</label>
-              <input type="text" class="cv-exp-role" value="${exp.role || ""}" placeholder="Ej: Senior Full Stack Developer">
+              <input type="text" class="cv-exp-role" value="${escapeHtml(exp.role)}" placeholder="Ej: Senior Full Stack Developer">
             </div>
             <div>
               <label>Período:</label>
-              <input type="text" class="cv-exp-period" value="${exp.period || ""}" placeholder="Ej: 2022 - Presente">
+              <input type="text" class="cv-exp-period" value="${escapeHtml(exp.period)}" placeholder="Ej: 2022 - Presente">
             </div>
           </div>
           <div>
             <label style="margin-top: 4px;">Responsabilidades Principales:</label>
-            <textarea class="cv-exp-desc" rows="2" placeholder="Resumen de responsabilidades...">${exp.description || ""}</textarea>
+            <textarea class="cv-exp-desc" rows="2" placeholder="Resumen de responsabilidades...">${escapeHtml(exp.description)}</textarea>
           </div>
           <div>
             <label style="margin-top: 4px;">Logros Clave y Métricas (Utilizados por Claude para argumentar idoneidad en postulaciones):</label>
-            <textarea class="cv-exp-achieve" rows="2" placeholder="Ej: Aumento del 40% en performance, reducción de costos AWS en 25%...">${exp.achievements || ""}</textarea>
+            <textarea class="cv-exp-achieve" rows="2" placeholder="Ej: Aumento del 40% en performance, reducción de costos AWS en 25%...">${escapeHtml(exp.achievements)}</textarea>
           </div>
           <div>
             <label style="margin-top: 4px;">Tecnologías Utilizadas:</label>
-            <input type="text" class="cv-exp-tech" value="${exp.technologies || ""}" placeholder="Ej: React, Python, PostgreSQL, Docker, AWS">
+            <input type="text" class="cv-exp-tech" value="${escapeHtml(exp.technologies)}" placeholder="Ej: React, Python, PostgreSQL, Docker, AWS">
           </div>
         `;
         cvExperiencesList.appendChild(card);
@@ -1534,16 +1625,16 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
           <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
             <div>
               <label>Nombre del Proyecto:</label>
-              <input type="text" class="cv-proj-name" value="${proj.name || ""}" placeholder="Ej: Plataforma de E-Commerce">
+              <input type="text" class="cv-proj-name" value="${escapeHtml(proj.name)}" placeholder="Ej: Plataforma de E-Commerce">
             </div>
             <div>
               <label>Stack Tecnológico:</label>
-              <input type="text" class="cv-proj-tech" value="${proj.technologies || ""}" placeholder="Ej: FastAPI, React, Redis">
+              <input type="text" class="cv-proj-tech" value="${escapeHtml(proj.technologies)}" placeholder="Ej: FastAPI, React, Redis">
             </div>
           </div>
           <div>
             <label style="margin-top: 4px;">Descripción e Impacto:</label>
-            <textarea class="cv-proj-desc" rows="2" placeholder="Objetivo del proyecto e impacto alcanzado...">${proj.description || ""}</textarea>
+            <textarea class="cv-proj-desc" rows="2" placeholder="Objetivo del proyecto e impacto alcanzado...">${escapeHtml(proj.description)}</textarea>
           </div>
         `;
         cvProjectsList.appendChild(card);
@@ -1557,6 +1648,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
         localCvDatabase = extractCvDatabaseFromDOM();
         localCvDatabase.experiences.splice(idx, 1);
         renderCvDatabase();
+        scheduleSave();
       });
     });
 
@@ -1566,6 +1658,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
         localCvDatabase = extractCvDatabaseFromDOM();
         localCvDatabase.projects.splice(idx, 1);
         renderCvDatabase();
+        scheduleSave();
       });
     });
   }
@@ -1625,17 +1718,347 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
     });
   }
 
+  // ─── Fuente de verdad en Markdown ─────────────────────────────────────────
+  // Búsquedas perezosas (no `const` de módulo): loadActiveProfileIntoDOM()
+  // llama a renderMarkdownSources() durante el arranque, ANTES de que la
+  // ejecución llegue a esta parte del archivo.
+  const mdDropzone = document.getElementById("mdDropzone");
+  const mdFileInput = document.getElementById("mdFileInput");
+  const btnApplyMdFields = document.getElementById("btnApplyMdFields");
+
+  function parsedMarkdown() {
+    return localMarkdownSources.length ? JobFillMarkdown.parseMarkdownSources(localMarkdownSources, { vetoed: vaultVetoed }) : null;
+  }
+
+  function formatBytes(n) {
+    return n > 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`;
+  }
+
+  /** Tarjeta por archivo, con lo que se entendió de él (o por qué no sirve). */
+  function renderMarkdownSources() {
+    const mdSourcesList = document.getElementById("mdSourcesList");
+    if (!mdSourcesList) return;
+    mdSourcesList.replaceChildren();
+
+    for (const source of localMarkdownSources) {
+      const parsed = JobFillMarkdown.parseMarkdownSources([source], { vetoed: vaultVetoed });
+      const summary = JobFillMarkdown.summarizeParsed(parsed);
+
+      const card = document.createElement("div");
+      card.className = "md-source-card";
+
+      const head = document.createElement("div");
+      head.className = "md-source-head";
+      const name = document.createElement("strong");
+      name.textContent = `📄 ${source.name}`;
+      const meta = document.createElement("span");
+      meta.className = "md-source-meta";
+      meta.textContent = `${formatBytes(source.content.length)} · importado ${new Date(source.importedAt).toLocaleString("es-CL")}`;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-delete-cf";
+      remove.textContent = "Quitar";
+      remove.addEventListener("click", () => {
+        localMarkdownSources = localMarkdownSources.filter(s => s.name !== source.name);
+        syncStructuredDbFromMarkdown();
+        renderMarkdownSources();
+        scheduleSave();
+      });
+      head.append(name, meta, remove);
+
+      const facts = document.createElement("ul");
+      facts.className = "md-source-facts";
+      const fact = (text, tone = "") => {
+        const li = document.createElement("li");
+        li.textContent = text;
+        if (tone) li.className = tone;
+        facts.appendChild(li);
+      };
+      if (summary.sections) fact(`✓ ${summary.sections} experiencias/proyectos con ${summary.achievements} logros`);
+      else fact("⚠️ No se encontraron secciones de experiencia (encabezados ## con logros en viñetas).", "warn");
+      fact(summary.hasRules ? "✓ REGLAS DE USO: se aplican literalmente en cada respuesta" : "Sin sección REGLAS DE USO (opcional)");
+      if (summary.excluded.length) fact(`🚫 Nunca se envían (su nota dice "NUNCA va en un CV" o tus reglas las vetan): ${summary.excluded.join(", ")}`);
+      if (source.origin === "vault") fact("🔗 Sincronizado desde tu vault: se actualiza solo");
+      if (summary.estimatedMetricsRemoved) fact(`🚫 ${summary.estimatedMetricsRemoved} métricas ESTIMADA se omiten siempre`);
+
+      card.append(head, facts);
+      mdSourcesList.appendChild(card);
+    }
+
+    renderDetectedFields();
+  }
+
+  /** Campos que el .md trae, para ofrecer completar los vacíos de "Mis datos". */
+  function renderDetectedFields() {
+    const mdDetectedFields = document.getElementById("mdDetectedFields");
+    const mdDetectedList = document.getElementById("mdDetectedList");
+    if (!mdDetectedFields) return;
+    const parsed = parsedMarkdown();
+    const fields = parsed ? JobFillMarkdown.markdownToProfileFields(parsed) : {};
+    const keys = Object.keys(fields).filter(k => MD_FIELD_LABELS[k]);
+    mdDetectedFields.hidden = keys.length === 0;
+    mdDetectedList.replaceChildren();
+    for (const key of keys) {
+      const dt = document.createElement("dt");
+      dt.textContent = MD_FIELD_LABELS[key];
+      const dd = document.createElement("dd");
+      dd.textContent = fields[key].length > 140 ? `${fields[key].slice(0, 140)}…` : fields[key];
+      mdDetectedList.append(dt, dd);
+    }
+  }
+
+  /**
+   * La base estructurada (cargos/logros/tecnologías) se regenera desde el
+   * .md: la usan el ranking por oferta y la verificación de requisitos. Sin
+   * .md, se conserva la que haya (CV procesado o editado a mano).
+   */
+  function syncStructuredDbFromMarkdown() {
+    const parsed = parsedMarkdown();
+    if (!parsed || !parsed.sections.length) return;
+    localCvDatabase = JobFillMarkdown.markdownToCvDatabase(parsed, "");
+    renderCvDatabase();
+  }
+
+  async function importMarkdownFiles(fileList) {
+    const files = [...fileList].filter(f => /\.(md|markdown)$/i.test(f.name) || f.type === "text/markdown");
+    if (!files.length) {
+      showSaveFeedback("⚠️ Solo se aceptan archivos .md");
+      return;
+    }
+    const t0 = performance.now();
+    for (const file of files) {
+      const content = await file.text();
+      const entry = { name: file.name, content, importedAt: Date.now() };
+      // Reimportar el mismo archivo lo REEMPLAZA: así se actualiza la BASE.
+      const idx = localMarkdownSources.findIndex(s => s.name === file.name);
+      if (idx >= 0) localMarkdownSources[idx] = entry;
+      else localMarkdownSources.push(entry);
+    }
+    syncStructuredDbFromMarkdown();
+    renderMarkdownSources();
+    await persistAll();
+    showSaveFeedback(`✓ ${files.length} archivo${files.length > 1 ? "s" : ""} importado${files.length > 1 ? "s" : ""} en ${Math.max(1, Math.round(performance.now() - t0))} ms`);
+  }
+
+  if (mdDropzone && mdFileInput) {
+    mdDropzone.addEventListener("click", () => mdFileInput.click());
+    mdDropzone.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); mdFileInput.click(); }
+    });
+    mdFileInput.addEventListener("change", () => {
+      importMarkdownFiles(mdFileInput.files);
+      mdFileInput.value = "";
+    });
+    ["dragenter", "dragover"].forEach(type => mdDropzone.addEventListener(type, e => {
+      e.preventDefault();
+      mdDropzone.classList.add("is-dragging");
+    }));
+    ["dragleave", "drop"].forEach(type => mdDropzone.addEventListener(type, e => {
+      e.preventDefault();
+      mdDropzone.classList.remove("is-dragging");
+    }));
+    mdDropzone.addEventListener("drop", e => importMarkdownFiles(e.dataTransfer.files));
+  }
+
+  btnApplyMdFields?.addEventListener("click", () => {
+    const parsed = parsedMarkdown();
+    if (!parsed) return;
+    const fields = JobFillMarkdown.markdownToProfileFields(parsed);
+    let filled = 0;
+    for (const [key, value] of Object.entries(fields)) {
+      const input = profileForm.elements[key];
+      // Solo lo vacío: nunca se pisa algo que el usuario ya escribió.
+      if (!input || (input.value || "").trim()) continue;
+      if (input.tagName === "SELECT" && ![...input.options].some(o => o.value === value)) continue;
+      input.value = value;
+      filled++;
+    }
+    showSaveFeedback(filled ? `✓ ${filled} campos completados desde tu .md` : "Tus datos ya estaban completos: no se cambió nada");
+    if (filled) scheduleSave();
+  });
+
+  // ─── Conexión con el vault (postulador) ──────────────────────────────────
+  // La lógica vive en el service worker (VAULT_*): aquí solo se muestra el
+  // estado y se envían las órdenes.
+  const vaultServerUrl = document.getElementById("vaultServerUrl");
+  const vaultResult = document.getElementById("vaultResult");
+
+  function sendToWorker(type, payload) {
+    return new Promise(resolve => {
+      chrome.runtime.sendMessage({ type, payload }, response => {
+        resolve(chrome.runtime.lastError
+          ? { success: false, error: chrome.runtime.lastError.message }
+          : response || { success: false, error: "Sin respuesta del service worker." });
+      });
+    });
+  }
+
+  function timeAgo(ts) {
+    const min = Math.round((Date.now() - ts) / 60000);
+    if (min < 1) return "recién";
+    if (min < 60) return `hace ${min} min`;
+    const h = Math.round(min / 60);
+    return h < 48 ? `hace ${h} h` : `hace ${Math.round(h / 24)} días`;
+  }
+
+  async function renderVaultCard() {
+    const { vaultAuth, vaultLastSync, vaultRules } = await chrome.storage.local.get(["vaultAuth", "vaultLastSync", "vaultRules"]);
+    const connected = Boolean(vaultAuth);
+    const newVetoed = vaultRules?.nunca_incluir || [];
+    if (JSON.stringify(newVetoed) !== JSON.stringify(vaultVetoed)) {
+      vaultVetoed = newVetoed;
+      renderMarkdownSources();
+    }
+    document.getElementById("vaultDisconnected").hidden = connected;
+    document.getElementById("vaultConnected").hidden = !connected;
+    const pill = document.getElementById("vaultPill");
+    pill.textContent = connected ? "Conectado" : "Sin conectar";
+    pill.classList.toggle("is-on", connected);
+    if (connected) {
+      const host = new URL(vaultAuth.serverUrl).host;
+      const vetoed = vaultRules?.nunca_incluir?.length || 0;
+      document.getElementById("vaultStatusText").textContent =
+        `${host} · BASE sincronizada ${vaultLastSync ? timeAgo(vaultLastSync) : "—"}` +
+        (vetoed ? ` · ${vetoed} ${vetoed === 1 ? "término vetado" : "términos vetados"} por tus reglas` : "") +
+        ". Se refresca sola al abrir esta página y al iniciar el navegador si tiene más de 6 h.";
+    }
+  }
+
+  function showVaultResult(ok, text) {
+    vaultResult.textContent = text;
+    vaultResult.className = `api-test-badge show ${ok ? "success" : "error"}`;
+  }
+
+  async function runVaultSync({ silent = false } = {}) {
+    if (!silent) showVaultResult(true, "⏳ Sincronizando con tu vault…");
+    const res = await sendToWorker("VAULT_SYNC");
+    if (res.success) {
+      if (!silent) showVaultResult(true, `✅ BASE sincronizada: ${res.sections} ${res.sections === 1 ? "experiencia" : "experiencias"}${res.excluded?.length ? ` (${res.excluded.length} excluidas por tus reglas)` : ""}.`);
+    } else if (!silent) {
+      showVaultResult(false, `❌ ${res.error}`);
+    }
+    await renderVaultCard();
+    return res;
+  }
+
+  document.getElementById("btnVaultConnect")?.addEventListener("click", async () => {
+    showVaultResult(true, "⏳ Abriendo el login de GitHub…");
+    const res = await sendToWorker("VAULT_CONNECT", { serverUrl: vaultServerUrl.value });
+    if (res.success) showVaultResult(true, `✅ Conectado. BASE sincronizada: ${res.sync.sections} ${res.sync.sections === 1 ? "experiencia" : "experiencias"}.`);
+    else showVaultResult(false, `❌ ${res.error}`);
+    await renderVaultCard();
+  });
+  document.getElementById("btnVaultSync")?.addEventListener("click", () => runVaultSync());
+  document.getElementById("btnVaultDisconnect")?.addEventListener("click", async () => {
+    await sendToWorker("VAULT_DISCONNECT");
+    showVaultResult(true, "Desconectado. Tu BASE ya importada se conserva.");
+    await renderVaultCard();
+  });
+
+  // Si otro contexto (el service worker al arrancar, el popup) actualiza la
+  // BASE mientras esta página está abierta, se refleja aquí — y se evita que
+  // el autoguardado la pise con la copia vieja que tenía en memoria.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local") return;
+    if (changes.candidateBase?.newValue) {
+      const incoming = changes.candidateBase.newValue.markdownSources || [];
+      const changed = JSON.stringify(incoming.map(x => [x.name, x.importedAt])) !== JSON.stringify(localMarkdownSources.map(x => [x.name, x.importedAt]));
+      if (changed) {
+        localMarkdownSources = [...incoming];
+        localCvDatabase = changes.candidateBase.newValue.cvDatabase || localCvDatabase;
+        renderMarkdownSources();
+        renderCvDatabase();
+      }
+    }
+    if (changes.vaultAuth || changes.vaultLastSync || changes.vaultRules) renderVaultCard();
+  });
+
+  // Al abrir la página: si la BASE del vault tiene más de 30 min, se refresca.
+  (async () => {
+    await renderVaultCard();
+    const { vaultAuth, vaultLastSync } = await chrome.storage.local.get(["vaultAuth", "vaultLastSync"]);
+    if (vaultAuth && (!vaultLastSync || Date.now() - vaultLastSync > 30 * 60 * 1000)) runVaultSync({ silent: true });
+  })();
+
+  // ─── Inicio: checklist de configuración ──────────────────────────────────
+  async function renderSetupChecklist() {
+    const container = document.getElementById("setupSteps");
+    if (!container) return;
+    const stored = await chrome.storage.local.get(null);
+    const base = stored.candidateBase || {};
+    const mdCount = (base.markdownSources || []).length;
+    const expCount = base.cvDatabase?.experiences?.length || 0;
+    const ai = JobFillAi.readAiSettings(stored);
+
+    const steps = [
+      {
+        done: mdCount > 0 || expCount > 0,
+        title: "Carga tu experiencia",
+        detail: stored.vaultAuth
+          ? "BASE sincronizada desde tu vault"
+          : mdCount ? `${mdCount} archivo${mdCount > 1 ? "s" : ""} .md como fuente de verdad` : expCount ? `${expCount} cargos cargados desde tu CV` : "Conecta tu vault o importa tu BASE en Markdown (instantáneo)",
+        tab: "tab-source",
+        action: "Ir a Fuente de verdad"
+      },
+      {
+        done: JobFillAi.hasAiCredentials(ai),
+        title: "Conecta la IA",
+        detail: JobFillAi.hasAiCredentials(ai)
+          ? `${JobFillAi.describeProvider(ai.provider)}${JobFillAi.hasGeminiFallback(ai) ? " + respaldo Gemini" : ""}`
+          : "Pega tu API Key de Claude (o de Gemini)",
+        tab: "tab-claude",
+        action: "Ir a Inteligencia artificial"
+      },
+      {
+        done: Boolean(base.email && base.phone && (base.firstName || base.fullName)),
+        title: "Revisa tus datos de contacto",
+        detail: base.email ? `${base.fullName || base.firstName || ""} · ${base.email}${base.phone ? ` · ${base.phone}` : " · falta teléfono"}` : "Nombre, email y teléfono (tu .md puede completarlos)",
+        tab: "tab-personal tab-links tab-experience tab-education tab-legal",
+        action: "Ir a Mis datos"
+      }
+    ];
+
+    container.replaceChildren();
+    steps.forEach((step, i) => {
+      const card = document.createElement("div");
+      card.className = `setup-step ${step.done ? "is-done" : ""}`;
+      const badge = document.createElement("div");
+      badge.className = "setup-step-badge";
+      badge.textContent = step.done ? "✓" : String(i + 1);
+      const text = document.createElement("div");
+      text.className = "setup-step-text";
+      const title = document.createElement("strong");
+      title.textContent = step.title;
+      const detail = document.createElement("span");
+      detail.textContent = step.detail;
+      text.append(title, detail);
+      const go = document.createElement("button");
+      go.type = "button";
+      go.className = step.done ? "btn-secondary" : "btn-primary";
+      go.textContent = step.done ? "Revisar" : step.action;
+      go.addEventListener("click", () => document.querySelector(`.nav-item[data-tab="${step.tab}"]`)?.click());
+      card.append(badge, text, go);
+      container.appendChild(card);
+    });
+  }
+
   // Backup - Export
   if (btnExportJson) {
     btnExportJson.addEventListener("click", async () => {
       const allData = await chrome.storage.local.get(null);
+      // Las API keys NO van en el respaldo: es un archivo que termina en
+      // Descargas, Drive o un correo, y con la key cualquiera puede gastar tu
+      // saldo. Al importarlo, las keys que ya tengas configuradas se
+      // conservan (storage.set fusiona).
+      for (const key of BACKUP_EXCLUDED_KEYS) delete allData[key];
       const blob = new Blob([JSON.stringify(allData, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
       a.download = `JobFill_AI_Backup_${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
-      URL.revokeObjectURL(url);
+      // Revocar en el mismo tick puede cancelar la descarga en algunos navegadores.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
   }
 
@@ -1653,6 +2076,18 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
       reader.onload = async (event) => {
         try {
           const importedData = JSON.parse(event.target.result);
+
+          // Solo se acepta algo con forma de respaldo de JobFill AI: un JSON
+          // cualquiera (o un array) se escribía tal cual en storage.
+          const isPlainObject = importedData && typeof importedData === "object" && !Array.isArray(importedData);
+          const looksLikeBackup = isPlainObject && (importedData.candidateBase || Array.isArray(importedData.profiles));
+          if (!looksLikeBackup) {
+            alert("❌ Ese archivo no parece un respaldo de JobFill AI (no trae datos de perfil).");
+            return;
+          }
+          // Un respaldo nunca debería traer keys (ya no se exportan), pero uno
+          // viejo sí: no se deja que pise las que están configuradas ahora.
+          for (const key of BACKUP_EXCLUDED_KEYS) delete importedData[key];
 
           // Respaldo PRE-rediseño (trae `profiles[]`, no `candidateBase`):
           // hay que borrar el esquema nuevo actual antes de escribirlo. Si no,

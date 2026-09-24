@@ -1,0 +1,20 @@
+# Corre la suite en cada push y PR. Sin dependencias que instalar: la suite
+# usa solo Node y lee el código real de la extensión (no copias).
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Validar manifest.json
+        run: node -e "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8'))"
+      - name: Tests (incluye la verificación de sintaxis de cada script)
+        run: npm test
