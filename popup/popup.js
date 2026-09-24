@@ -134,7 +134,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           // If content script was not injected, inject programmatically
           try {
             await chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ["content/autofill.css"] });
-            await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/autofill.js"] });
+            await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["content/portals.js", "content/autofill.js"] });
             
             // Retry message
             setTimeout(() => {

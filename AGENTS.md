@@ -32,7 +32,14 @@ Abre el icono de **JobFill AI** → ⚙️. La sección **🏠 Inicio** muestra 
 2. **🤖 Inteligencia artificial:** pega tu **Anthropic API Key** (`sk-ant-...`). Opcional: una **API Key de Vertex AI** (`AQ.…`) para que **Gemini responda si Claude se queda sin saldo**. *"⚡ Probar Conexión"* prueba cada proveedor por separado.
 3. **👤 Mis datos:** revisa contacto, renta, disponibilidad y la sección legal. Las preguntas legales empiezan **sin responder**: solo se rellenan si tú eliges una opción.
 
-Con el vault conectado, el panel flotante muestra **📌 Registrar postulación**: confirma empresa y cargo, y crea o actualiza `postulaciones/Empresa - Cargo.md` en tu Tracker con estado *Postulado* (siempre con confirmación, nunca automático).
+Con el vault conectado, el panel flotante suma dos botones:
+
+- **🚀 Postular**: todo el Postulador sin salir del portal. Lee la oferta de la página en tiempo real, elige tu CV base, lo adapta con tus instrucciones del vault (`cv/instrucciones.md`), pasa el verificador (reglas + 1 página, con un ajuste automático si hace falta), genera el PDF (queda en `cv/generados/`), **lo adjunta al campo del CV** del formulario y autorrellena el resto. Al final muestra la cobertura según tu grafo y te deja registrar la postulación con el CV usado. Si el CV no pasa el verificador, no se genera PDF ni se toca el formulario.
+- **📌 Registrar**: registra la postulación en el Tracker sin adaptar el CV.
+
+El registro en el Tracker siempre pide confirmación: nunca es automático.
+
+**🚀 Postular** funciona en la mayoría de los portales. Encuentra el formulario aunque esté dentro de un iframe (Greenhouse, Workable, iCIMS o Indeed embebidos en el sitio de la empresa) o en Shadow DOM (SuccessFactors, SmartRecruiters). Reconoce el campo del CV por los selectores de cada ATS (Greenhouse, Lever, Workday, Ashby, LinkedIn, Workable, Teamtailor y otros), por el nombre del campo o por su etiqueta. Si el portal solo ofrece una zona de "arrastra tu CV", suelta el archivo ahí. En formularios de varios pasos (LinkedIn Easy Apply, Workday, Taleo), si el campo del CV todavía no aparece, el PDF queda **pendiente** y se adjunta solo al llegar a ese paso (misma pestaña, 30 min). Si no está seguro de cuál es el campo del CV, no adjunta nada y te deja el botón de descarga.
 
 Extras: **💬 Respuestas guardadas** (Q&A y campos flexibles), **🎯 Perfiles de CV** (facetas con palabras clave, opcional) y **💾 Respaldo**.
 
@@ -66,5 +73,7 @@ Extras: **💬 Respuestas guardadas** (Q&A y campos flexibles), **🎯 Perfiles 
 
 - `npm test` corre la suite completa (sin dependencias). Carga el código **real** de la extensión (nunca copias) y verifica la sintaxis de cada script. GitHub Actions la corre en cada push (`.github/workflows/ci.yml`).
 - `shared/vault-client.js` es el cliente OAuth 2.1 (registro dinámico + PKCE con `chrome.identity`) y MCP (Streamable HTTP) del postulador (`rdf-grafo/postulador-mcp`). El token del vault no sale en los respaldos ni llega a las páginas.
+- `content/portals.js` concentra lo específico de cada portal: selectores del CV por ATS, puntaje de "¿es el campo del CV?", búsqueda en Shadow DOM y elección del frame. El content script corre con `all_frames`: el widget y la orquestación viven solo en el frame principal, y el service worker llama a la API `JobFillFrame` de cada frame con `chrome.scripting.executeScript` (mismo mundo aislado).
 - `shared/ai-client.js` es el único cliente de IA (Claude + respaldo Gemini); no agregues `fetch()` a proveedores en otros archivos.
+- El autorrelleno cubre también controles personalizados: dropdowns con `aria-haspopup="listbox"` o `role="combobox"` (Workday, MUI, Angular Material, Headless UI), `<select>` ocultos por Select2, Chosen o bootstrap-select, radios de MUI y `role="radio"`/`role="checkbox"`. Los radios se marcan con `click()` para que React/Vue se enteren. Qué opción elegir lo decide `JobFillPortals.pickOptionIndex` / `pickVariantIndex`, que nunca eligen el placeholder.
 - El autorrelleno **nunca pisa un campo que ya tiene valor**; para reemplazarlo, bórralo y vuelve a autorrellenar.

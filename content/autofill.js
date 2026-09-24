@@ -7,6 +7,15 @@
   if (window.__JOBFILL_AI_LOADED__) return;
   window.__JOBFILL_AI_LOADED__ = true;
 
+  // El content script corre en todos los frames (all_frames) para llegar a
+  // los formularios embebidos en iframes. El widget, los diálogos y la
+  // orquestación de "Postular" viven SOLO en el frame principal; los iframes
+  // exponen una API mínima (JobFillFrame, abajo) que el service worker llama.
+  const IS_TOP_FRAME = (() => { try { return window.top === window; } catch (e) { return false; } })();
+
+  // Selectores por portal y elección de opciones (content/portals.js).
+  const Portals = self.JobFillPortals;
+
   let activeProfile = null;
   let currentAiBtn = null;
 
@@ -623,133 +632,150 @@
     }
   }
 
-  /**
-   * Dispara `trigger` (clic en un botón, tipear en un input) y devuelve el
-   * `[role="listbox"]` que aparece COMO CONSECUENCIA — nunca "el primero del
-   * documento". Puede haber más de uno montado (otro campo del mismo tipo ya
-   * abierto, o un widget vecino sin relación); a diferencia del combobox de
-   * Greenhouse, aquí no siempre hay texto tecleado con el que comparar el
-   * contenido (un botón como "Degree" no escribe nada), así que se
-   * distingue por APARICIÓN: el que no estaba antes de disparar la acción.
-   */
-  async function openListboxVia(trigger) {
-    const before = new Set(document.querySelectorAll('[role="listbox"]'));
-    await trigger();
-    await new Promise(r => setTimeout(r, 350));
-    const after = Array.from(document.querySelectorAll('[role="listbox"]'));
-    return after.find(lb => !before.has(lb)) || null;
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+
+  function isShown(node) {
+    if (!node || !node.isConnected) return false;
+    const r = node.getBoundingClientRect();
+    return r.width > 0 && r.height > 0 && getComputedStyle(node).visibility !== "hidden";
+  }
+
+  /** Listbox que el control declara con aria-controls/aria-owns (puede existir desde antes, oculto). */
+  function controlledListbox(el) {
+    const ids = `${el.getAttribute("aria-controls") || ""} ${el.getAttribute("aria-owns") || ""}`.trim().split(/\s+/).filter(Boolean);
+    for (const id of ids) {
+      const node = rootOf(el).getElementById(id) || document.getElementById(id);
+      const lb = node && (node.getAttribute("role") === "listbox" ? node : node.querySelector('[role="listbox"]'));
+      if (isShown(lb)) return lb;
+    }
+    return null;
   }
 
   /**
-   * Rellena un widget "botón que abre un listbox" (patrón ARIA
-   * `aria-haspopup="listbox"` — el "Degree" de Workday es el caso real que lo
-   * motivó, pero el patrón es común a varias librerías de componentes). No
-   * escribe nada: abre el listbox, deja que `matcher` elija cuál opción
-   * corresponde de las que el sitio ofrece realmente, y hace clic en ella. Si
-   * `matcher` no encuentra ninguna, se cierra el listbox sin tocar nada —
-   * mismo criterio de "sin pruebas suficientes, no adivinar" que el resto del
-   * motor.
+   * Abre la lista de un dropdown personalizado y devuelve su
+   * `[role="listbox"]` — el que aparece COMO CONSECUENCIA (o el que el
+   * control declara con aria-controls), nunca "el primero del documento":
+   * puede haber otro montado de un campo vecino.
+   *
+   * Cada librería abre con un evento distinto: MUI y react-select con
+   * mousedown, Workday / Headless UI / Angular Material con click. Se prueba
+   * primero mousedown y, solo si no apareció nada, click (hacer ambos
+   * seguidos cerraría la lista en las que alternan).
    */
-  async function fillListboxButtonField(button, matcher) {
-    try {
-      const listbox = await openListboxVia(async () => button.click());
-      if (!listbox) return false;
+  async function openListboxFor(el) {
+    const before = new Set(document.querySelectorAll('[role="listbox"]'));
+    const fresh = () => controlledListbox(el) || Array.from(document.querySelectorAll('[role="listbox"]')).find(lb => !before.has(lb) && isShown(lb)) || null;
+    el.focus?.({ preventScroll: true });
+    el.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true, cancelable: true, composed: true, button: 0, pointerType: "mouse" }));
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true, cancelable: true, composed: true, button: 0 }));
+    await wait(220);
+    let lb = fresh();
+    if (lb) return lb;
+    el.click();
+    await wait(350);
+    lb = fresh();
+    if (lb) return lb;
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowDown", code: "ArrowDown", bubbles: true, cancelable: true, composed: true }));
+    await wait(250);
+    return fresh();
+  }
 
+  function closeListbox(el, listbox) {
+    const esc = new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true, composed: true });
+    (listbox.querySelector('[role="option"]') || listbox).dispatchEvent(esc);
+    el.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", code: "Escape", bubbles: true, cancelable: true, composed: true }));
+    setTimeout(() => { if (isShown(listbox)) el.click(); }, 120);
+  }
+
+  /**
+   * Rellena un dropdown personalizado (Workday, MUI, Angular Material,
+   * Headless UI, cualquier `aria-haspopup="listbox"` o `role="combobox"` que
+   * no es un input): abre la lista, `pickIndex` elige entre las opciones que
+   * el sitio ofrece de verdad y se hace clic en esa. Sin opción que calce,
+   * se cierra sin tocar nada.
+   */
+  async function fillDropdown(el, pickIndex) {
+    try {
+      const listbox = await openListboxFor(el);
+      if (!listbox) return false;
       const options = Array.from(listbox.querySelectorAll('[role="option"]'));
-      const target = options.find(o => matcher(o.textContent.trim()));
-      if (!target) {
-        button.click(); // cierra el listbox sin elegir nada
+      const index = pickIndex(options.map(o => ({ text: (o.getAttribute("aria-label") || o.textContent || "").trim(), value: o.getAttribute("data-value") || "" })));
+      const option = options[index];
+      if (!option || option.getAttribute("aria-disabled") === "true") {
+        closeListbox(el, listbox);
         return false;
       }
-
-      target.click();
+      option.scrollIntoView?.({ block: "nearest" });
+      option.click();
+      await wait(150);
+      // Radix y otras eligen en pointerup, no en click.
+      if (option.isConnected && isShown(listbox) && option.getAttribute("aria-selected") !== "true") {
+        option.dispatchEvent(new PointerEvent("pointerup", { bubbles: true, cancelable: true, composed: true, button: 0, pointerType: "mouse" }));
+        option.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, cancelable: true, composed: true, button: 0 }));
+        await wait(120);
+      }
+      if (isShown(listbox)) closeListbox(el, listbox);
+      el.classList.add("jobfill-highlight-success");
+      setTimeout(() => el.classList.remove("jobfill-highlight-success"), 2500);
       return true;
     } catch (e) {
-      // Mismo criterio que el combobox: un widget que se comporta distinto a
-      // lo esperado deja el campo sin tocar, nunca tumba la pasada completa.
-      console.warn("[JobFill AI] No se pudo usar el listbox del botón:", e);
+      // Un widget que se comporta distinto a lo esperado deja el campo sin
+      // tocar, nunca tumba la pasada completa.
+      console.warn("[JobFill AI] No se pudo usar el dropdown:", e);
       return false;
     }
   }
 
   /**
-   * Caso concreto de `fillListboxButtonField`: el "Degree" de Workday. Solo
-   * actúa si el contexto del botón matchea la misma regla `degree` que ya usa
-   * el motor genérico — así una futura regla de FIELD_RULES para "degree" se
-   * sigue aplicando aquí sin duplicar el patrón.
+   * El "Degree" de Workday (y otros ATS): un NIVEL estandarizado, no el
+   * nombre de la carrera — se clasifica el perfil y se busca esa categoría
+   * entre las opciones reales. Solo actúa si el contexto matchea la regla
+   * `degree` del motor genérico.
    */
-  async function tryFillCustomListboxButton(el, profile, textContext) {
-    if (el.tagName !== "BUTTON" || el.getAttribute("aria-haspopup") !== "listbox") return false;
-
+  async function tryFillDegreeDropdown(el, profile, textContext) {
     const degreeRule = FIELD_RULES.find(r => r.key === "degree");
     if (!degreeRule || !degreeRule.regex.test(textContext)) return false;
-
     const level = classifyDegreeLevel(profile.degree || "");
     if (!level) return false;
-
-    return fillListboxButtonField(el, text => findMatchingDegreeOptionIndex([text], level) === 0);
+    return fillDropdown(el, options => findMatchingDegreeOptionIndex(options.map(o => o.text), level));
   }
 
+  /**
+   * Elige en un <select> la opción que corresponde a `targetText` (ver
+   * JobFillPortals.pickOptionIndex: nunca elige el placeholder).
+   */
   function setSelectValue(select, targetText) {
     if (!select || !targetText) return false;
-    const targetNorm = normalizeText(targetText);
-    const targetWords = targetNorm.split(" ").filter(w => w.length > 1);
-
     const options = Array.from(select.options);
-    let matchedOption = null;
+    return selectOptionAt(select, Portals.pickOptionIndex(options.map(o => ({ text: o.text, value: o.value })), targetText));
+  }
 
-    // 1. Exact match on value or text
-    for (let opt of options) {
-      const optTextNorm = normalizeText(opt.text);
-      const optValNorm = normalizeText(opt.value);
-      if (optTextNorm === targetNorm || optValNorm === targetNorm) {
-        matchedOption = opt;
-        break;
-      }
-    }
+  /** Marca la opción `index` del <select> y avisa a la página (y a Select2/Chosen/bootstrap-select). */
+  function selectOptionAt(select, index) {
+    if (index < 0 || !select.options[index]) return false;
+    select.selectedIndex = index;
+    select.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    select.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    // Chosen solo se redibuja con su evento propio (jQuery lo escucha como
+    // un evento nativo más). Select2 y bootstrap-select ya escuchan "change".
+    select.dispatchEvent(new Event("chosen:updated", { bubbles: true }));
+    const visible = enhancedSelectUi(select) || select;
+    visible.classList.add("jobfill-highlight-success");
+    setTimeout(() => visible.classList.remove("jobfill-highlight-success"), 2500);
+    return true;
+  }
 
-    // 2. Substring match
-    if (!matchedOption) {
-      for (let opt of options) {
-        const optTextNorm = normalizeText(opt.text);
-        if (optTextNorm.includes(targetNorm) || targetNorm.includes(optTextNorm)) {
-          matchedOption = opt;
-          break;
-        }
-      }
-    }
-
-    // 3. CEFR Language Level Detection (e.g. A1, A2, B1, B2, C1, C2)
-    if (!matchedOption) {
-      const cefrMatch = targetText.match(/\b([ABC][12])\b/i);
-      if (cefrMatch) {
-        const level = cefrMatch[1].toUpperCase();
-        matchedOption = options.find(opt => opt.text.toUpperCase().includes(level) || opt.value.toUpperCase().includes(level));
-      }
-    }
-
-    // 4. Token overlap score
-    if (!matchedOption && targetWords.length > 0) {
-      let maxScore = 0;
-      for (let opt of options) {
-        const optNorm = normalizeText(opt.text) + " " + normalizeText(opt.value);
-        const score = targetWords.filter(w => optNorm.includes(w)).length;
-        if (score > maxScore) {
-          maxScore = score;
-          matchedOption = opt;
-        }
-      }
-    }
-
-    if (matchedOption) {
-      select.value = matchedOption.value;
-      select.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-      select.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-      select.classList.add("jobfill-highlight-success");
-      setTimeout(() => select.classList.remove("jobfill-highlight-success"), 2500);
-      return true;
-    }
-    return false;
+  /**
+   * UI visible de un <select> "mejorado" por un plugin (Select2, Chosen,
+   * bootstrap-select, Tom Select), que deja el <select> real oculto. Choices.js
+   * no se incluye: borra del <select> las opciones no elegidas, así que
+   * escribir ahí no sirve.
+   */
+  function enhancedSelectUi(select) {
+    const next = select.nextElementSibling;
+    if (next && next.matches(".select2, .select2-container, .chosen-container, .ts-wrapper")) return next;
+    const wrap = select.closest(".bootstrap-select");
+    return wrap || null;
   }
 
   /**
@@ -961,6 +987,16 @@
    * ruidosas. Aplanarlo todo en un string hacía que un match accidental en el
    * texto vecino pesara igual que el label real del campo.
    */
+  /**
+   * Documento o ShadowRoot donde vive el campo: `label[for]` y
+   * `aria-labelledby` apuntan a ids de ESE árbol, no del documento, cuando
+   * el formulario usa web components (SuccessFactors, SmartRecruiters).
+   */
+  function rootOf(el) {
+    const r = el.getRootNode?.();
+    return r && typeof r.getElementById === "function" ? r : document;
+  }
+
   function getFieldContextParts(el) {
     const label = [];
     const attrs = [];
@@ -981,13 +1017,24 @@
     if (fieldset) {
       const legend = fieldset.querySelector("legend, [role='heading'], .fb-form-element-label, .t-14, .label");
       if (legend && legend.innerText) label.push(legend.innerText);
+      // La pregunta del grupo suele vivir FUERA de él y enlazada por ARIA
+      // (MUI RadioGroup, radios dibujados con role=radio).
+      const groupLabel = fieldset.getAttribute("aria-label");
+      if (groupLabel) label.push(groupLabel);
+      const groupLabelledBy = fieldset.getAttribute("aria-labelledby");
+      if (groupLabelledBy) {
+        groupLabelledBy.split(/\s+/).forEach(id => {
+          const node = id && rootOf(el).getElementById(id);
+          if (node && node.innerText) label.push(node.innerText);
+        });
+      }
     }
 
     const labelledBy = el.getAttribute("aria-labelledby") || el.getAttribute("aria-describedby");
     if (labelledBy) {
       labelledBy.split(" ").forEach(id => {
         try {
-          const labelEl = document.getElementById(id);
+          const labelEl = rootOf(el).getElementById(id);
           if (labelEl && labelEl.innerText) label.push(labelEl.innerText);
         } catch (e) {}
       });
@@ -995,7 +1042,7 @@
 
     if (el.id) {
       try {
-        const forLabel = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        const forLabel = rootOf(el).querySelector(`label[for="${CSS.escape(el.id)}"]`);
         if (forLabel && forLabel.innerText) label.push(forLabel.innerText);
       } catch (e) {}
     }
@@ -1074,15 +1121,42 @@
   }
 
   const AUTOFILLABLE_SELECTOR =
-    "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']), textarea, select, trix-editor, [contenteditable='true'], button[aria-haspopup='listbox']";
+    "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']):not([type='file']), textarea, select, trix-editor, [contenteditable='true'], " +
+    // Controles personalizados: dropdowns (Workday, MUI, Angular Material,
+    // Headless UI) y radios/checkbox dibujados con divs (role=radio/checkbox).
+    "button[aria-haspopup='listbox'], [role='button'][aria-haspopup='listbox'], [role='combobox']:not(input), mat-select, [role='radio']:not(input), [role='checkbox']:not(input)";
 
-  function isFillableVisible(el) {
-    if (el.disabled || el.readOnly) return false;
+  function isBoxVisible(el) {
     const rect = el.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return false;
     const style = window.getComputedStyle(el);
-    if (style.display === "none" || style.visibility === "hidden" || style.opacity === "0") return false;
-    return true;
+    return !(style.display === "none" || style.visibility === "hidden" || style.opacity === "0");
+  }
+
+  function isFillableVisible(el) {
+    if (el.disabled || el.readOnly || el.getAttribute("aria-disabled") === "true") return false;
+    if (isBoxVisible(el)) return true;
+    // Radios y checkbox con estilo propio: el input real está oculto (opacity
+    // 0, 0×0) y lo que se ve es su <label>.
+    const type = (el.type || "").toLowerCase();
+    if (el.tagName === "INPUT" && (type === "radio" || type === "checkbox")) {
+      const label = el.labels?.[0] || el.closest("label");
+      return Boolean(label && isBoxVisible(label));
+    }
+    // <select> oculto por Select2/Chosen/bootstrap-select: se ve su UI.
+    if (el.tagName === "SELECT") {
+      const ui = enhancedSelectUi(el);
+      return Boolean(ui && isBoxVisible(ui));
+    }
+    return false;
+  }
+
+  /**
+   * Controles personalizados que contienen su propio input (patrón ARIA 1.1:
+   * div role=combobox > input) se rellenan por el input, no por el div.
+   */
+  function isWrapperOfInput(el) {
+    return el.tagName !== "INPUT" && el.getAttribute("role") === "combobox" && Boolean(el.querySelector("input:not([type='hidden'])"));
   }
 
   /**
@@ -1099,27 +1173,28 @@
       const textContext = [contextParts.label, contextParts.attrs, contextParts.nearby].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
       const normContext = normalizeText(textContext);
       const inputType = (el.type || "").toLowerCase();
+      const kind = choiceKind(el);
 
-      // Un botón que abre un listbox (patrón ARIA `aria-haspopup="listbox"` —
-      // el "Degree" de Workday es el caso real) no encaja en nada del motor
-      // de abajo: no tiene `.value` que escribir ni es un <select> nativo. Se
-      // resuelve aparte y se sale enseguida.
-      if (el.tagName === "BUTTON") {
-        return await tryFillCustomListboxButton(el, profile, textContext);
-      }
+      // Dropdown personalizado con la pregunta de estudios: nivel, no carrera.
+      if (kind === "dropdown" && await tryFillDegreeDropdown(el, profile, textContext)) return true;
 
       let ruleMatched = false;
 
       const applyRuleValue = async (val) => {
-        if (el.tagName === "SELECT") {
+        if (kind === "select") {
           return setSelectValue(el, val);
         }
-        if (inputType === "radio" || inputType === "checkbox") {
+        if (kind === "dropdown") {
+          return fillDropdown(el, options => Portals.pickOptionIndex(options, val));
+        }
+        if (kind === "radio" || kind === "checkbox") {
           if (val === "yes" || val === "true" || val === true) {
-            if (/yes|s[ií]|true/i.test(el.value || textContext)) {
-              el.checked = true;
-              el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-              return true;
+            // Un checkbox suelto ("Estoy autorizado a trabajar en Chile") se
+            // marca; en un grupo de radios solo la opción "Sí"/"Yes".
+            const own = choiceOptionText(el);
+            const isYesOption = matchesAnyOptionVariant(own, ["yes", "si", "true", "1"]);
+            if (isYesOption || (kind === "checkbox" && !matchesAnyOptionVariant(own, ["no", "false"]))) {
+              return checkChoice(el);
             }
           }
           return false;
@@ -1209,8 +1284,11 @@
           if (!cf.value) continue;
           const searchTerms = `${cf.label || ""} ${cf.keywords || ""}`;
           if (matchesQaAdvanced(textContext, searchTerms)) {
-            if (el.tagName === "SELECT") {
-              return setSelectValue(el, cf.value);
+            if (kind === "select") return setSelectValue(el, cf.value);
+            if (kind === "dropdown") return fillDropdown(el, options => Portals.pickOptionIndex(options, cf.value));
+            if (kind === "radio" || kind === "checkbox") {
+              if (Portals.pickOptionIndex([choiceOptionText(el)], cf.value) !== 0) continue;
+              return checkChoice(el);
             }
             setElementValue(el, cf.value);
             return true;
@@ -1234,7 +1312,7 @@
       // RADIO_GROUP_FIELDS): el motor genérico de arriba solo sabe marcar una
       // opción cuando el valor es literalmente "yes" — nunca "no", y nunca un
       // enum de 3+ alternativas (modalidad, género).
-      if (!ruleMatched && (inputType === "radio" || inputType === "checkbox")) {
+      if (!ruleMatched && kind !== "text") {
         for (const field of RADIO_GROUP_FIELDS) {
           if (!field.groupRegex.test(textContext) && !field.groupRegex.test(normContext)) continue;
 
@@ -1247,10 +1325,13 @@
           const variants = field.optionVariants[answer];
           if (!variants) break; // valor guardado fuera de la tabla esperada
 
-          if (matchesAnyOptionVariant(el.value || textContext, variants)) {
-            el.checked = true;
-            el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-            ruleMatched = true;
+          // Mismo campo como <select> o dropdown ("Sí"/"No", "Remoto"…).
+          if (kind === "select") {
+            ruleMatched = selectOptionAt(el, Portals.pickVariantIndex(Array.from(el.options).map(o => ({ text: o.text, value: o.value })), variants));
+          } else if (kind === "dropdown") {
+            ruleMatched = await fillDropdown(el, options => Portals.pickVariantIndex(options, variants));
+          } else if (matchesAnyOptionVariant(choiceOptionText(el) || textContext, variants)) {
+            ruleMatched = checkChoice(el);
           }
           break;
         }
@@ -1271,8 +1352,12 @@
     for (const el of inputs) {
       const isRequired = el.required || el.getAttribute("aria-required") === "true";
       if (!isRequired) continue;
-      const type = (el.type || "").toLowerCase();
-      if (type === "radio" || type === "checkbox") continue;
+      const kind = choiceKind(el);
+      if (kind === "radio" || kind === "checkbox") continue;
+      if (kind === "dropdown") {
+        if (!dropdownHasValue(el)) missing.push({ el, label: readableFieldLabel(el) });
+        continue;
+      }
       const value = el.isContentEditable ? el.innerText : el.value;
       if (value && value.trim()) continue;
       missing.push({ el, label: readableFieldLabel(el) });
@@ -1368,8 +1453,14 @@
    */
   function fieldAlreadyHasValue(el) {
     const type = (el.type || "").toLowerCase();
+    const kind = choiceKind(el);
 
-    if (el.tagName === "BUTTON") return false; // listbox ARIA: lo decide su propio flujo
+    if (kind === "dropdown") return dropdownHasValue(el);
+    if (kind === "radio" && el.tagName !== "INPUT") {
+      const group = el.closest("[role='radiogroup']");
+      return group ? Boolean(group.querySelector("[aria-checked='true']")) : el.getAttribute("aria-checked") === "true";
+    }
+    if (kind === "checkbox" && el.tagName !== "INPUT") return el.getAttribute("aria-checked") === "true";
     if (el.tagName === "TRIX-EDITOR" || el.isContentEditable) return Boolean((el.innerText || "").trim());
     if (el.tagName === "SELECT") {
       // La opción 0 suele ser el placeholder ("Selecciona…"): solo cuenta
@@ -1387,6 +1478,67 @@
     // Un prefijo de país precargado ("+56", "+1") no es un teléfono cargado.
     if (type === "tel" && /^\+?\d{0,4}$/.test(value)) return false;
     return value.length > 0;
+  }
+
+  /**
+   * Tipo de control, sin importar cómo esté dibujado: "select" (nativo),
+   * "dropdown" (personalizado), "radio", "checkbox" (nativos o role=) o "text".
+   */
+  function choiceKind(el) {
+    const tag = el.tagName;
+    const type = (el.type || "").toLowerCase();
+    const role = el.getAttribute?.("role") || "";
+    if (tag === "SELECT") return "select";
+    if (tag === "INPUT") return type === "radio" || type === "checkbox" ? type : "text";
+    if (role === "radio" || role === "checkbox") return role;
+    if (tag === "TEXTAREA" || tag === "TRIX-EDITOR" || el.isContentEditable) return "text";
+    if (tag === "MAT-SELECT" || role === "combobox" || el.getAttribute?.("aria-haspopup") === "listbox") return "dropdown";
+    return "text";
+  }
+
+  /**
+   * ¿El dropdown personalizado ya tiene algo elegido? Se mira el texto que
+   * muestra (sin el placeholder "Select One"/"Selecciona…"), las clases de
+   * "vacío" de Angular Material y el input oculto que acompaña a MUI.
+   */
+  function dropdownHasValue(el) {
+    if (/\bmat-(?:mdc-)?select-empty\b/.test(el.className || "")) return false;
+    const hidden = el.parentElement?.querySelector("input[aria-hidden='true'], input.MuiSelect-nativeInput");
+    if (hidden) return Boolean((hidden.value || "").trim());
+    const text = (el.innerText || el.textContent || "").replace(/[\u200b\u00a0]/g, " ").trim();
+    return Boolean(text) && !self.JobFillPortals.isPlaceholderOption(text.split("\n")[0]);
+  }
+
+  /** Texto de UNA opción de un grupo: su value y su propia etiqueta ("1 Sí"), no la pregunta. */
+  function choiceOptionText(el) {
+    if (el.tagName === "INPUT") {
+      const label = el.labels?.[0] || el.closest("label");
+      return `${el.value || ""} ${label ? label.innerText || "" : ""}`.trim();
+    }
+    return (el.getAttribute("aria-label") || el.innerText || el.textContent || "").trim();
+  }
+
+  /**
+   * Marca un radio/checkbox. Con `click()` y no con `checked = true`: React,
+   * Vue y Angular escuchan el click en estos controles, así que un
+   * `checked = true` se veía marcado pero el formulario no se enteraba.
+   */
+  function checkChoice(el) {
+    if (el.tagName === "INPUT") {
+      if (el.checked) return true;
+      el.click();
+      if (!el.checked) {
+        el.checked = true;
+        el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+        el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      }
+    } else if (el.getAttribute("aria-checked") !== "true") {
+      el.click();
+    }
+    const visible = el.tagName === "INPUT" && !isBoxVisible(el) ? (el.labels?.[0] || el.closest("label") || el) : el;
+    visible.classList.add("jobfill-highlight-success");
+    setTimeout(() => visible.classList.remove("jobfill-highlight-success"), 2500);
+    return true;
   }
 
   async function fillFieldSafely(el, profile) {
@@ -1409,8 +1561,7 @@
 
     const scanForNewFields = async () => {
       pending = false;
-      const found = Array.from(document.querySelectorAll(AUTOFILLABLE_SELECTOR))
-        .filter(el => !alreadyProcessed.has(el) && isFillableVisible(el));
+      const found = collectFillableFields().filter(el => !alreadyProcessed.has(el));
 
       for (const el of found) {
         alreadyProcessed.add(el);
@@ -1446,7 +1597,21 @@
   // otra la está leyendo, y terminan eligiendo la opción equivocada.
   let autofillInProgress = false;
 
-  async function executeAutofill() {
+  /**
+   * Campos rellenables visibles de ESTE frame, incluidos los que viven en
+   * Shadow DOM abierto (web components de SuccessFactors, SmartRecruiters…).
+   */
+  function collectFillableFields() {
+    return Portals.deepQuerySelectorAll(AUTOFILLABLE_SELECTOR, document, isOwnUi).filter(el => !isWrapperOfInput(el) && isFillableVisible(el));
+  }
+
+  /**
+   * Rellena el frame actual y, desde el frame principal, también los iframes
+   * de la pestaña (Greenhouse, Workable, iCIMS o Indeed embebidos en el sitio
+   * de la empresa). En los iframes corre en modo `quiet`: el resumen único lo
+   * muestra el frame principal con el total.
+   */
+  async function executeAutofill({ quiet = false } = {}) {
     if (autofillInProgress) return { count: 0, alreadyRunning: true };
     autofillInProgress = true;
 
@@ -1455,16 +1620,17 @@
       try {
         profile = await loadProfile();
       } catch (e) {
-        showToast(e.message, "error");
+        if (!quiet) showToast(e.message, "error");
         return { count: 0, error: e.message };
       }
       if (!profile) {
-        showToast("Por favor abre JobFill AI y configura tus datos.", "error");
+        if (!quiet) showToast("Por favor abre JobFill AI y configura tus datos.", "error");
         return { count: 0 };
       }
 
-      // Search across the entire document and filter by visibility to support dynamic DOMs (LinkedIn, Getonbrd)
-      const inputs = Array.from(document.querySelectorAll(AUTOFILLABLE_SELECTOR)).filter(isFillableVisible);
+      // Todo el documento (y sus shadow roots), filtrado por visibilidad para
+      // los DOM dinámicos (LinkedIn, Getonbrd)
+      const inputs = collectFillableFields();
 
       let filledCount = 0;
       let keptCount = 0;
@@ -1478,9 +1644,17 @@
 
       const missingRequired = listMissingRequiredFields(inputs);
       highlightMissingFields(missingRequired);
-      showToast(buildAutofillSummary(filledCount, keptCount, missingRequired), missingRequired.length ? "info" : (filledCount ? "success" : "info"));
-
       watchForLateFields(profile, new Set(inputs));
+      if (quiet) return { count: filledCount, kept: keptCount, missing: missingRequired.length };
+
+      const frames = IS_TOP_FRAME ? await sendToWorker("AUTOFILL_SUBFRAMES") : null;
+      if (frames?.success && frames.frames > 0) {
+        filledCount += frames.count;
+        keptCount += frames.kept;
+      }
+      const summary = buildAutofillSummary(filledCount, keptCount, missingRequired);
+      const note = frames?.frames > 0 && frames.count > 0 ? ` Incluye ${frames.count} dentro de un formulario embebido.` : "";
+      showToast(summary + note, missingRequired.length ? "info" : (filledCount ? "success" : "info"));
 
       return { count: filledCount };
     } finally {
@@ -1812,7 +1986,7 @@
     // 1. Explicit <label for="...">  — la fuente más específica: apunta exactamente a este campo.
     if (el.id) {
       try {
-        const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        const label = rootOf(el).querySelector(`label[for="${CSS.escape(el.id)}"]`);
         if (label && label.innerText) questionCandidates.push(label.innerText);
       } catch (e) {}
     }
@@ -1822,7 +1996,7 @@
     if (labelledBy) {
       const parts = labelledBy.split(" ").map(id => {
         try {
-          const labelEl = document.getElementById(id);
+          const labelEl = rootOf(el).getElementById(id);
           return labelEl && labelEl.innerText ? labelEl.innerText : "";
         } catch (e) { return ""; }
       }).filter(Boolean);
@@ -2022,9 +2196,12 @@
       // Bumeran / Laborum / Trabajando / Indeed
       ".box_detail h1", "[class*='JobTitle']", ".job-detail__title", ".title-jobs",
       "h1[data-testid='jobsearch-JobInfoHeader-title']",
-      // Genéricos
-      "[class*='job-title']", "[class*='jobtitle']", "h1.title", "h1"
-    ], { min: 3, max: 120, reject: NON_TITLE_PATTERNS });
+      // Workable
+      "[data-ui='job-title']"
+    ], { min: 3, max: 120, reject: NON_TITLE_PATTERNS })
+      // JSON-LD antes que los genéricos: un <h1> puede ser cualquier cosa.
+      || jsonLdTitle()
+      || firstMatchingText(["[class*='job-title']", "[class*='jobtitle']", "h1.title", "h1"], { min: 3, max: 120, reject: NON_TITLE_PATTERNS });
   }
 
   function extractCompanyName() {
@@ -2043,10 +2220,10 @@
       ".box_detail.post a[href*='/empresas/']",
       // Getonbrd / Bumeran / Indeed
       ".gb-company-name", "[class*='company-name']", "[class*='CompanyName']",
-      "[data-testid='inlineHeader-companyName']",
-      // Genéricos
-      "[class*='employer']", "[class*='company']"
-    ], { min: 2, max: 80 });
+      "[data-testid='inlineHeader-companyName']"
+    ], { min: 2, max: 80 })
+      || jsonLdCompany()
+      || firstMatchingText(["[class*='employer']", "[class*='company']"], { min: 2, max: 80 });
   }
 
   /**
@@ -2203,20 +2380,48 @@
     return markers.filter(m => text.includes(m)).length >= 2;
   }
 
-  /** Oferta publicada como datos estructurados schema.org/JobPosting. */
-  function extractJobPostingJsonLd() {
+  /**
+   * Oferta publicada como datos estructurados schema.org/JobPosting (la
+   * publican Greenhouse, Lever, Ashby, Workable, SmartRecruiters, Teamtailor,
+   * Personio, Getonbrd y casi cualquier sitio que quiera salir en Google
+   * Jobs). Acepta un objeto, un array o un `@graph` (WordPress/Yoast).
+   */
+  function findJobPostingJsonLd() {
+    const isPosting = o => o && (o["@type"] === "JobPosting" || (Array.isArray(o["@type"]) && o["@type"].includes("JobPosting")));
     for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
       try {
         const parsed = JSON.parse(script.textContent);
-        const entries = Array.isArray(parsed) ? parsed : [parsed];
-        const posting = entries.find(o => o && (o["@type"] === "JobPosting" || (Array.isArray(o["@type"]) && o["@type"].includes("JobPosting"))));
-        if (posting?.description) {
-          const text = String(posting.description).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-          if (text.length > 200) return text.slice(0, 6000);
-        }
+        const entries = (Array.isArray(parsed) ? parsed : [parsed])
+          .flatMap(o => (o && Array.isArray(o["@graph"]) ? o["@graph"] : [o]));
+        const posting = entries.find(isPosting);
+        if (posting) return posting;
       } catch (e) { /* JSON-LD malformado: se ignora y se sigue con el DOM */ }
     }
-    return "";
+    return null;
+  }
+
+  /** Texto plano de un valor JSON-LD (la descripción suele venir en HTML). DOMParser es inerte: no carga imágenes ni ejecuta nada. */
+  function jsonLdText(value) {
+    const doc = new DOMParser().parseFromString(String(value || ""), "text/html");
+    return (doc.body?.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function jsonLdTitle() {
+    const t = jsonLdText(findJobPostingJsonLd()?.title);
+    return t.length >= 3 && t.length <= 120 && !NON_TITLE_PATTERNS.test(t) ? t : "";
+  }
+
+  function jsonLdCompany() {
+    const org = findJobPostingJsonLd()?.hiringOrganization;
+    const t = jsonLdText(typeof org === "string" ? org : org?.name);
+    return t.length >= 2 && t.length <= 80 ? t : "";
+  }
+
+  function extractJobPostingJsonLd() {
+    const posting = findJobPostingJsonLd();
+    if (!posting?.description) return "";
+    const text = jsonLdText(posting.description);
+    return text.length > 200 ? text.slice(0, 6000) : "";
   }
 
   /**
@@ -2294,6 +2499,10 @@
       "[data-automation-id='jobPostingDescription']",
       // Lever
       ".posting-description", ".section-wrapper.page-full-width",
+      // Microdatos schema.org (muchos sitios de empleo propios)
+      "[itemprop='description']",
+      // Workable / SmartRecruiters / Ashby
+      "[data-ui='job-description']", ".job-sections", "[class*='descriptionText']",
       // Genérico de respaldo
       "[class*='jobdescription']", "[class*='job_description']", "main"
     ];
@@ -3840,6 +4049,7 @@
     }
     .btn.secondary:hover { border-color: rgba(129, 140, 248, 0.6); background: #1e293b; }
     .btn.wide { width: 100%; }
+    .btn.secondary.accent { border-color: rgba(129, 140, 248, 0.55); color: #e0e7ff; background: rgba(99, 102, 241, 0.18); }
 
     .launcher {
       display: grid;
@@ -3925,7 +4135,10 @@
           <button type="button" class="btn secondary" data-action="answer-all" title="Detecta todas las preguntas abiertas del formulario y las responde con una sola llamada a la IA">✨ Responder todas</button>
           <button type="button" class="btn secondary" data-action="capture" title="Lee el cargo de esta página y lo guarda para usarlo al postular (atajo: Ctrl+Shift+0, configurable en chrome://extensions/shortcuts)">📄 Guardar cargo</button>
         </div>
-        <button type="button" class="btn secondary wide" data-action="register" title="Crea o actualiza &quot;Empresa - Cargo&quot; en el Tracker de tu vault, con estado Postulado" hidden>📌 Registrar postulación</button>
+        <div class="row" data-vault-row hidden>
+          <button type="button" class="btn secondary accent" data-action="apply" title="Adapta tu CV a esta oferta, genera el PDF, lo adjunta al formulario y lo autorrellena">🚀 Postular</button>
+          <button type="button" class="btn secondary" data-action="register" title="Crea o actualiza &quot;Empresa - Cargo&quot; en el Tracker de tu vault, con estado Postulado">📌 Registrar</button>
+        </div>
       </section>`;
 
     const $ = selector => dock.querySelector(selector);
@@ -3959,11 +4172,14 @@
     answerAllBtn.addEventListener("click", () => handleAnswerAllQuestions(answerAllBtn));
     const captureBtn = $('[data-action="capture"]');
     captureBtn.addEventListener("click", () => manualCaptureJobContext(captureBtn));
+    const vaultRow = $("[data-vault-row]");
+    vaultRow.hidden = !vaultConnected;
     const registerBtn = $('[data-action="register"]');
-    registerBtn.hidden = !vaultConnected;
     registerBtn.addEventListener("click", () => registerApplicationFromPage(registerBtn));
+    const applyBtn = $('[data-action="apply"]');
+    applyBtn.addEventListener("click", () => runApplyFlow(applyBtn));
 
-    widgetRefs = { host, chip: $(".job"), chipText: $(".job-text"), registerBtn };
+    widgetRefs = { host, chip: $(".job"), chipText: $(".job-text"), vaultRow };
 
     shadow.append(style, dock);
     attachToTopLayerHost(host);
@@ -4067,6 +4283,404 @@
     });
   }
 
+  // ─── 🚀 Postular en 1 flujo ────────────────────────────────────────────────
+  //
+  // Oferta leída de la página → CV adaptado por el postulador (mismo proceso
+  // que el artefacto de claude.ai) → PDF adjunto al campo de CV → formulario
+  // autorrellenado → registro en el Tracker con confirmación.
+
+  let activeApplyFlow = null;
+
+  const APPLY_STEPS = [
+    ["contexto", "Leer tu BASE y CVs base"],
+    ["perfil", "Elegir el CV base"],
+    ["adaptar", "Adaptar el CV a la oferta"],
+    ["validar", "Verificar reglas y 1 página"],
+    ["ajustar", "Ajustar lo que no pasa"],
+    ["pdf", "Generar el PDF (queda en tu vault)"],
+    ["adjuntar", "Adjuntar el PDF al formulario"],
+    ["rellenar", "Autorrellenar el formulario"]
+  ];
+
+  const APPLY_FLOW_STYLES = `
+    .jf-steps { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 6px; }
+    .jf-steps li { display: flex; gap: 10px; align-items: baseline; font-size: 13px; color: #64748b; }
+    .jf-steps li::before { content: "○"; width: 14px; flex-shrink: 0; text-align: center; }
+    .jf-steps li.is-active { color: #e0e7ff; font-weight: 600; }
+    .jf-steps li.is-active::before { content: "◐"; color: #a5b4fc; }
+    .jf-steps li.is-done { color: #94a3b8; }
+    .jf-steps li.is-done::before { content: "✓"; color: #34d399; }
+    .jf-steps li.is-skip { display: none; }
+    .jf-detail { margin: 10px 0 0 !important; min-height: 18px; }
+    .jf-result { margin-top: 14px; display: grid; gap: 8px; font-size: 12.5px; color: #cbd5e1; }
+    .jf-result .ok { color: #6ee7b7; }
+    .jf-result .warn { color: #fbbf24; }
+    .jf-result .err { color: #fca5a5; }
+    .jf-result ul { margin: 0; padding-left: 18px; }
+    .jf-register { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(148, 163, 184, 0.18); }
+    [hidden] { display: none !important; }`;
+
+  function openApplyFlowDialog() {
+    const host = document.createElement("div");
+    host.className = "jobfill-dialog-host";
+    const shadow = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
+    style.textContent = CONFIRM_DIALOG_STYLES + APPLY_FLOW_STYLES;
+    const overlay = document.createElement("div");
+    overlay.className = "jobfill-overlay";
+    overlay.innerHTML = `
+      <div class="jobfill-confirm" role="dialog" aria-modal="true" aria-label="Postular">
+        <h3>🚀 Postular a esta oferta</h3>
+        <p class="jf-offer"></p>
+        <ul class="jf-steps">${APPLY_STEPS.map(([id, label]) => `<li data-step="${id}">${label}</li>`).join("")}</ul>
+        <p class="jf-detail"></p>
+        <div class="jf-result" hidden></div>
+        <div class="jf-register" hidden>
+          <div class="jobfill-field"><label for="jf-ap-empresa">Empresa</label><input type="text" id="jf-ap-empresa" spellcheck="false"></div>
+          <div class="jobfill-field"><label for="jf-ap-cargo">Cargo</label><input type="text" id="jf-ap-cargo" spellcheck="false"></div>
+        </div>
+        <div class="jobfill-confirm-actions">
+          <button class="jobfill-confirm-ok" type="button" data-act="register" hidden>📌 Registrar en el Tracker</button>
+          <button class="jobfill-confirm-cancel" type="button" data-act="download" hidden>⬇ Descargar PDF</button>
+          <button class="jobfill-confirm-cancel" type="button" data-act="close">Cerrar</button>
+        </div>
+      </div>`;
+    shadow.append(style, overlay);
+    attachToTopLayerHost(host);
+
+    const $s = sel => shadow.querySelector(sel);
+    const order = APPLY_STEPS.map(([id]) => id);
+    let current = -1;
+
+    const ui = {
+      shadow,
+      setOffer(text) { $s(".jf-offer").textContent = text; },
+      setStep(step, detail = "") {
+        const idx = order.indexOf(step);
+        if (idx === -1) return;
+        order.forEach((id, i) => {
+          const li = $s(`[data-step="${id}"]`);
+          if (i < idx && li.classList.contains("is-active")) li.classList.replace("is-active", "is-done");
+          else if (i < idx && !li.classList.contains("is-done")) li.classList.add(id === "ajustar" || id === "perfil" ? "is-skip" : "is-done");
+        });
+        $s(`[data-step="${step}"]`).classList.remove("is-skip");
+        $s(`[data-step="${step}"]`).classList.add("is-active");
+        current = idx;
+        $s(".jf-detail").textContent = detail;
+      },
+      finishSteps(upTo) {
+        const last = upTo ? order.indexOf(upTo) : order.length - 1;
+        order.forEach((id, i) => {
+          const li = $s(`[data-step="${id}"]`);
+          if (li.classList.contains("is-active") || (i <= last && !li.classList.contains("is-done") && !li.classList.contains("is-skip") && i <= current)) {
+            li.classList.remove("is-active");
+            li.classList.add("is-done");
+          }
+        });
+        $s(".jf-detail").textContent = "";
+      },
+      showResult(lines) {
+        const box = $s(".jf-result");
+        box.replaceChildren();
+        for (const { text, tone = "", items } of lines) {
+          const div = document.createElement("div");
+          if (tone) div.className = tone;
+          div.textContent = text;
+          if (items?.length) {
+            const ul = document.createElement("ul");
+            for (const it of items) { const li = document.createElement("li"); li.textContent = it; ul.appendChild(li); }
+            div.appendChild(ul);
+          }
+          box.appendChild(div);
+        }
+        box.hidden = false;
+      },
+      showRegister(empresa, cargo, onRegister) {
+        $s(".jf-register").hidden = false;
+        $s("#jf-ap-empresa").value = empresa || "";
+        $s("#jf-ap-cargo").value = cargo || "";
+        const btn = $s('[data-act="register"]');
+        btn.hidden = false;
+        btn.onclick = () => onRegister($s("#jf-ap-empresa").value.trim(), $s("#jf-ap-cargo").value.trim(), btn);
+      },
+      showDownload(onDownload) {
+        const btn = $s('[data-act="download"]');
+        btn.hidden = false;
+        btn.onclick = onDownload;
+      },
+      close() {
+        document.removeEventListener("keydown", onKeydown, true);
+        host.remove();
+        if (activeApplyFlow === ui) activeApplyFlow = null;
+      }
+    };
+    function onKeydown(e) { if (e.key === "Escape") { e.stopPropagation(); ui.close(); } }
+    document.addEventListener("keydown", onKeydown, true);
+    $s('[data-act="close"]').addEventListener("click", () => ui.close());
+    return ui;
+  }
+
+  /** Hosts de la propia extensión: la búsqueda profunda no entra en ellos. */
+  function isOwnUi(el) {
+    return Boolean(el.closest?.(".jobfill-floating-container, .jobfill-dialog-host"));
+  }
+
+  /** Texto de contexto de un <input type=file> o una zona de soltar, para puntuarlo. */
+  function fileTargetText(el) {
+    const attrs = ["id", "name", "data-automation-id", "data-testid", "data-test", "data-ui", "data-field", "aria-label"]
+      .map(a => el.getAttribute?.(a) || "").join(" ");
+    const labelParts = [getFieldContext(el)];
+    const container = el.closest("label, fieldset, .form-group, .field, [class*='upload' i], [class*='file' i], [class*='dropzone' i], [class*='drop-zone' i], [class*='resume' i], [class*='attachment' i], [data-automation-id*='upload' i]");
+    if (container && container.innerText) labelParts.push(container.innerText.slice(0, 200));
+    return { attrs, label: labelParts.join(" ") };
+  }
+
+  /**
+   * Mejor destino para el CV en ESTE frame: un <input type=file> (también
+   * dentro de Shadow DOM) o, si la zona no tiene input, la zona de soltar.
+   * Devuelve { el, kind, score } o { el: null, reason }.
+   *
+   * Solo se adjunta a algo identificado como CV (puntaje ≥ 60). Un campo
+   * neutro (15) cuenta solo si es el ÚNICO campo de archivo del frame: con
+   * varios campos ambiguos (CV, carta, certificados) no se adivina.
+   */
+  function findCvTarget() {
+    const portalHits = new Set();
+    for (const sel of Portals.PORTAL_CV_SELECTORS) {
+      try { Portals.deepQuerySelectorAll(sel, document, isOwnUi).forEach(el => portalHits.add(el)); } catch (e) { /* selector no soportado */ }
+    }
+    const inputs = Portals.deepQuerySelectorAll('input[type="file"]', document, isOwnUi).filter(i => !i.disabled);
+    const scored = inputs.map(el => {
+      const { attrs, label } = fileTargetText(el);
+      return { el, kind: "input", score: Portals.scoreCvCandidate({ portalMatch: portalHits.has(el), attrs, label, accept: el.accept }) };
+    });
+
+    // Zonas de soltar SIN input adentro (con input, ya se puntuó el input).
+    const zones = Portals.deepQuerySelectorAll(Portals.DROPZONE_SELECTOR, document, isOwnUi)
+      .filter(z => !z.querySelector('input[type="file"]') && !z.parentElement?.closest(Portals.DROPZONE_SELECTOR));
+    for (const el of zones) {
+      const { attrs, label } = fileTargetText(el);
+      scored.push({ el, kind: "dropzone", score: Portals.scoreCvCandidate({ attrs, label }) });
+    }
+
+    const total = inputs.length + zones.length;
+    const best = scored.filter(c => c.score >= 60).sort((a, b) => b.score - a.score)[0];
+    if (best) return best;
+    const neutral = scored.filter(c => c.score > 0);
+    if (total === 1 && neutral.length === 1) return neutral[0];
+    return { el: null, score: 0, total, reason: total ? "no se identificó con certeza cuál es el campo del CV" : "la página no tiene un campo para subir archivos" };
+  }
+
+  /** Lo que el service worker necesita para elegir frame, sin tocar nada. */
+  function probeCvTarget() {
+    const t = findCvTarget();
+    const filled = t.kind === "input" && t.el.files?.length > 0;
+    return { score: filled ? 0 : t.score, total: t.total ?? 1, filled, kind: t.kind || "", reason: filled ? "el campo del CV ya tiene un archivo (no se reemplaza)" : t.reason || "" };
+  }
+
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  /**
+   * Adjunta el PDF al campo del CV de ESTE frame. Mismo principio que el
+   * autorrelleno: nunca se reemplaza un archivo que el usuario ya eligió.
+   *
+   * Con un input: DataTransfer → `input.files` + eventos input/change que
+   * burbujean (así lo ven React/Vue/Angular, que escuchan en la raíz). Con una
+   * zona sin input: dragenter/dragover/drop sintéticos con el mismo
+   * DataTransfer, que es lo que hace el navegador al soltar un archivo.
+   */
+  function attachPdfToForm(base64, fileName) {
+    const target = findCvTarget();
+    if (!target.el) return { attached: false, reason: target.reason };
+    const file = new File([base64ToBytes(base64)], fileName, { type: "application/pdf" });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+
+    if (target.kind === "input") {
+      const input = target.el;
+      if (input.files && input.files.length) return { attached: false, reason: "el campo del CV ya tiene un archivo (no se reemplaza)" };
+      input.files = dt.files;
+      input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      return { attached: true, kind: "input" };
+    }
+
+    for (const type of ["dragenter", "dragover", "drop"]) {
+      target.el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, composed: true, dataTransfer: dt }));
+    }
+    return { attached: true, kind: "dropzone" };
+  }
+
+  function downloadPdf(base64, fileName) {
+    const url = URL.createObjectURL(new Blob([base64ToBytes(base64)], { type: "application/pdf" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  function sendToWorker(type, payload) {
+    return new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({ type, payload }, r => resolve(chrome.runtime.lastError ? { success: false, error: ORPHANED_CONTEXT_MSG } : r || { success: false, error: "Sin respuesta del service worker." }));
+      } catch (e) {
+        resolve({ success: false, error: ORPHANED_CONTEXT_MSG });
+      }
+    });
+  }
+
+  async function runApplyFlow(btn) {
+    if (activeApplyFlow) return;
+    let job = {};
+    try { job = await resolveJobContext(); } catch (e) { /* se valida abajo */ }
+    let oferta = (job.description || "").trim();
+    let empresa = job.company || extractCompanyName() || "";
+    let cargo = job.title || extractJobTitle() || "";
+    if (oferta.length < 80) {
+      // Formulario embebido: la oferta puede estar dentro del iframe del ATS.
+      const fromFrames = await sendToWorker("FRAMES_JOB_CONTEXT");
+      if (fromFrames?.description) {
+        // El cargo y la empresa del iframe mandan: el <h1> del sitio que lo
+        // envuelve suele ser "Trabaja con nosotros", no el cargo.
+        oferta = fromFrames.description.trim();
+        empresa = fromFrames.company || empresa;
+        cargo = fromFrames.title || cargo;
+      }
+    }
+    if (oferta.length < 80) {
+      showToast("No encontré la descripción de la oferta en esta página. Abre la oferta y guárdala con 📄 Guardar cargo, y después vuelve al formulario.", "error");
+      return;
+    }
+
+    btn.disabled = true;
+    const ui = openApplyFlowDialog();
+    activeApplyFlow = ui;
+    ui.setOffer(`${cargo || "Cargo sin detectar"}${empresa ? ` · ${empresa}` : ""}${job.fromCache ? " (oferta guardada)" : ""}`);
+    ui.setStep("contexto", "Conectando con tu vault…");
+
+    try {
+      const res = await sendToWorker("APPLY_ADAPT_CV", { oferta, empresa, cargo });
+      if (!res?.success) throw new Error(res?.error || "No se pudo adaptar el CV.");
+
+      if (!res.ok) {
+        ui.finishSteps("validar");
+        ui.showResult([
+          { text: "✗ El CV adaptado no pasa las reglas de tu verificador, así que no se generó el PDF.", tone: "err", items: res.hallazgos.filter(h => h.nivel === "error").map(h => h.detalle) },
+          { text: "Ábrelo en el Postulador de claude.ai para ajustarlo a mano; el formulario no se tocó." }
+        ]);
+        return;
+      }
+
+      ui.setStep("adjuntar", "Buscando el campo para subir el CV…");
+      const attach = await sendToWorker("APPLY_ATTACH_CV", { base64: res.base64, archivo: res.archivo });
+      ui.setStep("rellenar", "Rellenando el resto del formulario…");
+      const fill = await executeAutofill();
+      ui.finishSteps();
+
+      const warnings = res.hallazgos.filter(h => h.nivel !== "error").map(h => h.detalle);
+      ui.showResult([
+        { text: `✓ CV ${res.perfil} adaptado${res.ajustado ? " (con un ajuste automático)" : ""} y guardado en tu vault: cv/generados/${res.archivo}`, tone: "ok" },
+        attach.attached
+          ? { text: `✓ PDF adjuntado al campo del CV${attach.inFrame ? " (formulario embebido)" : ""}. Revísalo antes de enviar.`, tone: "ok" }
+          : attach.pending
+            ? { text: "⏳ Este paso del formulario aún no pide el CV: se adjuntará solo cuando aparezca el campo (en esta pestaña, durante 30 min).", tone: "warn" }
+            : { text: `⚠ No se adjuntó automáticamente: ${attach.reason || attach.error || "error desconocido"}. Descárgalo y súbelo a mano.`, tone: "warn" },
+        { text: fill?.count ? `✓ ${fill.count === 1 ? "1 campo del formulario rellenado" : `${fill.count} campos del formulario rellenados`}.` : "Formulario sin campos vacíos que rellenar." },
+        res.cobertura ? { text: `Requisitos de la oferta respaldados por tu grafo: ${res.cobertura}` } : null,
+        res.faltantes?.length ? { text: "Sin respaldo en tu BASE (no se mencionan en el CV):", tone: "warn", items: res.faltantes } : null,
+        warnings.length ? { text: "Avisos del verificador:", tone: "warn", items: warnings } : null
+      ].filter(Boolean));
+
+      ui.showDownload(() => downloadPdf(res.base64, res.archivo));
+      ui.showRegister(res.empresa || empresa, res.cargo || cargo, async (emp, car, regBtn) => {
+        if (!emp || !car) return;
+        regBtn.disabled = true;
+        const r = await sendToWorker("VAULT_REGISTER_APPLICATION", {
+          empresa: emp, cargo: car, url: location.href, canal: location.hostname.replace(/^www\./, ""),
+          cvPerfil: res.perfil, cvPdf: res.archivo, area: res.area, keywordsCubiertas: res.cobertura
+        });
+        if (r?.success) {
+          regBtn.textContent = "✓ Registrada";
+          showToast(`📌 Registrada en tu Tracker: ${r.name}`, "success");
+        } else {
+          regBtn.disabled = false;
+          showToast(r?.error || "No se pudo registrar la postulación.", "error");
+        }
+      });
+    } catch (err) {
+      ui.showResult([{ text: `✗ ${err.message}`, tone: "err" }]);
+      clearFlowDetail(ui);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function clearFlowDetail(ui) {
+    const d = ui.shadow.querySelector(".jf-detail");
+    if (d) d.textContent = "";
+  }
+
+  /**
+   * API de este frame para el service worker (chrome.scripting corre en el
+   * mismo mundo aislado que el content script). Nunca la ve la página: vive
+   * en el mundo aislado, no en `window` de la página.
+   */
+  globalThis.JobFillFrame = {
+    probeCv: () => extensionEnabled ? probeCvTarget() : { score: 0, total: 0, reason: "JobFill AI está apagado" },
+    attachCv: (base64, fileName) => extensionEnabled ? attachPdfToForm(base64, fileName) : { attached: false, reason: "JobFill AI está apagado" },
+    autofill: () => (IS_TOP_FRAME || !extensionEnabled) ? { skipped: true } : executeAutofill({ quiet: true }),
+    job: () => {
+      const { text, reliable } = extractJobDescriptionWithSource();
+      return { title: extractJobTitle(), company: extractCompanyName(), text, reliable };
+    }
+  };
+
+  /*
+   * CV pendiente (formularios de varios pasos). Mientras el service worker
+   * tenga un PDF pendiente para esta pestaña, cada frame vigila si aparece el
+   * campo del CV y lo reclama una sola vez. Fuera de ese estado no se busca
+   * nada: la búsqueda profunda no corre en cada mutación de cada página.
+   */
+  let pendingCvWatch = false;
+  let pendingCvTimer = null;
+  const offeredCvTargets = new WeakSet();
+
+  function setPendingCvWatch(active) {
+    pendingCvWatch = active;
+    clearTimeout(pendingCvTimer);
+    if (active) schedulePendingCvCheck();
+  }
+
+  function schedulePendingCvCheck() {
+    if (!pendingCvWatch || pendingCvTimer) return;
+    pendingCvTimer = setTimeout(checkPendingCv, 700);
+  }
+
+  async function checkPendingCv() {
+    pendingCvTimer = null;
+    if (!pendingCvWatch || !extensionEnabled) return;
+    const target = findCvTarget();
+    if (!target.el || offeredCvTargets.has(target.el)) return;
+    offeredCvTargets.add(target.el);
+    if (target.kind === "input" && target.el.files?.length) return;
+
+    const claim = await sendToWorker("CLAIM_PENDING_CV");
+    if (!claim?.base64) return;
+    const result = attachPdfToForm(claim.base64, claim.archivo);
+    showToast(result.attached
+      ? `📎 CV adaptado adjuntado: ${claim.archivo}. Revísalo antes de enviar.`
+      : `No se pudo adjuntar el CV adaptado: ${result.reason}. Descárgalo desde tu vault (cv/generados).`,
+      result.attached ? "success" : "error");
+  }
+
   /** Quita de la página todo lo que la extensión dibuja de forma persistente. */
   function teardownPageUi() {
     document.querySelector(".jobfill-floating-container")?.remove();
@@ -4077,8 +4691,8 @@
   /** Aplica el interruptor global en esta pestaña, sin recargar. */
   function applyEnabledState(enabled) {
     extensionEnabled = enabled;
-    if (enabled) initFloatingWidget();
-    else teardownPageUi();
+    if (enabled && IS_TOP_FRAME) initFloatingWidget();
+    else if (!enabled) teardownPageUi();
   }
 
   document.addEventListener("focusin", (e) => {
@@ -4111,6 +4725,15 @@
   });
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === "CV_PENDING") {
+      setPendingCvWatch(message.active === true);
+      return false;
+    }
+
+    // El popup envía a todos los frames; responde solo el principal, que
+    // además rellena los iframes (AUTOFILL_SUBFRAMES) y suma el total.
+    if (!IS_TOP_FRAME) return false;
+
     if (message.type === "TRIGGER_AUTOFILL") {
       if (!extensionEnabled) {
         sendResponse({ success: false, count: 0, disabled: true });
@@ -4118,6 +4741,11 @@
       }
       executeAutofill().then(res => sendResponse(res));
       return true;
+    }
+
+    if (message.type === "APPLY_PROGRESS") {
+      activeApplyFlow?.setStep(message.step, message.detail);
+      return false;
     }
 
     if (message.type === "CAPTURE_JOB_CONTEXT_HOTKEY") {
@@ -4148,6 +4776,8 @@
   // Dynamic MutationObserver to monitor LinkedIn Easy Apply / Getonbrd modals & step transitions
   const observer = new MutationObserver(() => {
     if (!extensionEnabled) return;
+    schedulePendingCvCheck();
+    if (!IS_TOP_FRAME) return;
     initFloatingWidget();
     // Cubre las SPA: en LinkedIn o Getonbrd la pantalla de "postulación
     // enviada" aparece sin recargar la página, así que un chequeo único al
@@ -4163,7 +4793,7 @@
     if (changes.extensionEnabled) applyEnabledState(changes.extensionEnabled.newValue !== false);
     if (changes.vaultLastSync) {
       vaultConnected = Boolean(changes.vaultLastSync.newValue);
-      if (widgetRefs?.registerBtn) widgetRefs.registerBtn.hidden = !vaultConnected;
+      if (widgetRefs?.vaultRow) widgetRefs.vaultRow.hidden = !vaultConnected;
     }
     if (changes.widgetCollapsed) {
       widgetCollapsed = changes.widgetCollapsed.newValue === true;
@@ -4176,7 +4806,16 @@
   chrome.storage.local.get(["extensionEnabled", "widgetCollapsed", "vaultLastSync"]).then(prefs => {
     widgetCollapsed = prefs.widgetCollapsed === true;
     vaultConnected = Boolean(prefs.vaultLastSync);
-    const start = () => applyEnabledState(prefs.extensionEnabled !== false);
+    const start = () => {
+      applyEnabledState(prefs.extensionEnabled !== false);
+      // Un paso nuevo del formulario puede ser una página nueva (Taleo,
+      // iCIMS): se pregunta si quedó un CV pendiente. Solo el frame principal
+      // y los iframes con campos preguntan; los de anuncios no despiertan al
+      // service worker.
+      if (extensionEnabled && (IS_TOP_FRAME || document.querySelector("input, textarea, select"))) {
+        sendToWorker("HAS_PENDING_CV").then(r => { if (r?.pending) setPendingCvWatch(true); });
+      }
+    };
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", start);
     } else {

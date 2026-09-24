@@ -6,7 +6,7 @@
 // Cliente único de IA (Claude, con respaldo en Gemini vía Vertex AI),
 // compartido con opciones y popup. Ruta absoluta: importScripts resuelve
 // relativo al SW.
-importScripts("/shared/ai-client.js", "/shared/markdown-source.js", "/shared/vault-client.js");
+importScripts("/shared/ai-client.js", "/shared/markdown-source.js", "/shared/vault-client.js", "/shared/cv-adapter.js", "/content/portals.js");
 
 // `targetRole` vacío por defecto: alimenta `headline`, que el autofill escribe
 // en campos "Job Title"/"Titular" y que el prompt le pasa a Claude como el cargo
@@ -475,6 +475,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "APPLY_ADAPT_CV") {
+    withKeepAlive(() => adaptCvForOffer(message.payload || {}, sender.tab?.id))
+      .then(response => sendResponse(response))
+      .catch(error => sendResponse({ success: false, error: describeError(error) }));
+    return true;
+  }
+
+  if (message.type === "APPLY_ATTACH_CV") {
+    attachCvInTab(sender.tab?.id, message.payload || {})
+      .then(response => sendResponse(response))
+      .catch(error => sendResponse({ success: false, error: describeError(error) }));
+    return true;
+  }
+
+  if (message.type === "AUTOFILL_SUBFRAMES") {
+    autofillSubframes(sender.tab?.id)
+      .then(response => sendResponse(response))
+      .catch(error => sendResponse({ success: false, error: describeError(error) }));
+    return true;
+  }
+
+  if (message.type === "FRAMES_JOB_CONTEXT") {
+    jobContextFromFrames(sender.tab?.id)
+      .then(response => sendResponse(response))
+      .catch(error => sendResponse({ success: false, error: describeError(error) }));
+    return true;
+  }
+
+  if (message.type === "HAS_PENDING_CV") {
+    readPendingCv(sender.tab?.id)
+      .then(p => sendResponse({ success: true, pending: Boolean(p) }))
+      .catch(() => sendResponse({ success: true, pending: false }));
+    return true;
+  }
+
+  if (message.type === "CLAIM_PENDING_CV") {
+    claimPendingCv(sender.tab?.id)
+      .then(p => sendResponse({ success: true, ...(p || {}) }))
+      .catch(error => sendResponse({ success: false, error: describeError(error) }));
+    return true;
+  }
+
   if (message.type === "VAULT_REGISTER_APPLICATION") {
     withKeepAlive(() => registerApplication(message.payload || {}))
       .then(response => sendResponse(response))
@@ -618,6 +660,223 @@ async function syncFromVault() {
   };
 }
 
+/** Llama una herramienta del postulador con el auth guardado y persiste el token renovado. */
+async function vaultCall(name, args) {
+  const { vaultAuth } = await chrome.storage.local.get("vaultAuth");
+  if (!vaultAuth) throw new Error("Conecta JobFill AI a tu vault en Opciones → Fuente de verdad.");
+  const { data, auth } = await JobFillVault.callWithAuth(vaultAuth, name, args);
+  if (auth !== vaultAuth) await chrome.storage.local.set({ vaultAuth: auth });
+  return data;
+}
+
+/**
+ * "Postular en 1 flujo": adapta el CV a la oferta que el usuario tiene
+ * abierta, igual que el artefacto Postulador pero con la oferta leída de la
+ * página en tiempo real. Pasos: contexto del vault → perfil → adaptación →
+ * verificador (con UN ajuste automático si no pasa) → brechas del grafo →
+ * PDF (queda guardado en cv/generados del vault).
+ *
+ * Si el CV no pasa el verificador ni tras el ajuste, NO se genera el PDF:
+ * las reglas del verificador son duras (1 página, textos vetados, fechas
+ * fijas) y un PDF que las rompe no debe llegar a un reclutador.
+ */
+/* ─── Formularios en varios frames (all_frames) ───────────────────────────
+ *
+ * El content script corre en cada frame de la pestaña. Muchos portales
+ * incrustan el formulario del ATS en un iframe (Greenhouse, Workable, iCIMS,
+ * Indeed, Taleo en el sitio de la empresa), así que el frame principal —el
+ * que tiene el widget— no ve esos campos. Estas funciones llaman a la API
+ * `JobFillFrame` que cada content script expone en su mundo aislado
+ * (chrome.scripting corre en el mismo mundo aislado que los content scripts)
+ * y juntan los resultados. No hace falta el permiso webNavigation: los
+ * resultados de executeScript ya traen el frameId.
+ */
+async function runInFrames(tabId, func, args = [], frameIds) {
+  if (!tabId) return [];
+  const target = frameIds ? { tabId, frameIds } : { tabId, allFrames: true };
+  try {
+    return await chrome.scripting.executeScript({ target, func, args });
+  } catch (e) {
+    console.warn("[JobFill AI] executeScript en frames falló:", e);
+    return [];
+  }
+}
+
+/** Adjunta el CV en el frame que tenga el campo; si no hay ninguno, queda pendiente. */
+async function attachCvInTab(tabId, { base64, archivo }) {
+  if (!base64 || !archivo) return { success: false, error: "No hay PDF que adjuntar." };
+  const probes = await runInFrames(tabId, () => globalThis.JobFillFrame?.probeCv() || null);
+  const pick = JobFillPortals.pickCvFrame(probes);
+  if (pick.frameId === null) {
+    if (pick.pending) await setPendingCv(tabId, { base64, archivo });
+    return { success: true, attached: false, pending: Boolean(pick.pending), reason: pick.reason };
+  }
+  const [res] = await runInFrames(tabId, (b64, name) => globalThis.JobFillFrame?.attachCv(b64, name) || null, [base64, archivo], [pick.frameId]);
+  const out = res?.result || { attached: false, reason: "el frame del formulario no respondió" };
+  return { success: true, ...out, inFrame: pick.frameId !== 0 };
+}
+
+/** Autorrelleno en los iframes (el frame principal se rellena solo). */
+async function autofillSubframes(tabId) {
+  const results = await runInFrames(tabId, () => globalThis.JobFillFrame?.autofill() || null);
+  const sub = results.filter(r => r.frameId !== 0 && r.result && !r.result.skipped);
+  return {
+    success: true,
+    frames: sub.filter(r => r.result.count || r.result.kept || r.result.missing).length,
+    count: sub.reduce((n, r) => n + (r.result.count || 0), 0),
+    kept: sub.reduce((n, r) => n + (r.result.kept || 0), 0)
+  };
+}
+
+/** Oferta leída desde un iframe (Greenhouse embebido trae la descripción adentro). */
+async function jobContextFromFrames(tabId) {
+  const results = await runInFrames(tabId, () => globalThis.JobFillFrame?.job() || null);
+  const best = results
+    .filter(r => r.frameId !== 0 && r.result?.reliable && (r.result.text || "").length >= 200)
+    .sort((a, b) => b.result.text.length - a.result.text.length)[0];
+  return best
+    ? { success: true, title: best.result.title, company: best.result.company, description: best.result.text }
+    : { success: true };
+}
+
+/*
+ * CV pendiente: en formularios de varios pasos (LinkedIn Easy Apply, Workday,
+ * Taleo) el campo del CV aparece en un paso posterior. El PDF se guarda en
+ * chrome.storage.session (solo memoria, inaccesible para las páginas y para
+ * los content scripts) por pestaña y 30 minutos; el primer frame que vea
+ * aparecer el campo lo reclama UNA vez.
+ */
+const PENDING_CV_KEY = "pendingCv";
+const PENDING_CV_TTL_MS = 30 * 60 * 1000;
+
+async function setPendingCv(tabId, { base64, archivo }) {
+  if (!tabId) return;
+  const all = (await chrome.storage.session.get(PENDING_CV_KEY))[PENDING_CV_KEY] || {};
+  all[tabId] = { base64, archivo, expires: Date.now() + PENDING_CV_TTL_MS };
+  await chrome.storage.session.set({ [PENDING_CV_KEY]: all });
+  chrome.tabs.sendMessage(tabId, { type: "CV_PENDING", active: true }).catch(() => {});
+}
+
+async function readPendingCv(tabId) {
+  if (!tabId) return null;
+  const all = (await chrome.storage.session.get(PENDING_CV_KEY))[PENDING_CV_KEY] || {};
+  const p = all[tabId];
+  return p && p.expires > Date.now() ? p : null;
+}
+
+// Dos frames que ven el campo a la vez no pueden reclamar el mismo PDF.
+const claimingTabs = new Set();
+
+async function claimPendingCv(tabId) {
+  if (!tabId || claimingTabs.has(tabId)) return null;
+  claimingTabs.add(tabId);
+  try {
+    const p = await readPendingCv(tabId);
+    await dropPendingCv(tabId);
+    return p ? { base64: p.base64, archivo: p.archivo } : null;
+  } finally {
+    claimingTabs.delete(tabId);
+  }
+}
+
+async function dropPendingCv(tabId) {
+  const all = (await chrome.storage.session.get(PENDING_CV_KEY))[PENDING_CV_KEY] || {};
+  if (!(tabId in all)) return;
+  delete all[tabId];
+  await chrome.storage.session.set({ [PENDING_CV_KEY]: all });
+  chrome.tabs.sendMessage(tabId, { type: "CV_PENDING", active: false }).catch(() => {});
+}
+
+chrome.tabs.onRemoved.addListener(tabId => { dropPendingCv(tabId).catch(() => {}); });
+
+async function adaptCvForOffer({ oferta, empresa, cargo }, tabId) {
+  const progress = (step, detail = "") => {
+    if (tabId) chrome.tabs.sendMessage(tabId, { type: "APPLY_PROGRESS", step, detail }).catch(() => {});
+  };
+
+  if (!oferta || oferta.trim().length < 80) {
+    throw new Error("No encontré la descripción de la oferta en esta página. Ábrela (o guárdala con 📄 Guardar cargo) y vuelve a intentar.");
+  }
+  const storage = await chrome.storage.local.get(null);
+  const ai = JobFillAi.readAiSettings(storage);
+  const aiProblem = JobFillAi.aiSettingsProblem(ai);
+  if (aiProblem) throw new Error(aiProblem);
+
+  // Cabecera con lo que JobFill ya sabe de la página: ayuda al modelo a
+  // copiar empresa y cargo exactos aunque la descripción no los repita.
+  const ofertaCompleta = `${empresa ? `Empresa: ${empresa}\n` : ""}${cargo ? `Cargo: ${cargo}\n` : ""}\n${oferta}`;
+
+  progress("contexto", "Leyendo tu BASE y tus CVs base…");
+  const ctx = await vaultCall("cv_contexto", {});
+  if (!Array.isArray(ctx?.perfiles) || !ctx.perfiles.length) {
+    throw new Error("Tu vault no tiene CVs base (cv/base/*.md): el Postulador los necesita para adaptar.");
+  }
+
+  const ask = async (prompt, { model, max_tokens, timeoutMs }) => {
+    const data = await callAnthropicMessagesApi({
+      ai, model, max_tokens, timeoutMs,
+      messages: [{ role: "user", content: [{ type: "text", text: prompt }] }]
+    });
+    return JobFillCv.parseJsonReply(extractTextFromResponse(data));
+  };
+
+  let perfil = ctx.perfiles[0].perfil;
+  if (ctx.perfiles.length > 1) {
+    progress("perfil", "Eligiendo el CV base que mejor calza…");
+    const r = await ask(JobFillCv.buildProfilePickPrompt(ctx.perfiles, ofertaCompleta), { model: MODEL_SIMPLE, max_tokens: 100, timeoutMs: 30000 });
+    perfil = JobFillCv.resolvePerfil(ctx.perfiles, r);
+  }
+
+  progress("adaptar", `Adaptando tu CV ${perfil} a la oferta (suele tardar 30–60 s)…`);
+  const adaptado = await ask(JobFillCv.buildAdaptPrompt(ctx, perfil, ofertaCompleta), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
+  if (!adaptado?.markdown) throw new Error("La IA no devolvió el CV adaptado. Intenta de nuevo.");
+
+  // Brechas en paralelo con la validación: es evidencia del grafo para el
+  // Tracker, no bloquea el PDF si el grafo no responde.
+  const brechasPromise = vaultCall("brechas", {
+    requisitos: (adaptado.keywords_oferta || []).filter(k => typeof k === "string" && k.trim()),
+    oferta: ofertaCompleta.slice(0, 9000)
+  }).catch(err => { console.warn("[JobFill AI] brechas falló:", err); return null; });
+
+  progress("validar", "Revisando reglas y que quepa en 1 página…");
+  let markdown = adaptado.markdown;
+  let validacion = await vaultCall("cv_validar", { markdown });
+  let ajustado = false;
+  if (!validacion?.ok) {
+    progress("ajustar", "Ajustando el CV a las reglas…");
+    const fix = await ask(JobFillCv.buildFixPrompt(ctx, markdown, validacion), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
+    if (fix?.markdown) {
+      markdown = fix.markdown;
+      validacion = await vaultCall("cv_validar", { markdown });
+      ajustado = true;
+    }
+  }
+
+  const brechas = await brechasPromise;
+  const resumen = {
+    perfil,
+    empresa: adaptado.empresa || empresa || "",
+    cargo: adaptado.cargo || cargo || "",
+    area: adaptado.area || "",
+    ajustado,
+    hallazgos: (validacion?.hallazgos || []).map(h => ({ nivel: h.nivel, detalle: h.detalle })),
+    paginas: validacion?.paginas,
+    cobertura: JobFillCv.coberturaTexto(brechas, adaptado.keywords_cubiertas),
+    faltantes: (brechas?.requisitos || []).filter(q => q.nivel === "brecha").map(q => q.termino)
+  };
+
+  if (!validacion?.ok) {
+    return { success: true, ok: false, ...resumen };
+  }
+
+  progress("pdf", "Generando el PDF y guardándolo en tu vault…");
+  const nombre = JobFillCv.pdfFileName(resumen);
+  const pdf = await vaultCall("cv_generar_pdf", { markdown, nombre });
+  if (!pdf?.base64) throw new Error("El postulador no devolvió el PDF.");
+
+  return { success: true, ok: true, ...resumen, archivo: pdf.archivo || `${nombre}.pdf`, base64: pdf.base64 };
+}
+
 /** Registra la postulación actual en el Tracker del vault (postulacion_guardar). */
 async function registerApplication(input) {
   const { vaultAuth, cvIndexes, activeCvIndexId } = await chrome.storage.local.get(["vaultAuth", "cvIndexes", "activeCvIndexId"]);
@@ -739,13 +998,14 @@ function arrayBufferToBase64(buffer) {
  * max_tokens — con presupuestos pequeños se agotan antes de emitir texto y la
  * respuesta llega vacía. Aquí siempre queremos texto directo y acotado.
  */
-async function callAnthropicMessagesApi({ ai, model, system, messages, max_tokens = 1500 }) {
+async function callAnthropicMessagesApi({ ai, model, system, messages, max_tokens = 1500, timeoutMs }) {
   return JobFillAi.callAi(ai, {
     model,
     system,
     messages,
     max_tokens,
-    thinking: { type: "disabled" }
+    thinking: { type: "disabled" },
+    ...(timeoutMs ? { timeoutMs } : {})
   });
 }
 

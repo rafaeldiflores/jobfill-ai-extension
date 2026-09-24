@@ -1222,10 +1222,13 @@ it("Strips rich-text editor chrome from questions and honors required length ran
 it("Extracts job descriptions from JSON-LD and split rich-text blocks", () => {
   const srcPath = path.join(__dirname, "..", "content", "autofill.js");
   const src = readSourceText(srcPath);
-  const start = src.indexOf("  function extractJobPostingJsonLd");
+  const start = src.indexOf("  function findJobPostingJsonLd");
   const end = src.indexOf("  function extractLargestTextBlock");
   if (start === -1 || end === -1) throw new Error("No se pudieron aislar los extractores de oferta en content/autofill.js");
-  const api = eval(src.slice(start, end) + "\n({ extractJobPostingJsonLd, extractRichTextBlocks });");
+  // DOMParser de navegador, mínimo: texto sin etiquetas (en Chromium el real es inerte).
+  global.DOMParser = class { parseFromString(html) { return { body: { textContent: String(html).replace(/<[^>]+>/g, "") } }; } };
+  const NON_TITLE_PATTERNS = /^(postula|apply)/i; // eslint-disable-line no-unused-vars
+  const api = eval(src.slice(start, end) + "\n({ extractJobPostingJsonLd, extractRichTextBlocks, jsonLdTitle, jsonLdCompany });");
 
   const stubDocument = map => {
     global.document = { querySelectorAll: sel => map[sel] || [] };
@@ -1244,6 +1247,19 @@ it("Extracts job descriptions from JSON-LD and split rich-text blocks", () => {
   const fromLd = api.extractJobPostingJsonLd();
   assert.ok(fromLd.startsWith("Buscamos alguien con Angular y GCP."), "debe limpiar las etiquetas HTML");
   assert.ok(!/[<>]/.test(fromLd), "no debe quedar HTML en la descripción");
+
+  assert.strictEqual(api.jsonLdTitle(), "Full-Stack Engineer");
+
+  // @graph (WordPress/Yoast) y hiringOrganization como objeto.
+  stubDocument({
+    [LD]: [{ textContent: JSON.stringify({ "@context": "https://schema.org", "@graph": [
+      { "@type": "WebPage", name: "Empleos" },
+      { "@type": ["JobPosting"], title: "Data Engineer", hiringOrganization: { "@type": "Organization", name: "Acme Labs" }, description: "z".repeat(300) }
+    ] }) }]
+  });
+  assert.strictEqual(api.extractJobPostingJsonLd(), "z".repeat(300));
+  assert.strictEqual(api.jsonLdTitle(), "Data Engineer");
+  assert.strictEqual(api.jsonLdCompany(), "Acme Labs");
 
   // Un JSON-LD que no es JobPosting no aporta descripción...
   stubDocument({ [LD]: [{ textContent: JSON.stringify({ "@type": "Organization", description: "y".repeat(400) }) }] });
@@ -2275,7 +2291,7 @@ it("Every extension script parses (a syntax error silently disables a whole file
   const { execFileSync } = require("child_process");
   const scripts = [
     ["background", "service-worker.js"], ["content", "autofill.js"], ["options", "options.js"],
-    ["options", "pdf-parser.js"], ["popup", "popup.js"], ["shared", "ai-client.js"], ["shared", "markdown-source.js"], ["shared", "vault-client.js"]
+    ["options", "pdf-parser.js"], ["popup", "popup.js"], ["shared", "ai-client.js"], ["shared", "markdown-source.js"], ["shared", "vault-client.js"], ["shared", "cv-adapter.js"], ["content", "portals.js"]
   ];
   for (const parts of scripts) {
     execFileSync(process.execPath, ["--check", path.join(__dirname, "..", ...parts)], { stdio: "pipe" });
@@ -2625,6 +2641,195 @@ it("Vault rules: vetoed terms exclude sections, reach the prompt and are flagged
   assert.ok(manifest.permissions.includes("identity"), "chrome.identity para el login OAuth");
   const optionsSrc = readSourceText(path.join(__dirname, "..", "options", "options.js"));
   assert.match(optionsSrc, /BACKUP_EXCLUDED_KEYS = \[[^\]]*"vaultAuth"/, "el token del vault no sale en los respaldos");
+});
+
+// ─── POSTULAR EN 1 FLUJO (adaptación de CV del postulador) ────────────────
+function loadRealCvAdapter() {
+  require(path.join(__dirname, "..", "shared", "cv-adapter.js"));
+  return globalThis.JobFillCv;
+}
+
+it("CV adapter: same rules as the Postulador artifact, from vault instructions or the built-in fallback", () => {
+  const C = loadRealCvAdapter();
+  const ctx = {
+    base: "# BASE\n- [px-01] Logro real",
+    perfiles: [{ perfil: "AIEngineer", markdown: '---\ntitulo: "Ing | AI"\n---\nCV AI' }, { perfil: "Datos", markdown: '---\ntitulo: "Ing | Datos"\n---\nCV Datos' }],
+    instrucciones: null,
+    reglas: { titulo_profesional: "Ingeniero en Informática", fechas_fijas: { MAZA: "May 2024" }, nunca_incluir: ["Gemini Spark", "Ghost HUD"] }
+  };
+  const reglas = C.reglasCon(ctx);
+  assert.match(reglas, /LITERAL, carácter por carácter: "Ingeniero en Informática"/);
+  assert.match(reglas, /Fechas fijas \(no las cambies\): MAZA desde May 2024\. Textos vetados: Gemini Spark, Ghost HUD\./);
+  assert.ok(!/\{TITULO\}|\{FECHAS\}|\{VETOS\}/.test(reglas), "no quedan marcadores sin reemplazar");
+  // Con cv/instrucciones.md en el vault, mandan esas (editables sin republicar nada).
+  assert.strictEqual(C.reglasCon({ ...ctx, instrucciones: "Mis reglas para {TITULO}" }), "Mis reglas para Ingeniero en Informática");
+
+  const pick = C.buildProfilePickPrompt(ctx.perfiles, "x".repeat(10000));
+  assert.match(pick, /- AIEngineer: Ing \| AI\n- Datos: Ing \| Datos/);
+  assert.ok(pick.length < 6400, "la oferta se recorta a 6000 caracteres para elegir perfil");
+  assert.strictEqual(C.resolvePerfil(ctx.perfiles, { perfil: "Datos" }), "Datos");
+  assert.strictEqual(C.resolvePerfil(ctx.perfiles, { perfil: "Inventado" }), "AIEngineer", "un perfil inexistente cae al primero");
+
+  const adapt = C.buildAdaptPrompt(ctx, "Datos", "OFERTA " + "y".repeat(12000));
+  assert.match(adapt, /=== CV BASE \(Datos\) ===\n---\ntitulo: "Ing \| Datos"/);
+  assert.match(adapt, /=== BASE DE EXPERIENCIA ===\n# BASE/);
+  assert.match(adapt, /"keywords_faltantes"/);
+  assert.ok(adapt.endsWith("y".repeat(9000 - 7)), "la oferta se recorta a 9000 caracteres");
+
+  const fix = C.buildFixPrompt(ctx, "## CV", { hallazgos: [{ detalle: "Sobra una página" }], lineasDeMas: 3, lineasResumen: 5 });
+  assert.match(fix, /- Sobra una página/);
+  assert.match(fix, /Sobran ~3 líneas/);
+  assert.match(fix, /Acorta el Resumen a 4 líneas/);
+});
+
+it("CV adapter: tolerant JSON parsing, artifact-identical PDF names and Tracker coverage", () => {
+  const C = loadRealCvAdapter();
+  assert.strictEqual(C.parseJsonReply('```json\n{"markdown":"# CV"}\n```').markdown, "# CV");
+  assert.strictEqual(C.parseJsonReply('Aquí va: {"perfil":"Datos"} listo').perfil, "Datos");
+  assert.throws(() => C.parseJsonReply("sin json"), /JSON/);
+
+  // Mismo formato que cv/generados del artefacto: CV_RDF_<Empresa>_<Cargo>_<AAAAMMDD>.
+  const date = new Date("2026-09-24T15:00:00Z");
+  assert.strictEqual(C.pdfFileName({ empresa: "Agilesoft SpA", cargo: "Desarrollador Full Stack" }, date), "CV_RDF_Agilesoft_SpA_Desarrollador_Full_Stack_20260924");
+  assert.strictEqual(C.slug("Ingeniería & Datos (Sr.)"), "Ingenieria_Datos_Sr");
+  // Fecha en hora de Chile: a las 23:30 de Santiago en UTC ya es el día siguiente.
+  assert.strictEqual(C.hoy(new Date("2026-09-25T02:30:00Z")), "2026-09-24");
+
+  assert.strictEqual(C.coberturaTexto({ requisitos: [{ termino: "Python", nivel: "demostrada" }, { termino: "RAG", nivel: "declarada" }, { termino: "Docker", nivel: "brecha" }], cobertura: { respaldadas: 2, total: 3 } }), "67% (Python, RAG)");
+  assert.strictEqual(C.coberturaTexto(null, ["Python"]), "Python [estimada]");
+  assert.strictEqual(C.coberturaTexto(null, []), undefined);
+
+  const V = loadRealVaultClient();
+  const payload = V.buildApplicationPayload({ empresa: "Acme", cargo: "Dev", cvPerfil: "AIEngineer", cvPdf: "CV_RDF_Acme_Dev_20260924.pdf", area: "IA", keywordsCubiertas: "67% (Python, RAG)" });
+  assert.strictEqual(payload.cv_pdf, "CV_RDF_Acme_Dev_20260924.pdf");
+  assert.strictEqual(payload.area, "IA");
+  assert.strictEqual(payload.keywords_cubiertas, "67% (Python, RAG)");
+  assert.match(payload.fecha, /^\d{4}-\d{2}-\d{2}$/);
+});
+
+function loadRealPortals() {
+  require(path.join(__dirname, "..", "content", "portals.js"));
+  return globalThis.JobFillPortals;
+}
+
+it("Apply flow: attaches the PDF only to the CV field, never to cover letters, and autofill skips file inputs", () => {
+  const P = loadRealPortals();
+  const score = (o) => P.scoreCvCandidate(o);
+  for (const label of ["Adjunta tu CV (PDF)", "Currículum vitae", "Upload your resume", "Hoja de vida", "Résumé", "CV en PDF, sin foto"]) {
+    assert.strictEqual(score({ label }), 60, `${label} es campo de CV`);
+  }
+  for (const label of ["Carta de presentación", "Cover letter", "Foto de perfil", "Certificado de título", "Carta de presentación (adjunta aparte del CV)"]) {
+    assert.strictEqual(score({ label }), 0, `${label} NO es campo de CV`);
+  }
+  // "Resumen" (español) no es "resume": sin otra pista queda como neutro.
+  assert.strictEqual(score({ label: "Resumen de tu experiencia" }), 15);
+  // Atributos del ATS: Greenhouse name=resume, Teamtailor candidate[resume], Workday automation id.
+  assert.strictEqual(score({ attrs: "candidate[resume]" }), 80);
+  assert.strictEqual(score({ attrs: "candidate_cv upload" }), 80);
+  assert.strictEqual(score({ attrs: "cover_letter", label: "Adjunta tu CV" }), 0, "el atributo de carta manda sobre un contenedor que menciona el CV");
+  assert.strictEqual(score({ portalMatch: true, label: "Attach" }), 100);
+  assert.strictEqual(score({ label: "CV", accept: "image/*" }), 0, "un campo solo de imágenes no recibe un PDF");
+  assert.strictEqual(score({ label: "CV", accept: ".pdf,.doc,.docx" }), 60);
+
+  const src = readSourceText(path.join(__dirname, "..", "content", "autofill.js"));
+  assert.match(src, /if \(input\.files && input\.files\.length\) return \{ attached: false/, "nunca reemplaza un archivo que el usuario ya eligió");
+  assert.match(src, /:not\(\[type='file'\]\), textarea/, "el autorrelleno no intenta escribir texto en campos de archivo");
+
+  const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
+  assert.match(sw, /if \(!validacion\?\.ok\) \{\n    return \{ success: true, ok: false/, "un CV que no pasa el verificador no genera PDF");
+  assert.match(sw, /importScripts\([^)]*"\/shared\/cv-adapter\.js"[^)]*"\/content\/portals\.js"\)/);
+});
+
+it("Portals: picks the frame that holds the CV field, and defers multi-step forms", () => {
+  const P = loadRealPortals();
+  const probe = (frameId, score, total = 1, extra = {}) => ({ frameId, result: { score, total, filled: false, reason: "", ...extra } });
+
+  // Greenhouse embebido: el iframe (frame 3) tiene el campo; el principal no tiene archivos.
+  assert.deepStrictEqual({ ...P.pickCvFrame([probe(0, 0, 0), probe(3, 100)]) }, { frameId: 3 });
+  // Empate: gana el principal.
+  assert.strictEqual(P.pickCvFrame([probe(5, 60), probe(0, 60)]).frameId, 0);
+  // Un campo neutro solo vale si es el único de toda la pestaña.
+  assert.strictEqual(P.pickCvFrame([probe(0, 15)]).frameId, 0);
+  assert.strictEqual(P.pickCvFrame([probe(0, 15), probe(2, 15)]).frameId, null);
+  assert.strictEqual(P.pickCvFrame([probe(0, 15, 2)]).frameId, null);
+  // Sin ningún campo de archivo (paso 1 de LinkedIn Easy Apply / Workday): queda pendiente.
+  const pending = P.pickCvFrame([probe(0, 0, 0), { frameId: 1, result: null }]);
+  assert.strictEqual(pending.pending, true);
+  // El campo del CV ya tiene archivo: no se adjunta en otro lado ni queda pendiente.
+  const filled = P.pickCvFrame([probe(0, 0, 1, { filled: true, reason: "el campo del CV ya tiene un archivo (no se reemplaza)" })]);
+  assert.strictEqual(filled.frameId, null);
+  assert.ok(!filled.pending);
+  assert.match(filled.reason, /ya tiene un archivo/);
+
+  assert.deepStrictEqual([...P.attrTokens("candidate[resume]")], ["candidate", "resume"]);
+  assert.deepStrictEqual([...P.attrTokens("uploadResumeInput")], ["upload", "resume", "input"]);
+  assert.strictEqual(P.detectPortal("boards.greenhouse.io"), "greenhouse");
+  assert.strictEqual(P.detectPortal("acme.wd5.myworkdayjobs.com"), "workday");
+  assert.strictEqual(P.detectPortal("www.getonbrd.com"), "getonbrd");
+  assert.strictEqual(P.detectPortal("example.com"), "");
+  for (const sel of P.PORTAL_CV_SELECTORS) assert.ok(typeof sel === "string" && sel.length > 3);
+});
+
+it("Form controls: picks the right option in native and custom dropdowns, never the placeholder", () => {
+  const P = loadRealPortals();
+  assert.strictEqual(P.pickOptionIndex(["Selecciona...", "Chile", "Argentina"], "Chile"), 1);
+  assert.strictEqual(P.pickOptionIndex([{ text: "Seleccione", value: "" }, { text: "Chilean", value: "cl" }], "Chile"), 1, "contiene con 4+ letras");
+  assert.strictEqual(P.pickOptionIndex(["--", "Básico (A2)", "Intermedio (B1)", "Avanzado (B2)"], "B2"), 3, "nivel CEFR");
+  assert.strictEqual(P.pickOptionIndex(["Seleccione", "Ingeniería Civil en Informática", "Otra"], "Ingeniería en Informática"), 1);
+  assert.strictEqual(P.pickOptionIndex(["Select...", "Bachelor of Science", "Master"], "Ingeniería"), -1, "sin calce no adivina");
+  assert.strictEqual(P.pickOptionIndex([{ text: "", value: "" }, { text: "Sí", value: "1" }], "Chile"), -1, "una opción vacía nunca calza");
+  // Sí/No: "yes" no calza por texto; se resuelve con las variantes del grupo.
+  assert.strictEqual(P.pickOptionIndex(["Seleccione", "Sí", "No"], "yes"), -1);
+  assert.strictEqual(P.pickVariantIndex(["Seleccione", "Sí", "No"], ["yes", "si", "true"]), 1);
+  assert.strictEqual(P.pickVariantIndex(["Select One", "Yes", "No"], ["no", "false"]), 2);
+  assert.strictEqual(P.pickVariantIndex(["Noruega", "No"], ["no"]), 1, "palabra completa: Noruega no es No");
+  for (const t of ["Select One", "Selecciona…", "-- Elige --", "Seleccione una opción", "Choose...", "", "---"]) assert.ok(P.isPlaceholderOption(t), t);
+  for (const t of ["Chile", "Noruega", "Sí", "Optimismo"]) assert.ok(!P.isPlaceholderOption(t), t);
+});
+
+it("Form controls: custom radios, checkboxes and dropdowns count as filled when they already have a choice", () => {
+  const src = sliceRealSource("function fieldAlreadyHasValue(el)", "async function fillFieldSafely(el, profile)");
+  loadRealPortals();
+  const self = globalThis; // eslint-disable-line no-unused-vars
+  const has = eval(`const CSS = { escape: s => s };\n${src}\nfieldAlreadyHasValue;`);
+  const node = (tagName, attrs = {}, extra = {}) => ({ tagName, getAttribute: a => (a in attrs ? attrs[a] : null), closest: () => null, className: "", ...extra });
+
+  // Workday: botón con "Select One" = vacío; con un valor = respetado.
+  assert.strictEqual(has(node("BUTTON", { "aria-haspopup": "listbox" }, { innerText: "Select One" })), false);
+  assert.strictEqual(has(node("BUTTON", { "aria-haspopup": "listbox" }, { innerText: "LinkedIn" })), true);
+  // MUI: el input oculto hermano manda.
+  const muiParent = v => ({ querySelector: () => ({ value: v }) });
+  assert.strictEqual(has(node("DIV", { role: "combobox" }, { innerText: "\u200b", parentElement: muiParent("") })), false);
+  assert.strictEqual(has(node("DIV", { role: "combobox" }, { innerText: "Chile", parentElement: muiParent("CL") })), true);
+  // Angular Material vacío.
+  assert.strictEqual(has(node("MAT-SELECT", {}, { className: "mat-mdc-select mat-mdc-select-empty", innerText: "País" })), false);
+  // role=radio: basta con que el grupo tenga uno marcado.
+  const group = { querySelector: sel => (sel.includes("aria-checked='true'") ? {} : null) };
+  assert.strictEqual(has(node("DIV", { role: "radio", "aria-checked": "false" }, { closest: () => group })), true);
+  assert.strictEqual(has(node("DIV", { role: "radio", "aria-checked": "false" })), false);
+  assert.strictEqual(has(node("DIV", { role: "checkbox", "aria-checked": "true" })), true);
+});
+
+it("Form controls: radios are checked with a real click (React/Vue see it) and the group question is read from aria-labelledby", () => {
+  const src = readSourceText(path.join(__dirname, "..", "content", "autofill.js"));
+  assert.match(src, /if \(el\.checked\) return true;\n      el\.click\(\);/, "checkChoice hace click en vez de solo checked = true");
+  assert.doesNotMatch(src, /el\.checked = true;\n\s+el\.dispatchEvent\(new Event\("change", \{ bubbles: true, composed: true \}\)\);\n\s+ruleMatched = true;/, "ya no queda el camino viejo que React ignoraba");
+  assert.match(src, /const groupLabelledBy = fieldset\.getAttribute\("aria-labelledby"\);/);
+  assert.match(src, /\[role='combobox'\]:not\(input\), mat-select, \[role='radio'\]:not\(input\), \[role='checkbox'\]:not\(input\)/);
+});
+
+it("Portals: content script runs in every frame, portals.js loads first, widget only in the top frame", () => {
+  const manifest = JSON.parse(readSourceText(path.join(__dirname, "..", "manifest.json")));
+  const cs = manifest.content_scripts[0];
+  assert.strictEqual(cs.all_frames, true);
+  assert.deepStrictEqual(cs.js, ["content/portals.js", "content/autofill.js"]);
+
+  const src = readSourceText(path.join(__dirname, "..", "content", "autofill.js"));
+  assert.match(src, /if \(enabled && IS_TOP_FRAME\) initFloatingWidget\(\);/);
+  assert.match(src, /if \(!IS_TOP_FRAME\) return false;\n\n    if \(message\.type === "TRIGGER_AUTOFILL"\)/, "el popup recibe una sola respuesta, del frame principal");
+
+  const popup = readSourceText(path.join(__dirname, "..", "popup", "popup.js"));
+  assert.match(popup, /files: \["content\/portals\.js", "content\/autofill\.js"\]/, "la inyección de respaldo también carga portals.js");
 });
 
 // Espera a los tests async antes de contar: si el resumen se imprimiera de
