@@ -107,19 +107,24 @@
   }
 
   /** Datos de una postulación para el Tracker, validados como los valida el Worker. */
-  function buildApplicationPayload({ empresa, cargo, url, canal, notas, cvPerfil, fecha }) {
+  function buildApplicationPayload({ empresa, cargo, url, canal, notas, cvPerfil, cvPdf, area, keywordsCubiertas, fecha }) {
     const clip = (v, n) => String(v || "").trim().slice(0, n);
     const payload = {
       empresa: clip(empresa, 120),
       cargo: clip(cargo, 200),
       estado: "Postulado",
-      fecha: clip(fecha || new Date().toISOString().slice(0, 10), 10)
+      // Fecha en Chile, igual que el artefacto Postulador: con UTC, una
+      // postulación hecha de noche quedaba registrada con el día siguiente.
+      fecha: clip(fecha || new Date().toLocaleDateString("en-CA", { timeZone: "America/Santiago" }), 10)
     };
     if (!payload.empresa) throw new Error("Falta la empresa.");
     if (!payload.cargo) throw new Error("Falta el cargo.");
     if (url) payload.url = clip(url, 500);
     if (canal) payload.canal = clip(canal, 120);
     if (cvPerfil) payload.cv_perfil = clip(cvPerfil, 60);
+    if (cvPdf) payload.cv_pdf = clip(cvPdf, 200);
+    if (area) payload.area = clip(area, 200);
+    if (keywordsCubiertas) payload.keywords_cubiertas = clip(keywordsCubiertas, 1000);
     if (notas) payload.notas = clip(notas, 2000);
     return payload;
   }

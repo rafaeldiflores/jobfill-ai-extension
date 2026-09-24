@@ -2275,7 +2275,7 @@ it("Every extension script parses (a syntax error silently disables a whole file
   const { execFileSync } = require("child_process");
   const scripts = [
     ["background", "service-worker.js"], ["content", "autofill.js"], ["options", "options.js"],
-    ["options", "pdf-parser.js"], ["popup", "popup.js"], ["shared", "ai-client.js"], ["shared", "markdown-source.js"], ["shared", "vault-client.js"]
+    ["options", "pdf-parser.js"], ["popup", "popup.js"], ["shared", "ai-client.js"], ["shared", "markdown-source.js"], ["shared", "vault-client.js"], ["shared", "cv-adapter.js"]
   ];
   for (const parts of scripts) {
     execFileSync(process.execPath, ["--check", path.join(__dirname, "..", ...parts)], { stdio: "pipe" });
@@ -2625,6 +2625,88 @@ it("Vault rules: vetoed terms exclude sections, reach the prompt and are flagged
   assert.ok(manifest.permissions.includes("identity"), "chrome.identity para el login OAuth");
   const optionsSrc = readSourceText(path.join(__dirname, "..", "options", "options.js"));
   assert.match(optionsSrc, /BACKUP_EXCLUDED_KEYS = \[[^\]]*"vaultAuth"/, "el token del vault no sale en los respaldos");
+});
+
+// ─── POSTULAR EN 1 FLUJO (adaptación de CV del postulador) ────────────────
+function loadRealCvAdapter() {
+  require(path.join(__dirname, "..", "shared", "cv-adapter.js"));
+  return globalThis.JobFillCv;
+}
+
+it("CV adapter: same rules as the Postulador artifact, from vault instructions or the built-in fallback", () => {
+  const C = loadRealCvAdapter();
+  const ctx = {
+    base: "# BASE\n- [px-01] Logro real",
+    perfiles: [{ perfil: "AIEngineer", markdown: '---\ntitulo: "Ing | AI"\n---\nCV AI' }, { perfil: "Datos", markdown: '---\ntitulo: "Ing | Datos"\n---\nCV Datos' }],
+    instrucciones: null,
+    reglas: { titulo_profesional: "Ingeniero en Informática", fechas_fijas: { MAZA: "May 2024" }, nunca_incluir: ["Gemini Spark", "Ghost HUD"] }
+  };
+  const reglas = C.reglasCon(ctx);
+  assert.match(reglas, /LITERAL, carácter por carácter: "Ingeniero en Informática"/);
+  assert.match(reglas, /Fechas fijas \(no las cambies\): MAZA desde May 2024\. Textos vetados: Gemini Spark, Ghost HUD\./);
+  assert.ok(!/\{TITULO\}|\{FECHAS\}|\{VETOS\}/.test(reglas), "no quedan marcadores sin reemplazar");
+  // Con cv/instrucciones.md en el vault, mandan esas (editables sin republicar nada).
+  assert.strictEqual(C.reglasCon({ ...ctx, instrucciones: "Mis reglas para {TITULO}" }), "Mis reglas para Ingeniero en Informática");
+
+  const pick = C.buildProfilePickPrompt(ctx.perfiles, "x".repeat(10000));
+  assert.match(pick, /- AIEngineer: Ing \| AI\n- Datos: Ing \| Datos/);
+  assert.ok(pick.length < 6400, "la oferta se recorta a 6000 caracteres para elegir perfil");
+  assert.strictEqual(C.resolvePerfil(ctx.perfiles, { perfil: "Datos" }), "Datos");
+  assert.strictEqual(C.resolvePerfil(ctx.perfiles, { perfil: "Inventado" }), "AIEngineer", "un perfil inexistente cae al primero");
+
+  const adapt = C.buildAdaptPrompt(ctx, "Datos", "OFERTA " + "y".repeat(12000));
+  assert.match(adapt, /=== CV BASE \(Datos\) ===\n---\ntitulo: "Ing \| Datos"/);
+  assert.match(adapt, /=== BASE DE EXPERIENCIA ===\n# BASE/);
+  assert.match(adapt, /"keywords_faltantes"/);
+  assert.ok(adapt.endsWith("y".repeat(9000 - 7)), "la oferta se recorta a 9000 caracteres");
+
+  const fix = C.buildFixPrompt(ctx, "## CV", { hallazgos: [{ detalle: "Sobra una página" }], lineasDeMas: 3, lineasResumen: 5 });
+  assert.match(fix, /- Sobra una página/);
+  assert.match(fix, /Sobran ~3 líneas/);
+  assert.match(fix, /Acorta el Resumen a 4 líneas/);
+});
+
+it("CV adapter: tolerant JSON parsing, artifact-identical PDF names and Tracker coverage", () => {
+  const C = loadRealCvAdapter();
+  assert.strictEqual(C.parseJsonReply('```json\n{"markdown":"# CV"}\n```').markdown, "# CV");
+  assert.strictEqual(C.parseJsonReply('Aquí va: {"perfil":"Datos"} listo').perfil, "Datos");
+  assert.throws(() => C.parseJsonReply("sin json"), /JSON/);
+
+  // Mismo formato que cv/generados del artefacto: CV_RDF_<Empresa>_<Cargo>_<AAAAMMDD>.
+  const date = new Date("2026-09-24T15:00:00Z");
+  assert.strictEqual(C.pdfFileName({ empresa: "Agilesoft SpA", cargo: "Desarrollador Full Stack" }, date), "CV_RDF_Agilesoft_SpA_Desarrollador_Full_Stack_20260924");
+  assert.strictEqual(C.slug("Ingeniería & Datos (Sr.)"), "Ingenieria_Datos_Sr");
+  // Fecha en hora de Chile: a las 23:30 de Santiago en UTC ya es el día siguiente.
+  assert.strictEqual(C.hoy(new Date("2026-09-25T02:30:00Z")), "2026-09-24");
+
+  assert.strictEqual(C.coberturaTexto({ requisitos: [{ termino: "Python", nivel: "demostrada" }, { termino: "RAG", nivel: "declarada" }, { termino: "Docker", nivel: "brecha" }], cobertura: { respaldadas: 2, total: 3 } }), "67% (Python, RAG)");
+  assert.strictEqual(C.coberturaTexto(null, ["Python"]), "Python [estimada]");
+  assert.strictEqual(C.coberturaTexto(null, []), undefined);
+
+  const V = loadRealVaultClient();
+  const payload = V.buildApplicationPayload({ empresa: "Acme", cargo: "Dev", cvPerfil: "AIEngineer", cvPdf: "CV_RDF_Acme_Dev_20260924.pdf", area: "IA", keywordsCubiertas: "67% (Python, RAG)" });
+  assert.strictEqual(payload.cv_pdf, "CV_RDF_Acme_Dev_20260924.pdf");
+  assert.strictEqual(payload.area, "IA");
+  assert.strictEqual(payload.keywords_cubiertas, "67% (Python, RAG)");
+  assert.match(payload.fecha, /^\d{4}-\d{2}-\d{2}$/);
+});
+
+it("Apply flow: attaches the PDF only to the CV field, never to cover letters, and autofill skips file inputs", () => {
+  const src = readSourceText(path.join(__dirname, "..", "content", "autofill.js"));
+  const cvRe = eval(src.match(/const CV_FILE_RE = (\/.*\/i);/)[1]);
+  const notCvRe = eval(src.match(/const NOT_CV_FILE_RE = (\/.*\/i);/)[1]);
+  for (const label of ["Adjunta tu CV (PDF)", "Currículum vitae", "Upload your resume", "Hoja de vida", "Résumé"]) {
+    assert.ok(cvRe.test(label), `${label} es campo de CV`);
+  }
+  for (const label of ["Carta de presentación", "Cover letter", "Foto de perfil", "Certificado de título"]) {
+    assert.ok(!cvRe.test(label) && notCvRe.test(label), `${label} NO es campo de CV`);
+  }
+  assert.match(src, /if \(input\.files && input\.files\.length\) return \{ attached: false/, "nunca reemplaza un archivo que el usuario ya eligió");
+  assert.match(src, /:not\(\[type='file'\]\), textarea/, "el autorrelleno no intenta escribir texto en campos de archivo");
+
+  const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
+  assert.match(sw, /if \(!validacion\?\.ok\) \{\n    return \{ success: true, ok: false/, "un CV que no pasa el verificador no genera PDF");
+  assert.match(sw, /importScripts\([^)]*"\/shared\/cv-adapter\.js"\)/);
 });
 
 // Espera a los tests async antes de contar: si el resumen se imprimiera de

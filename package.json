@@ -1,6 +1,6 @@
 {
   "name": "jobfill-ai-extension",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "private": true,
   "description": "Extensión MV3 que autorrellena formularios de postulación y redacta respuestas con Claude (respaldo: Gemini).",
   "scripts": {

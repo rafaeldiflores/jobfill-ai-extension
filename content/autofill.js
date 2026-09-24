@@ -1074,7 +1074,7 @@
   }
 
   const AUTOFILLABLE_SELECTOR =
-    "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']), textarea, select, trix-editor, [contenteditable='true'], button[aria-haspopup='listbox']";
+    "input:not([type='hidden']):not([type='submit']):not([type='button']):not([type='reset']):not([type='file']), textarea, select, trix-editor, [contenteditable='true'], button[aria-haspopup='listbox']";
 
   function isFillableVisible(el) {
     if (el.disabled || el.readOnly) return false;
@@ -3840,6 +3840,7 @@
     }
     .btn.secondary:hover { border-color: rgba(129, 140, 248, 0.6); background: #1e293b; }
     .btn.wide { width: 100%; }
+    .btn.secondary.accent { border-color: rgba(129, 140, 248, 0.55); color: #e0e7ff; background: rgba(99, 102, 241, 0.18); }
 
     .launcher {
       display: grid;
@@ -3925,7 +3926,10 @@
           <button type="button" class="btn secondary" data-action="answer-all" title="Detecta todas las preguntas abiertas del formulario y las responde con una sola llamada a la IA">✨ Responder todas</button>
           <button type="button" class="btn secondary" data-action="capture" title="Lee el cargo de esta página y lo guarda para usarlo al postular (atajo: Ctrl+Shift+0, configurable en chrome://extensions/shortcuts)">📄 Guardar cargo</button>
         </div>
-        <button type="button" class="btn secondary wide" data-action="register" title="Crea o actualiza &quot;Empresa - Cargo&quot; en el Tracker de tu vault, con estado Postulado" hidden>📌 Registrar postulación</button>
+        <div class="row" data-vault-row hidden>
+          <button type="button" class="btn secondary accent" data-action="apply" title="Adapta tu CV a esta oferta, genera el PDF, lo adjunta al formulario y lo autorrellena">🚀 Postular</button>
+          <button type="button" class="btn secondary" data-action="register" title="Crea o actualiza &quot;Empresa - Cargo&quot; en el Tracker de tu vault, con estado Postulado">📌 Registrar</button>
+        </div>
       </section>`;
 
     const $ = selector => dock.querySelector(selector);
@@ -3959,11 +3963,14 @@
     answerAllBtn.addEventListener("click", () => handleAnswerAllQuestions(answerAllBtn));
     const captureBtn = $('[data-action="capture"]');
     captureBtn.addEventListener("click", () => manualCaptureJobContext(captureBtn));
+    const vaultRow = $("[data-vault-row]");
+    vaultRow.hidden = !vaultConnected;
     const registerBtn = $('[data-action="register"]');
-    registerBtn.hidden = !vaultConnected;
     registerBtn.addEventListener("click", () => registerApplicationFromPage(registerBtn));
+    const applyBtn = $('[data-action="apply"]');
+    applyBtn.addEventListener("click", () => runApplyFlow(applyBtn));
 
-    widgetRefs = { host, chip: $(".job"), chipText: $(".job-text"), registerBtn };
+    widgetRefs = { host, chip: $(".job"), chipText: $(".job-text"), vaultRow };
 
     shadow.append(style, dock);
     attachToTopLayerHost(host);
@@ -4067,6 +4074,296 @@
     });
   }
 
+  // ─── 🚀 Postular en 1 flujo ────────────────────────────────────────────────
+  //
+  // Oferta leída de la página → CV adaptado por el postulador (mismo proceso
+  // que el artefacto de claude.ai) → PDF adjunto al campo de CV → formulario
+  // autorrellenado → registro en el Tracker con confirmación.
+
+  let activeApplyFlow = null;
+
+  const APPLY_STEPS = [
+    ["contexto", "Leer tu BASE y CVs base"],
+    ["perfil", "Elegir el CV base"],
+    ["adaptar", "Adaptar el CV a la oferta"],
+    ["validar", "Verificar reglas y 1 página"],
+    ["ajustar", "Ajustar lo que no pasa"],
+    ["pdf", "Generar el PDF (queda en tu vault)"],
+    ["adjuntar", "Adjuntar el PDF al formulario"],
+    ["rellenar", "Autorrellenar el formulario"]
+  ];
+
+  const APPLY_FLOW_STYLES = `
+    .jf-steps { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 6px; }
+    .jf-steps li { display: flex; gap: 10px; align-items: baseline; font-size: 13px; color: #64748b; }
+    .jf-steps li::before { content: "○"; width: 14px; flex-shrink: 0; text-align: center; }
+    .jf-steps li.is-active { color: #e0e7ff; font-weight: 600; }
+    .jf-steps li.is-active::before { content: "◐"; color: #a5b4fc; }
+    .jf-steps li.is-done { color: #94a3b8; }
+    .jf-steps li.is-done::before { content: "✓"; color: #34d399; }
+    .jf-steps li.is-skip { display: none; }
+    .jf-detail { margin: 10px 0 0 !important; min-height: 18px; }
+    .jf-result { margin-top: 14px; display: grid; gap: 8px; font-size: 12.5px; color: #cbd5e1; }
+    .jf-result .ok { color: #6ee7b7; }
+    .jf-result .warn { color: #fbbf24; }
+    .jf-result .err { color: #fca5a5; }
+    .jf-result ul { margin: 0; padding-left: 18px; }
+    .jf-register { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(148, 163, 184, 0.18); }
+    [hidden] { display: none !important; }`;
+
+  function openApplyFlowDialog() {
+    const host = document.createElement("div");
+    host.className = "jobfill-dialog-host";
+    const shadow = host.attachShadow({ mode: "open" });
+    const style = document.createElement("style");
+    style.textContent = CONFIRM_DIALOG_STYLES + APPLY_FLOW_STYLES;
+    const overlay = document.createElement("div");
+    overlay.className = "jobfill-overlay";
+    overlay.innerHTML = `
+      <div class="jobfill-confirm" role="dialog" aria-modal="true" aria-label="Postular">
+        <h3>🚀 Postular a esta oferta</h3>
+        <p class="jf-offer"></p>
+        <ul class="jf-steps">${APPLY_STEPS.map(([id, label]) => `<li data-step="${id}">${label}</li>`).join("")}</ul>
+        <p class="jf-detail"></p>
+        <div class="jf-result" hidden></div>
+        <div class="jf-register" hidden>
+          <div class="jobfill-field"><label for="jf-ap-empresa">Empresa</label><input type="text" id="jf-ap-empresa" spellcheck="false"></div>
+          <div class="jobfill-field"><label for="jf-ap-cargo">Cargo</label><input type="text" id="jf-ap-cargo" spellcheck="false"></div>
+        </div>
+        <div class="jobfill-confirm-actions">
+          <button class="jobfill-confirm-ok" type="button" data-act="register" hidden>📌 Registrar en el Tracker</button>
+          <button class="jobfill-confirm-cancel" type="button" data-act="download" hidden>⬇ Descargar PDF</button>
+          <button class="jobfill-confirm-cancel" type="button" data-act="close">Cerrar</button>
+        </div>
+      </div>`;
+    shadow.append(style, overlay);
+    attachToTopLayerHost(host);
+
+    const $s = sel => shadow.querySelector(sel);
+    const order = APPLY_STEPS.map(([id]) => id);
+    let current = -1;
+
+    const ui = {
+      shadow,
+      setOffer(text) { $s(".jf-offer").textContent = text; },
+      setStep(step, detail = "") {
+        const idx = order.indexOf(step);
+        if (idx === -1) return;
+        order.forEach((id, i) => {
+          const li = $s(`[data-step="${id}"]`);
+          if (i < idx && li.classList.contains("is-active")) li.classList.replace("is-active", "is-done");
+          else if (i < idx && !li.classList.contains("is-done")) li.classList.add(id === "ajustar" || id === "perfil" ? "is-skip" : "is-done");
+        });
+        $s(`[data-step="${step}"]`).classList.remove("is-skip");
+        $s(`[data-step="${step}"]`).classList.add("is-active");
+        current = idx;
+        $s(".jf-detail").textContent = detail;
+      },
+      finishSteps(upTo) {
+        const last = upTo ? order.indexOf(upTo) : order.length - 1;
+        order.forEach((id, i) => {
+          const li = $s(`[data-step="${id}"]`);
+          if (li.classList.contains("is-active") || (i <= last && !li.classList.contains("is-done") && !li.classList.contains("is-skip") && i <= current)) {
+            li.classList.remove("is-active");
+            li.classList.add("is-done");
+          }
+        });
+        $s(".jf-detail").textContent = "";
+      },
+      showResult(lines) {
+        const box = $s(".jf-result");
+        box.replaceChildren();
+        for (const { text, tone = "", items } of lines) {
+          const div = document.createElement("div");
+          if (tone) div.className = tone;
+          div.textContent = text;
+          if (items?.length) {
+            const ul = document.createElement("ul");
+            for (const it of items) { const li = document.createElement("li"); li.textContent = it; ul.appendChild(li); }
+            div.appendChild(ul);
+          }
+          box.appendChild(div);
+        }
+        box.hidden = false;
+      },
+      showRegister(empresa, cargo, onRegister) {
+        $s(".jf-register").hidden = false;
+        $s("#jf-ap-empresa").value = empresa || "";
+        $s("#jf-ap-cargo").value = cargo || "";
+        const btn = $s('[data-act="register"]');
+        btn.hidden = false;
+        btn.onclick = () => onRegister($s("#jf-ap-empresa").value.trim(), $s("#jf-ap-cargo").value.trim(), btn);
+      },
+      showDownload(onDownload) {
+        const btn = $s('[data-act="download"]');
+        btn.hidden = false;
+        btn.onclick = onDownload;
+      },
+      close() {
+        document.removeEventListener("keydown", onKeydown, true);
+        host.remove();
+        if (activeApplyFlow === ui) activeApplyFlow = null;
+      }
+    };
+    function onKeydown(e) { if (e.key === "Escape") { e.stopPropagation(); ui.close(); } }
+    document.addEventListener("keydown", onKeydown, true);
+    $s('[data-act="close"]').addEventListener("click", () => ui.close());
+    return ui;
+  }
+
+  /** Texto de contexto de un <input type=file>, para decidir si es el campo del CV. */
+  function fileInputContext(input) {
+    const parts = [getFieldContext(input), input.accept || ""];
+    const container = input.closest("label, .form-group, .field, [class*='upload'], [class*='file'], [class*='dropzone'], [class*='resume'], [class*='cv']");
+    if (container && container.innerText) parts.push(container.innerText.slice(0, 200));
+    return parts.join(" ");
+  }
+
+  const CV_FILE_RE = /\b(cv|c\.v\.|curr[ií]cul|resume|r[ée]sum[ée]|hoja de vida|curriculum)/i;
+  const NOT_CV_FILE_RE = /(carta|cover|motivaci|foto|photo|imagen|image|portafolio|portfolio|certificad|t[ií]tulo|diploma|transcript)/i;
+
+  /**
+   * Elige el <input type=file> del CV. Solo se adjunta cuando el campo se
+   * identifica como CV (o es el ÚNICO campo de archivo y acepta PDF): con
+   * varios campos ambiguos (CV, carta, certificados) no se adivina.
+   */
+  function findCvFileInput() {
+    const inputs = [...document.querySelectorAll('input[type="file"]')].filter(i => !i.disabled);
+    const acceptsPdf = i => !i.accept || /pdf|application\/\*|\*\/\*/i.test(i.accept);
+    const candidates = inputs.filter(acceptsPdf).map(input => {
+      const ctx = fileInputContext(input);
+      return { input, isCv: CV_FILE_RE.test(ctx), notCv: NOT_CV_FILE_RE.test(ctx) && !CV_FILE_RE.test(ctx) };
+    });
+    const explicit = candidates.filter(c => c.isCv);
+    if (explicit.length) return { input: explicit[0].input };
+    const neutral = candidates.filter(c => !c.notCv);
+    if (inputs.length === 1 && neutral.length === 1) return { input: neutral[0].input };
+    return { input: null, reason: inputs.length ? "no se identificó con certeza cuál es el campo del CV" : "la página no tiene un campo para subir archivos" };
+  }
+
+  function base64ToBytes(b64) {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  /**
+   * Adjunta el PDF al campo del CV. Mismo principio que el autorrelleno:
+   * nunca se reemplaza un archivo que el usuario ya eligió.
+   */
+  function attachPdfToForm(base64, fileName) {
+    const { input, reason } = findCvFileInput();
+    if (!input) return { attached: false, reason };
+    if (input.files && input.files.length) return { attached: false, reason: "el campo del CV ya tiene un archivo (no se reemplaza)" };
+    const file = new File([base64ToBytes(base64)], fileName, { type: "application/pdf" });
+    const dt = new DataTransfer();
+    dt.items.add(file);
+    input.files = dt.files;
+    input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+    input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+    return { attached: true };
+  }
+
+  function downloadPdf(base64, fileName) {
+    const url = URL.createObjectURL(new Blob([base64ToBytes(base64)], { type: "application/pdf" }));
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = fileName;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+
+  function sendToWorker(type, payload) {
+    return new Promise(resolve => {
+      try {
+        chrome.runtime.sendMessage({ type, payload }, r => resolve(chrome.runtime.lastError ? { success: false, error: ORPHANED_CONTEXT_MSG } : r || { success: false, error: "Sin respuesta del service worker." }));
+      } catch (e) {
+        resolve({ success: false, error: ORPHANED_CONTEXT_MSG });
+      }
+    });
+  }
+
+  async function runApplyFlow(btn) {
+    if (activeApplyFlow) return;
+    let job = {};
+    try { job = await resolveJobContext(); } catch (e) { /* se valida abajo */ }
+    const oferta = (job.description || "").trim();
+    const empresa = job.company || extractCompanyName() || "";
+    const cargo = job.title || extractJobTitle() || "";
+    if (oferta.length < 80) {
+      showToast("No encontré la descripción de la oferta en esta página. Abre la oferta y guárdala con 📄 Guardar cargo, y después vuelve al formulario.", "error");
+      return;
+    }
+
+    btn.disabled = true;
+    const ui = openApplyFlowDialog();
+    activeApplyFlow = ui;
+    ui.setOffer(`${cargo || "Cargo sin detectar"}${empresa ? ` · ${empresa}` : ""}${job.fromCache ? " (oferta guardada)" : ""}`);
+    ui.setStep("contexto", "Conectando con tu vault…");
+
+    try {
+      const res = await sendToWorker("APPLY_ADAPT_CV", { oferta, empresa, cargo });
+      if (!res?.success) throw new Error(res?.error || "No se pudo adaptar el CV.");
+
+      if (!res.ok) {
+        ui.finishSteps("validar");
+        ui.showResult([
+          { text: "✗ El CV adaptado no pasa las reglas de tu verificador, así que no se generó el PDF.", tone: "err", items: res.hallazgos.filter(h => h.nivel === "error").map(h => h.detalle) },
+          { text: "Ábrelo en el Postulador de claude.ai para ajustarlo a mano; el formulario no se tocó." }
+        ]);
+        return;
+      }
+
+      ui.setStep("adjuntar", "Buscando el campo para subir el CV…");
+      const attach = attachPdfToForm(res.base64, res.archivo);
+      ui.setStep("rellenar", "Rellenando el resto del formulario…");
+      const fill = await executeAutofill();
+      ui.finishSteps();
+
+      const warnings = res.hallazgos.filter(h => h.nivel !== "error").map(h => h.detalle);
+      ui.showResult([
+        { text: `✓ CV ${res.perfil} adaptado${res.ajustado ? " (con un ajuste automático)" : ""} y guardado en tu vault: cv/generados/${res.archivo}`, tone: "ok" },
+        attach.attached
+          ? { text: "✓ PDF adjuntado al campo del CV. Revísalo antes de enviar.", tone: "ok" }
+          : { text: `⚠ No se adjuntó automáticamente: ${attach.reason}. Descárgalo y súbelo a mano.`, tone: "warn" },
+        { text: fill?.count ? `✓ ${fill.count} campos del formulario rellenados.` : "Formulario sin campos vacíos que rellenar." },
+        res.cobertura ? { text: `Requisitos de la oferta respaldados por tu grafo: ${res.cobertura}` } : null,
+        res.faltantes?.length ? { text: "Sin respaldo en tu BASE (no se mencionan en el CV):", tone: "warn", items: res.faltantes } : null,
+        warnings.length ? { text: "Avisos del verificador:", tone: "warn", items: warnings } : null
+      ].filter(Boolean));
+
+      ui.showDownload(() => downloadPdf(res.base64, res.archivo));
+      ui.showRegister(res.empresa || empresa, res.cargo || cargo, async (emp, car, regBtn) => {
+        if (!emp || !car) return;
+        regBtn.disabled = true;
+        const r = await sendToWorker("VAULT_REGISTER_APPLICATION", {
+          empresa: emp, cargo: car, url: location.href, canal: location.hostname.replace(/^www\./, ""),
+          cvPerfil: res.perfil, cvPdf: res.archivo, area: res.area, keywordsCubiertas: res.cobertura
+        });
+        if (r?.success) {
+          regBtn.textContent = "✓ Registrada";
+          showToast(`📌 Registrada en tu Tracker: ${r.name}`, "success");
+        } else {
+          regBtn.disabled = false;
+          showToast(r?.error || "No se pudo registrar la postulación.", "error");
+        }
+      });
+    } catch (err) {
+      ui.showResult([{ text: `✗ ${err.message}`, tone: "err" }]);
+      clearFlowDetail(ui);
+    } finally {
+      btn.disabled = false;
+    }
+  }
+
+  function clearFlowDetail(ui) {
+    const d = ui.shadow.querySelector(".jf-detail");
+    if (d) d.textContent = "";
+  }
+
   /** Quita de la página todo lo que la extensión dibuja de forma persistente. */
   function teardownPageUi() {
     document.querySelector(".jobfill-floating-container")?.remove();
@@ -4120,6 +4417,11 @@
       return true;
     }
 
+    if (message.type === "APPLY_PROGRESS") {
+      activeApplyFlow?.setStep(message.step, message.detail);
+      return false;
+    }
+
     if (message.type === "CAPTURE_JOB_CONTEXT_HOTKEY") {
       // El atajo de teclado (Ctrl+Shift+0 por defecto, o el botón del mouse
       // remapeado a esa combinación) dispara la misma captura manual que el
@@ -4163,7 +4465,7 @@
     if (changes.extensionEnabled) applyEnabledState(changes.extensionEnabled.newValue !== false);
     if (changes.vaultLastSync) {
       vaultConnected = Boolean(changes.vaultLastSync.newValue);
-      if (widgetRefs?.registerBtn) widgetRefs.registerBtn.hidden = !vaultConnected;
+      if (widgetRefs?.vaultRow) widgetRefs.vaultRow.hidden = !vaultConnected;
     }
     if (changes.widgetCollapsed) {
       widgetCollapsed = changes.widgetCollapsed.newValue === true;
