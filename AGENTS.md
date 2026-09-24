@@ -34,7 +34,7 @@ Abre el icono de **JobFill AI** → ⚙️. La sección **🏠 Inicio** muestra 
 
 Con el vault conectado, el panel flotante suma dos botones:
 
-- **🚀 Postular**: todo el Postulador sin salir del portal. Lee la oferta de la página en tiempo real, elige tu CV base, lo adapta con tus instrucciones del vault (`cv/instrucciones.md`), pasa el verificador (reglas + 1 página, con un ajuste automático si hace falta), genera el PDF (queda en `cv/generados/`), **lo adjunta al campo del CV** del formulario y autorrellena el resto. Al final muestra la cobertura según tu grafo y te deja registrar la postulación con el CV usado. Si el CV no pasa el verificador, no se genera PDF ni se toca el formulario.
+- **🚀 Postular**: todo el Postulador sin salir del portal. Lee la oferta de la página en tiempo real, elige tu CV base, lo adapta con tus instrucciones del vault (`cv/instrucciones.md`), pasa el verificador (reglas + 1 página, con un ajuste automático si hace falta), genera el PDF (queda en `cv/generados/`) y **te muestra la vista previa** (misma plantilla del PDF, con opción de abrirlo o descargarlo). Solo cuando confirmas con "✓ Se ve bien", **lo adjunta al campo del CV** del formulario y autorrellena el resto. Si Claude responde que se alcanzó el límite por minuto, espera y reintenta solo; si aun así falla, **↻ Reintentar** retoma desde el paso que falló sin volver a adaptar. Al final muestra la cobertura según tu grafo y te deja registrar la postulación con el CV usado. Si el CV no pasa el verificador, no se genera PDF ni se toca el formulario.
 - **📌 Registrar**: registra la postulación en el Tracker sin adaptar el CV.
 
 El registro en el Tracker siempre pide confirmación: nunca es automático.

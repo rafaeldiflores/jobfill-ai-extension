@@ -935,6 +935,9 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
     ajustado: (cp.fixRounds || 0) > 0,
     hallazgos: (validacion?.hallazgos || []).map(h => ({ nivel: h.nivel, detalle: h.detalle })),
     paginas: validacion?.paginas,
+    // HTML con la MISMA plantilla del PDF (lo devuelve cv_validar): la vista
+    // previa que el usuario revisa antes de adjuntar.
+    html: typeof validacion?.html === "string" ? validacion.html : "",
     cobertura: JobFillCv.coberturaTexto(brechas, adaptado.keywords_cubiertas),
     faltantes: (brechas?.requisitos || []).filter(q => q.nivel === "brecha").map(q => q.termino)
   };

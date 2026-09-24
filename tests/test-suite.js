@@ -2846,6 +2846,23 @@ it("Form controls: radios are checked with a real click (React/Vue see it) and t
   assert.match(src, /\[role='combobox'\]:not\(input\), mat-select, \[role='radio'\]:not\(input\), \[role='checkbox'\]:not\(input\)/);
 });
 
+it("Apply flow: pauses on a preview of the CV and only attaches after the user confirms", () => {
+  const src = readSourceText(path.join(__dirname, "..", "content", "autofill.js"));
+  const flow = src.slice(src.indexOf("  async function runApplyFlow"), src.indexOf("  /** Resumen del CV generado"));
+  // Tras el PDF: paso "revisar", vista previa y botón de confirmar; completeApplyFlow (adjuntar) solo desde ese botón.
+  assert.match(flow, /ui\.setStep\("revisar"/);
+  assert.match(flow, /ui\.showPreview\(res\.html/);
+  assert.match(flow, /ui\.showAttach\(\(\) => completeApplyFlow\(/);
+  assert.strictEqual((flow.match(/completeApplyFlow\(/g) || []).length, 1, "no hay otro camino que adjunte sin confirmar");
+  // Vista previa saneada: sin scripts ni on*, sin imágenes externas.
+  const sanitize = src.slice(src.indexOf("  function sanitizeCvHtml"), src.indexOf("  /** Abre el PDF en una pestaña nueva"));
+  assert.match(sanitize, /"script, iframe, object, embed, link, meta, base, form, style"/);
+  assert.match(sanitize, /\/\^on\/i\.test\(attr\.name\)/);
+  assert.match(sanitize, /querySelectorAll\("img"\)/);
+  const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
+  assert.match(sw, /html: typeof validacion\?\.html === "string" \? validacion\.html : ""/, "el worker entrega el HTML de cv_validar");
+});
+
 it("Portals: content script runs in every frame, portals.js loads first, widget only in the top frame", () => {
   const manifest = JSON.parse(readSourceText(path.join(__dirname, "..", "manifest.json")));
   const cs = manifest.content_scripts[0];
