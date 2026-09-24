@@ -478,7 +478,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === "APPLY_ADAPT_CV") {
     withKeepAlive(() => adaptCvForOffer(message.payload || {}, sender.tab?.id))
       .then(response => sendResponse(response))
-      .catch(error => sendResponse({ success: false, error: describeError(error) }));
+      .catch(error => sendResponse({ success: false, error: describeError(error), retryable: Boolean(error.retryable), step: error.step }));
     return true;
   }
 
@@ -789,11 +789,70 @@ async function dropPendingCv(tabId) {
 
 chrome.tabs.onRemoved.addListener(tabId => { dropPendingCv(tabId).catch(() => {}); });
 
-async function adaptCvForOffer({ oferta, empresa, cargo }, tabId) {
+/*
+ * Punto de control del flujo, por pestaña, en chrome.storage.session (solo
+ * memoria, sobrevive a que el service worker se duerma). Guarda lo ya
+ * pagado —perfil elegido, CV adaptado, validación, ajuste, brechas— para que
+ * "Reintentar" retome desde el paso que falló en vez de volver a adaptar.
+ */
+const APPLY_CHECKPOINT_KEY = "applyCheckpoint";
+const APPLY_CHECKPOINT_TTL_MS = 30 * 60 * 1000;
+// Ajustes automáticos máximos por intento (el primero va dentro del flujo;
+// "Reintentar" sobre un CV que sigue sin pasar hace uno más).
+const MAX_FIX_ROUNDS = 1;
+
+async function readApplyCheckpoint(tabId) {
+  const all = (await chrome.storage.session.get(APPLY_CHECKPOINT_KEY))[APPLY_CHECKPOINT_KEY] || {};
+  const cp = all[tabId];
+  return cp && Date.now() - cp.at < APPLY_CHECKPOINT_TTL_MS ? cp : null;
+}
+
+async function writeApplyCheckpoint(tabId, cp) {
+  if (!tabId) return;
+  const all = (await chrome.storage.session.get(APPLY_CHECKPOINT_KEY))[APPLY_CHECKPOINT_KEY] || {};
+  if (cp) all[tabId] = { ...cp, at: Date.now() };
+  else delete all[tabId];
+  await chrome.storage.session.set({ [APPLY_CHECKPOINT_KEY]: all });
+}
+
+chrome.tabs.onRemoved.addListener(tabId => { writeApplyCheckpoint(tabId, null).catch(() => {}); });
+
+async function adaptCvForOffer({ oferta, empresa, cargo, resume = false, cambio = "" }, tabId) {
+  let currentStep = "contexto";
   const progress = (step, detail = "") => {
+    currentStep = step;
     if (tabId) chrome.tabs.sendMessage(tabId, { type: "APPLY_PROGRESS", step, detail }).catch(() => {});
   };
 
+  // Retomar: se parte de lo ya hecho en el intento anterior de esta pestaña.
+  let cp = null;
+  if (resume) {
+    cp = await readApplyCheckpoint(tabId);
+    if (!cp) throw new Error("No quedó un intento anterior que retomar (pasaron más de 30 min o se cerró la pestaña). Pulsa 🚀 Postular de nuevo.");
+    ({ oferta, empresa, cargo } = cp.input);
+    // "✎ Pedir cambio": queda pendiente hasta aplicarse, así un Reintentar
+    // tras un fallo lo aplica en vez de devolver el CV anterior.
+    const pedido = String(cambio || "").trim().slice(0, JobFillCv.CAMBIO_MAX);
+    if (pedido) cp.cambioPendiente = pedido;
+  } else {
+    cp = { input: { oferta, empresa, cargo } };
+    await writeApplyCheckpoint(tabId, null);
+  }
+  // Muta el mismo objeto: runAdaptCvSteps lee `cp` después de cada save.
+  const save = async patch => { Object.assign(cp, patch); await writeApplyCheckpoint(tabId, cp); };
+
+  try {
+    await writeApplyCheckpoint(tabId, cp);
+    return await runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, getStep: () => currentStep });
+  } catch (err) {
+    // Lo ya pagado queda guardado: el error se puede reintentar desde aquí.
+    err.retryable = true;
+    err.step = currentStep;
+    throw err;
+  }
+}
+
+async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, getStep }) {
   if (!oferta || oferta.trim().length < 80) {
     throw new Error("No encontré la descripción de la oferta en esta página. Ábrela (o guárdala con 📄 Guardar cargo) y vuelve a intentar.");
   }
@@ -806,49 +865,83 @@ async function adaptCvForOffer({ oferta, empresa, cargo }, tabId) {
   // copiar empresa y cargo exactos aunque la descripción no los repita.
   const ofertaCompleta = `${empresa ? `Empresa: ${empresa}\n` : ""}${cargo ? `Cargo: ${cargo}\n` : ""}\n${oferta}`;
 
-  progress("contexto", "Leyendo tu BASE y tus CVs base…");
+  // Con un cambio pedido, el diálogo sigue en "Revisar" (no vuelve al paso 1).
+  if (cp.cambioPendiente) progress("revisar", "Leyendo tu BASE para aplicar el cambio…");
+  else progress("contexto", "Leyendo tu BASE y tus CVs base…");
   const ctx = await vaultCall("cv_contexto", {});
   if (!Array.isArray(ctx?.perfiles) || !ctx.perfiles.length) {
     throw new Error("Tu vault no tiene CVs base (cv/base/*.md): el Postulador los necesita para adaptar.");
   }
 
+  // Si Claude pide esperar (límite por minuto), el diálogo lo muestra en el
+  // paso en curso en vez de quedarse "pegado" sin explicación.
+  const onRetry = ({ waitMs, attempt }) => progress(getStep(), `Claude pidió esperar por el límite de uso por minuto de tu cuenta. Reintento ${attempt} en ${Math.round(waitMs / 1000)} s…`);
   const ask = async (prompt, { model, max_tokens, timeoutMs }) => {
     const data = await callAnthropicMessagesApi({
-      ai, model, max_tokens, timeoutMs,
+      ai, model, max_tokens, timeoutMs, onRetry,
       messages: [{ role: "user", content: [{ type: "text", text: prompt }] }]
     });
     return JobFillCv.parseJsonReply(extractTextFromResponse(data));
   };
 
-  let perfil = ctx.perfiles[0].perfil;
-  if (ctx.perfiles.length > 1) {
-    progress("perfil", "Eligiendo el CV base que mejor calza…");
-    const r = await ask(JobFillCv.buildProfilePickPrompt(ctx.perfiles, ofertaCompleta), { model: MODEL_SIMPLE, max_tokens: 100, timeoutMs: 30000 });
-    perfil = JobFillCv.resolvePerfil(ctx.perfiles, r);
+  if (!cp.perfil) {
+    let perfil = ctx.perfiles[0].perfil;
+    if (ctx.perfiles.length > 1) {
+      progress("perfil", "Eligiendo el CV base que mejor calza…");
+      const r = await ask(JobFillCv.buildProfilePickPrompt(ctx.perfiles, ofertaCompleta), { model: MODEL_SIMPLE, max_tokens: 100, timeoutMs: 30000 });
+      perfil = JobFillCv.resolvePerfil(ctx.perfiles, r);
+    }
+    await save({ perfil });
   }
+  const perfil = cp.perfil;
 
-  progress("adaptar", `Adaptando tu CV ${perfil} a la oferta (suele tardar 30–60 s)…`);
-  const adaptado = await ask(JobFillCv.buildAdaptPrompt(ctx, perfil, ofertaCompleta), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
-  if (!adaptado?.markdown) throw new Error("La IA no devolvió el CV adaptado. Intenta de nuevo.");
+  if (!cp.adaptado) {
+    progress("adaptar", `Adaptando tu CV ${perfil} a la oferta (suele tardar 30–60 s)…`);
+    const adaptado = await ask(JobFillCv.buildAdaptPrompt(ctx, perfil, ofertaCompleta), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
+    if (!adaptado?.markdown) throw new Error("La IA no devolvió el CV adaptado. Intenta de nuevo.");
+    await save({ adaptado, markdown: adaptado.markdown, fixRounds: 0 });
+  }
+  const adaptado = cp.adaptado;
 
   // Brechas en paralelo con la validación: es evidencia del grafo para el
   // Tracker, no bloquea el PDF si el grafo no responde.
-  const brechasPromise = vaultCall("brechas", {
+  const brechasPromise = cp.brechas !== undefined ? Promise.resolve(cp.brechas) : vaultCall("brechas", {
     requisitos: (adaptado.keywords_oferta || []).filter(k => typeof k === "string" && k.trim()),
     oferta: ofertaCompleta.slice(0, 9000)
-  }).catch(err => { console.warn("[JobFill AI] brechas falló:", err); return null; });
+  }).then(b => save({ brechas: b }).then(() => b))
+    .catch(err => { console.warn("[JobFill AI] brechas falló:", err); return null; });
 
-  progress("validar", "Revisando reglas y que quepa en 1 página…");
-  let markdown = adaptado.markdown;
-  let validacion = await vaultCall("cv_validar", { markdown });
-  let ajustado = false;
-  if (!validacion?.ok) {
+  // Cambio pedido desde la vista previa: se aplica sobre el CV actual y
+  // desde ahí el camino es el mismo (verificar, ajustar si hace falta, PDF).
+  if (cp.cambioPendiente) {
+    progress("revisar", "Aplicando tu cambio con las reglas de tu vault…");
+    const revisado = await ask(JobFillCv.buildRevisePrompt(ctx, cp.markdown, cp.cambioPendiente, ofertaCompleta), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
+    if (!revisado?.markdown) throw new Error("La IA no devolvió el CV con el cambio. Intenta de nuevo.");
+    await save({
+      markdown: revisado.markdown, validacion: null, fixRounds: 0, retryFix: false,
+      cambioPendiente: null, nota: String(revisado.nota || "").trim(), cambios: (cp.cambios || 0) + 1
+    });
+  }
+
+  let validacion = cp.validacion;
+  if (!validacion) {
+    progress("validar", "Revisando reglas y que quepa en 1 página…");
+    validacion = await vaultCall("cv_validar", { markdown: cp.markdown });
+    await save({ validacion });
+  }
+
+  // Un ajuste por intento: el primero en el flujo normal; "Reintentar" sobre
+  // un CV que sigue sin pasar concede uno más.
+  const fixBudget = (cp.fixRounds || 0) < MAX_FIX_ROUNDS || cp.retryFix;
+  if (!validacion?.ok && fixBudget) {
     progress("ajustar", "Ajustando el CV a las reglas…");
-    const fix = await ask(JobFillCv.buildFixPrompt(ctx, markdown, validacion), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
+    const fix = await ask(JobFillCv.buildFixPrompt(ctx, cp.markdown, validacion), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
+    await save({ fixRounds: (cp.fixRounds || 0) + 1, retryFix: false });
     if (fix?.markdown) {
-      markdown = fix.markdown;
-      validacion = await vaultCall("cv_validar", { markdown });
-      ajustado = true;
+      await save({ markdown: fix.markdown, validacion: null });
+      progress("ajustar", "Revisando de nuevo el CV ajustado…");
+      validacion = await vaultCall("cv_validar", { markdown: cp.markdown });
+      await save({ validacion });
     }
   }
 
@@ -858,20 +951,27 @@ async function adaptCvForOffer({ oferta, empresa, cargo }, tabId) {
     empresa: adaptado.empresa || empresa || "",
     cargo: adaptado.cargo || cargo || "",
     area: adaptado.area || "",
-    ajustado,
+    ajustado: (cp.fixRounds || 0) > 0,
+    cambios: cp.cambios || 0,
+    nota: cp.nota || "",
     hallazgos: (validacion?.hallazgos || []).map(h => ({ nivel: h.nivel, detalle: h.detalle })),
     paginas: validacion?.paginas,
+    // HTML con la MISMA plantilla del PDF (lo devuelve cv_validar): la vista
+    // previa que el usuario revisa antes de adjuntar.
+    html: typeof validacion?.html === "string" ? validacion.html : "",
     cobertura: JobFillCv.coberturaTexto(brechas, adaptado.keywords_cubiertas),
     faltantes: (brechas?.requisitos || []).filter(q => q.nivel === "brecha").map(q => q.termino)
   };
 
   if (!validacion?.ok) {
-    return { success: true, ok: false, ...resumen };
+    // El punto de control queda: "Reintentar ajuste" pide una ronda más.
+    await save({ retryFix: true });
+    return { success: true, ok: false, canRetry: true, ...resumen };
   }
 
   progress("pdf", "Generando el PDF y guardándolo en tu vault…");
   const nombre = JobFillCv.pdfFileName(resumen);
-  const pdf = await vaultCall("cv_generar_pdf", { markdown, nombre });
+  const pdf = await vaultCall("cv_generar_pdf", { markdown: cp.markdown, nombre });
   if (!pdf?.base64) throw new Error("El postulador no devolvió el PDF.");
 
   return { success: true, ok: true, ...resumen, archivo: pdf.archivo || `${nombre}.pdf`, base64: pdf.base64 };
@@ -998,14 +1098,15 @@ function arrayBufferToBase64(buffer) {
  * max_tokens — con presupuestos pequeños se agotan antes de emitir texto y la
  * respuesta llega vacía. Aquí siempre queremos texto directo y acotado.
  */
-async function callAnthropicMessagesApi({ ai, model, system, messages, max_tokens = 1500, timeoutMs }) {
+async function callAnthropicMessagesApi({ ai, model, system, messages, max_tokens = 1500, timeoutMs, onRetry }) {
   return JobFillAi.callAi(ai, {
     model,
     system,
     messages,
     max_tokens,
     thinking: { type: "disabled" },
-    ...(timeoutMs ? { timeoutMs } : {})
+    ...(timeoutMs ? { timeoutMs } : {}),
+    ...(onRetry ? { onRetry } : {})
   });
 }
 

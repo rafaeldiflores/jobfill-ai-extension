@@ -4298,6 +4298,7 @@
     ["validar", "Verificar reglas y 1 página"],
     ["ajustar", "Ajustar lo que no pasa"],
     ["pdf", "Generar el PDF (queda en tu vault)"],
+    ["revisar", "Revisar el CV (tú decides si se adjunta)"],
     ["adjuntar", "Adjuntar el PDF al formulario"],
     ["rellenar", "Autorrellenar el formulario"]
   ];
@@ -4311,12 +4312,28 @@
     .jf-steps li.is-done { color: #94a3b8; }
     .jf-steps li.is-done::before { content: "✓"; color: #34d399; }
     .jf-steps li.is-skip { display: none; }
+    .jf-steps li.is-error { color: #fca5a5; font-weight: 600; }
+    .jf-steps li.is-error::before { content: "✗"; color: #f87171; }
     .jf-detail { margin: 10px 0 0 !important; min-height: 18px; }
     .jf-result { margin-top: 14px; display: grid; gap: 8px; font-size: 12.5px; color: #cbd5e1; }
     .jf-result .ok { color: #6ee7b7; }
     .jf-result .warn { color: #fbbf24; }
     .jf-result .err { color: #fca5a5; }
     .jf-result ul { margin: 0; padding-left: 18px; }
+    .jobfill-confirm.is-wide { width: min(880px, 100%); }
+    /* Con la vista previa el diálogo se alarga: los botones quedan fijos abajo. */
+    .jobfill-confirm.is-wide .jobfill-confirm-actions { position: sticky; bottom: -22px; margin: 14px -22px -22px; padding: 12px 22px; background: #0f172a; border-top: 1px solid rgba(148, 163, 184, 0.18); flex-wrap: wrap; }
+    .jf-preview { margin-top: 14px; padding: 14px; border-radius: 12px; background: #334155; max-height: 62vh; overflow: auto; }
+    .jf-preview-bar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin: 0 0 10px; font-size: 12px; color: #cbd5e1; }
+    .jf-preview-bar .warn { color: #fbbf24; }
+    .jf-paper { display: block; margin: 0 auto; width: 8.5in; min-height: 11in; box-sizing: border-box; padding: 1.27cm; background: #fff; box-shadow: 0 10px 30px -10px rgba(2, 6, 23, 0.6); }
+    .jf-preview-empty { font-size: 12.5px; color: #cbd5e1; }
+    .jf-revise { margin-top: 14px; }
+    .jf-revise label { display: block; font-size: 12.5px; font-weight: 600; color: #e2e8f0; margin-bottom: 6px; }
+    .jf-revise textarea { box-sizing: border-box; width: 100%; min-height: 64px; resize: vertical; padding: 9px 11px; border-radius: 10px; border: 1px solid rgba(148, 163, 184, 0.3); background: #1e293b; color: #f8fafc; font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+    .jf-revise textarea:focus { outline: 2px solid #818cf8; outline-offset: 1px; }
+    .jf-revise-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-top: 8px; font-size: 11.5px; color: #94a3b8; }
+    .jf-revise-row button { flex: 0 0 auto; }
     .jf-register { margin-top: 14px; padding-top: 12px; border-top: 1px solid rgba(148, 163, 184, 0.18); }
     [hidden] { display: none !important; }`;
 
@@ -4335,11 +4352,23 @@
         <ul class="jf-steps">${APPLY_STEPS.map(([id, label]) => `<li data-step="${id}">${label}</li>`).join("")}</ul>
         <p class="jf-detail"></p>
         <div class="jf-result" hidden></div>
+        <div class="jf-preview" hidden></div>
+        <div class="jf-revise" hidden>
+          <label for="jf-revise-text">✎ ¿Quieres cambiar algo del CV?</label>
+          <textarea id="jf-revise-text" maxlength="1000" placeholder="Ej: acorta el resumen, pon MAZA antes que MedInfo, usa &quot;APIs REST&quot; como dice la oferta…"></textarea>
+          <div class="jf-revise-row">
+            <span>Se aplica solo con hechos de tu BASE y vuelve a pasar por el verificador.</span>
+            <button class="jobfill-confirm-cancel" type="button" data-act="revise">✎ Aplicar cambio</button>
+          </div>
+        </div>
         <div class="jf-register" hidden>
           <div class="jobfill-field"><label for="jf-ap-empresa">Empresa</label><input type="text" id="jf-ap-empresa" spellcheck="false"></div>
           <div class="jobfill-field"><label for="jf-ap-cargo">Cargo</label><input type="text" id="jf-ap-cargo" spellcheck="false"></div>
         </div>
         <div class="jobfill-confirm-actions">
+          <button class="jobfill-confirm-ok" type="button" data-act="attach" hidden>✓ Se ve bien: adjuntar y rellenar</button>
+          <button class="jobfill-confirm-ok" type="button" data-act="retry" hidden>↻ Reintentar</button>
+          <button class="jobfill-confirm-cancel" type="button" data-act="open" hidden>↗ Abrir PDF</button>
           <button class="jobfill-confirm-ok" type="button" data-act="register" hidden>📌 Registrar en el Tracker</button>
           <button class="jobfill-confirm-cancel" type="button" data-act="download" hidden>⬇ Descargar PDF</button>
           <button class="jobfill-confirm-cancel" type="button" data-act="close">Cerrar</button>
@@ -4358,12 +4387,15 @@
       setStep(step, detail = "") {
         const idx = order.indexOf(step);
         if (idx === -1) return;
+        // Un solo paso activo: al pedir un cambio el flujo vuelve de
+        // "Revisar" a "Verificar"/"Ajustar".
+        shadow.querySelectorAll(".jf-steps li.is-active").forEach(li => li.classList.replace("is-active", "is-done"));
         order.forEach((id, i) => {
           const li = $s(`[data-step="${id}"]`);
           if (i < idx && li.classList.contains("is-active")) li.classList.replace("is-active", "is-done");
           else if (i < idx && !li.classList.contains("is-done")) li.classList.add(id === "ajustar" || id === "perfil" ? "is-skip" : "is-done");
         });
-        $s(`[data-step="${step}"]`).classList.remove("is-skip");
+        $s(`[data-step="${step}"]`).classList.remove("is-skip", "is-error");
         $s(`[data-step="${step}"]`).classList.add("is-active");
         current = idx;
         $s(".jf-detail").textContent = detail;
@@ -4378,6 +4410,95 @@
           }
         });
         $s(".jf-detail").textContent = "";
+      },
+      /** Marca en rojo el paso en curso (el que falló). */
+      markError() {
+        const li = shadow.querySelector(".jf-steps li.is-active");
+        if (li) li.classList.replace("is-active", "is-error");
+      },
+      clearResult() {
+        const box = $s(".jf-result");
+        box.replaceChildren();
+        box.hidden = true;
+      },
+      showRetry(label, onRetry) {
+        const btn = $s('[data-act="retry"]');
+        btn.textContent = label;
+        btn.disabled = false;
+        btn.hidden = false;
+        btn.onclick = () => { btn.disabled = true; onRetry(); };
+      },
+      hideRetry() { $s('[data-act="retry"]').hidden = true; },
+      /**
+       * Vista previa del CV con la misma plantilla del PDF. Va en su propio
+       * Shadow DOM: ni el CSS del portal ni el del diálogo la alteran.
+       */
+      showPreview(html, { paginas } = {}) {
+        const box = $s(".jf-preview");
+        box.replaceChildren();
+        const bar = document.createElement("div");
+        bar.className = "jf-preview-bar";
+        const title = document.createElement("span");
+        title.textContent = "Vista previa (misma plantilla del PDF)";
+        const pages = document.createElement("span");
+        if (paginas) {
+          pages.textContent = paginas === 1 ? "1 página" : `${paginas} páginas`;
+          if (paginas > 1) pages.className = "warn";
+        }
+        bar.append(title, pages);
+        box.appendChild(bar);
+
+        const cv = sanitizeCvHtml(html);
+        if (!cv) {
+          const empty = document.createElement("p");
+          empty.className = "jf-preview-empty";
+          empty.textContent = "Tu postulador no devolvió la vista previa. Revisa el PDF con ↗ Abrir PDF o ⬇ Descargar PDF antes de adjuntarlo.";
+          box.appendChild(empty);
+        } else {
+          const paper = document.createElement("div");
+          paper.className = "jf-paper";
+          const root = paper.attachShadow({ mode: "open" });
+          const style = document.createElement("style");
+          style.textContent = cv.css;
+          root.append(style, cv.body);
+          box.appendChild(paper);
+          // A escala del ancho disponible (la hoja Carta mide 816 px).
+          requestAnimationFrame(() => {
+            const avail = box.clientWidth - 28;
+            paper.style.zoom = String(Math.min(1, Math.max(0.4, avail / 816)));
+          });
+        }
+        $s(".jobfill-confirm").classList.add("is-wide");
+        box.hidden = false;
+      },
+      showOpen(onOpen) {
+        const btn = $s('[data-act="open"]');
+        btn.hidden = false;
+        btn.onclick = onOpen;
+      },
+      showRevise(onSubmit) {
+        const box = $s(".jf-revise");
+        const text = $s("#jf-revise-text");
+        const btn = $s('[data-act="revise"]');
+        box.hidden = false;
+        btn.disabled = false;
+        btn.onclick = () => {
+          const value = text.value.trim();
+          if (!value) { text.focus(); return; }
+          onSubmit(value);
+          text.value = "";
+        };
+      },
+      /** Oculta lo que depende del CV mostrado mientras se genera otro. */
+      hideReviewActions() {
+        for (const act of ["attach", "open", "download", "retry"]) $s(`[data-act="${act}"]`).hidden = true;
+        $s(".jf-revise").hidden = true;
+      },
+      showAttach(onAttach) {
+        const btn = $s('[data-act="attach"]');
+        btn.hidden = false;
+        btn.disabled = false;
+        btn.onclick = () => { btn.hidden = true; $s(".jf-revise").hidden = true; onAttach(); };
       },
       showResult(lines) {
         const box = $s(".jf-result");
@@ -4516,6 +4637,42 @@
     return { attached: true, kind: "dropzone" };
   }
 
+  /**
+   * HTML de la vista previa (viene de TU postulador, pero igual se trata
+   * como no confiable): sin scripts, iframes ni atributos on*, enlaces a
+   * pestaña nueva. Las reglas de `html`/`body` se reescriben a `.cv-body`
+   * porque dentro de un Shadow DOM no existen esos elementos.
+   */
+  function sanitizeCvHtml(html) {
+    if (!html || typeof html !== "string") return null;
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const css = [...doc.querySelectorAll("style")].map(st => st.textContent).join("\n")
+      .replace(/@page[^{]*\{[^}]*\}/g, "")
+      .replace(/(^|[\s,}])html\s*\{/g, "$1.cv-html {")
+      .replace(/(^|[\s,}])body\s*\{/g, "$1.cv-body {");
+    doc.querySelectorAll("script, iframe, object, embed, link, meta, base, form, style").forEach(n => n.remove());
+    // La plantilla no usa imágenes; una externa haría una petición desde el portal.
+    doc.querySelectorAll("img").forEach(img => { if (!/^data:image\//i.test(img.getAttribute("src") || "")) img.remove(); });
+    for (const el of doc.body.querySelectorAll("*")) {
+      for (const attr of [...el.attributes]) {
+        if (/^on/i.test(attr.name) || /^\s*javascript:/i.test(attr.value)) el.removeAttribute(attr.name);
+      }
+      if (el.tagName === "A") { el.target = "_blank"; el.rel = "noopener noreferrer"; }
+    }
+    if (!doc.body.textContent.trim()) return null;
+    const body = document.createElement("div");
+    body.className = "cv-body cv-html";
+    body.append(...[...doc.body.childNodes].map(n => document.importNode(n, true)));
+    return { css, body };
+  }
+
+  /** Abre el PDF en una pestaña nueva (visor de PDF del navegador). */
+  function openPdf(base64) {
+    const url = URL.createObjectURL(new Blob([base64ToBytes(base64)], { type: "application/pdf" }));
+    window.open(url, "_blank", "noopener");
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  }
+
   function downloadPdf(base64, fileName) {
     const url = URL.createObjectURL(new Blob([base64ToBytes(base64)], { type: "application/pdf" }));
     const a = document.createElement("a");
@@ -4566,61 +4723,116 @@
     ui.setOffer(`${cargo || "Cargo sin detectar"}${empresa ? ` · ${empresa}` : ""}${job.fromCache ? " (oferta guardada)" : ""}`);
     ui.setStep("contexto", "Conectando con tu vault…");
 
-    try {
-      const res = await sendToWorker("APPLY_ADAPT_CV", { oferta, empresa, cargo });
-      if (!res?.success) throw new Error(res?.error || "No se pudo adaptar el CV.");
+    // Cada intento pide al worker que adapte; "Reintentar" repite con
+    // `resume: true` y el worker sigue desde su punto de control (no vuelve a
+    // adaptar ni a gastar lo que ya salió bien).
+    const requestChange = cambio => {
+      ui.setStep("revisar", "Aplicando tu cambio…");
+      attempt({ resume: true, cambio });
+    };
 
-      if (!res.ok) {
-        ui.finishSteps("validar");
-        ui.showResult([
-          { text: "✗ El CV adaptado no pasa las reglas de tu verificador, así que no se generó el PDF.", tone: "err", items: res.hallazgos.filter(h => h.nivel === "error").map(h => h.detalle) },
-          { text: "Ábrelo en el Postulador de claude.ai para ajustarlo a mano; el formulario no se tocó." }
-        ]);
-        return;
-      }
-
-      ui.setStep("adjuntar", "Buscando el campo para subir el CV…");
-      const attach = await sendToWorker("APPLY_ATTACH_CV", { base64: res.base64, archivo: res.archivo });
-      ui.setStep("rellenar", "Rellenando el resto del formulario…");
-      const fill = await executeAutofill();
-      ui.finishSteps();
-
-      const warnings = res.hallazgos.filter(h => h.nivel !== "error").map(h => h.detalle);
-      ui.showResult([
-        { text: `✓ CV ${res.perfil} adaptado${res.ajustado ? " (con un ajuste automático)" : ""} y guardado en tu vault: cv/generados/${res.archivo}`, tone: "ok" },
-        attach.attached
-          ? { text: `✓ PDF adjuntado al campo del CV${attach.inFrame ? " (formulario embebido)" : ""}. Revísalo antes de enviar.`, tone: "ok" }
-          : attach.pending
-            ? { text: "⏳ Este paso del formulario aún no pide el CV: se adjuntará solo cuando aparezca el campo (en esta pestaña, durante 30 min).", tone: "warn" }
-            : { text: `⚠ No se adjuntó automáticamente: ${attach.reason || attach.error || "error desconocido"}. Descárgalo y súbelo a mano.`, tone: "warn" },
-        { text: fill?.count ? `✓ ${fill.count === 1 ? "1 campo del formulario rellenado" : `${fill.count} campos del formulario rellenados`}.` : "Formulario sin campos vacíos que rellenar." },
-        res.cobertura ? { text: `Requisitos de la oferta respaldados por tu grafo: ${res.cobertura}` } : null,
-        res.faltantes?.length ? { text: "Sin respaldo en tu BASE (no se mencionan en el CV):", tone: "warn", items: res.faltantes } : null,
-        warnings.length ? { text: "Avisos del verificador:", tone: "warn", items: warnings } : null
-      ].filter(Boolean));
-
-      ui.showDownload(() => downloadPdf(res.base64, res.archivo));
-      ui.showRegister(res.empresa || empresa, res.cargo || cargo, async (emp, car, regBtn) => {
-        if (!emp || !car) return;
-        regBtn.disabled = true;
-        const r = await sendToWorker("VAULT_REGISTER_APPLICATION", {
-          empresa: emp, cargo: car, url: location.href, canal: location.hostname.replace(/^www\./, ""),
-          cvPerfil: res.perfil, cvPdf: res.archivo, area: res.area, keywordsCubiertas: res.cobertura
-        });
-        if (r?.success) {
-          regBtn.textContent = "✓ Registrada";
-          showToast(`📌 Registrada en tu Tracker: ${r.name}`, "success");
-        } else {
-          regBtn.disabled = false;
-          showToast(r?.error || "No se pudo registrar la postulación.", "error");
+    const attempt = async (payload) => {
+      ui.hideReviewActions();
+      ui.clearResult();
+      btn.disabled = true;
+      try {
+        const res = await sendToWorker("APPLY_ADAPT_CV", payload);
+        if (!res?.success) {
+          const err = new Error(res?.error || "No se pudo adaptar el CV.");
+          err.retryable = Boolean(res?.retryable);
+          throw err;
         }
+
+        if (!res.ok) {
+          ui.finishSteps("validar");
+          ui.showResult([
+            { text: "✗ El CV adaptado no pasa las reglas de tu verificador, así que no se generó el PDF.", tone: "err", items: res.hallazgos.filter(h => h.nivel === "error").map(h => h.detalle) },
+            { text: res.canRetry
+              ? "Puedes pedir otro ajuste automático, o abrirlo en el Postulador de claude.ai para ajustarlo a mano. El formulario no se tocó."
+              : "Ábrelo en el Postulador de claude.ai para ajustarlo a mano; el formulario no se tocó." }
+          ]);
+          ui.showPreview(res.html, { paginas: res.paginas });
+          ui.showRevise(requestChange);
+          if (res.canRetry) ui.showRetry("↻ Intentar otro ajuste", () => { ui.setStep("ajustar", "Pidiendo otro ajuste…"); attempt({ resume: true }); });
+          return;
+        }
+
+        // Pausa: nada se adjunta sin que el usuario vea el CV y lo apruebe.
+        ui.setStep("revisar", "Revisa el CV. No se adjunta nada hasta que confirmes.");
+        ui.showResult(cvSummaryLines(res));
+        ui.showPreview(res.html, { paginas: res.paginas });
+        ui.showDownload(() => downloadPdf(res.base64, res.archivo));
+        ui.showOpen(() => openPdf(res.base64));
+        ui.showRevise(requestChange);
+        ui.showAttach(() => completeApplyFlow(ui, res, { empresa, cargo }).catch(err => {
+          ui.markError();
+          clearFlowDetail(ui);
+          ui.showResult([{ text: `✗ ${err.message}`, tone: "err" }, { text: "El PDF sigue disponible: descárgalo y súbelo a mano." }]);
+        }));
+      } catch (err) {
+        ui.markError();
+        clearFlowDetail(ui);
+        ui.showResult([
+          { text: `✗ ${err.message}`, tone: "err" },
+          err.retryable ? { text: "Lo que ya estaba listo (perfil, CV adaptado, verificación) quedó guardado: Reintentar sigue desde el paso que falló." } : null
+        ].filter(Boolean));
+        if (err.retryable) ui.showRetry("↻ Reintentar", () => attempt({ resume: true }));
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    await attempt({ oferta, empresa, cargo });
+  }
+
+  /** Resumen del CV generado: primera línea + cobertura, faltantes y avisos. */
+  function cvSummaryLines(res) {
+    const warnings = res.hallazgos.filter(h => h.nivel !== "error").map(h => h.detalle);
+    return [
+      { text: `✓ CV ${res.perfil} adaptado${res.cambios ? ` con ${res.cambios === 1 ? "tu cambio" : `tus ${res.cambios} cambios`}` : ""}${res.ajustado ? " (con un ajuste automático)" : ""} y guardado en tu vault: cv/generados/${res.archivo}`, tone: "ok" },
+      res.nota ? { text: `Sobre tu cambio: ${res.nota}`, tone: "warn" } : null,
+      res.cobertura ? { text: `Requisitos de la oferta respaldados por tu grafo: ${res.cobertura}` } : null,
+      res.faltantes?.length ? { text: "Sin respaldo en tu BASE (no se mencionan en el CV):", tone: "warn", items: res.faltantes } : null,
+      warnings.length ? { text: "Avisos del verificador:", tone: "warn", items: warnings } : null
+    ].filter(Boolean);
+  }
+
+  /** Con el PDF listo: adjuntar, autorrellenar, mostrar el resultado y ofrecer descarga y registro. */
+  async function completeApplyFlow(ui, res, { empresa, cargo }) {
+    ui.setStep("adjuntar", "Buscando el campo para subir el CV…");
+    const attach = await sendToWorker("APPLY_ATTACH_CV", { base64: res.base64, archivo: res.archivo });
+    ui.setStep("rellenar", "Rellenando el resto del formulario…");
+    const fill = await executeAutofill();
+    ui.finishSteps();
+
+    const [cvLine, ...details] = cvSummaryLines(res);
+    ui.showResult([
+      cvLine,
+      attach.attached
+        ? { text: `✓ PDF adjuntado al campo del CV${attach.inFrame ? " (formulario embebido)" : ""}. Revísalo antes de enviar.`, tone: "ok" }
+        : attach.pending
+          ? { text: "⏳ Este paso del formulario aún no pide el CV: se adjuntará solo cuando aparezca el campo (en esta pestaña, durante 30 min).", tone: "warn" }
+          : { text: `⚠ No se adjuntó automáticamente: ${attach.reason || attach.error || "error desconocido"}. Descárgalo y súbelo a mano.`, tone: "warn" },
+      { text: fill?.count ? `✓ ${fill.count === 1 ? "1 campo del formulario rellenado" : `${fill.count} campos del formulario rellenados`}.` : "Formulario sin campos vacíos que rellenar." },
+      ...details
+    ]);
+
+    ui.showDownload(() => downloadPdf(res.base64, res.archivo));
+    ui.showRegister(res.empresa || empresa, res.cargo || cargo, async (emp, car, regBtn) => {
+      if (!emp || !car) return;
+      regBtn.disabled = true;
+      const r = await sendToWorker("VAULT_REGISTER_APPLICATION", {
+        empresa: emp, cargo: car, url: location.href, canal: location.hostname.replace(/^www\./, ""),
+        cvPerfil: res.perfil, cvPdf: res.archivo, area: res.area, keywordsCubiertas: res.cobertura
       });
-    } catch (err) {
-      ui.showResult([{ text: `✗ ${err.message}`, tone: "err" }]);
-      clearFlowDetail(ui);
-    } finally {
-      btn.disabled = false;
-    }
+      if (r?.success) {
+        regBtn.textContent = "✓ Registrada";
+        showToast(`📌 Registrada en tu Tracker: ${r.name}`, "success");
+      } else {
+        regBtn.disabled = false;
+        showToast(r?.error || "No se pudo registrar la postulación.", "error");
+      }
+    });
   }
 
   function clearFlowDetail(ui) {

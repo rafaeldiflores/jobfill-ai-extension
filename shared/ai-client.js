@@ -235,6 +235,39 @@
       lower.includes("credit balance") || lower.includes("billing") || lower.includes("overloaded");
   }
 
+  /**
+   * Límite por minuto (429) o Anthropic saturado (529): se espera lo que
+   * pide el servidor y se reintenta el MISMO pedido, hasta 2 veces. Pasa
+   * seguido en "Postular": adaptar el CV manda la BASE completa (decenas de
+   * miles de tokens de entrada) y el ajuste llega segundos después, dentro
+   * del mismo minuto. Esperas de más de un minuto no se reintentan aquí: ahí
+   * el usuario decide (botón Reintentar) o responde Gemini.
+   */
+  const RATE_LIMIT_RETRIES = 2;
+  const RATE_LIMIT_MAX_WAIT_MS = 60000;
+  const RATE_LIMIT_DEFAULT_WAIT_MS = 15000;
+
+  /** Milisegundos a esperar según `retry-after` (segundos o fecha HTTP), o null. */
+  function retryAfterMs(headers, now = Date.now()) {
+    const raw = headers?.get?.("retry-after");
+    if (!raw) return null;
+    const secs = Number(raw);
+    if (Number.isFinite(secs)) return Math.max(0, Math.round(secs * 1000));
+    const at = Date.parse(raw);
+    return Number.isFinite(at) ? Math.max(0, at - now) : null;
+  }
+
+  /** Cuánto esperar antes del reintento `attempt` (0, 1…), o null si no conviene reintentar. */
+  function rateLimitWait(status, headers, attempt) {
+    if (status !== 429 && status !== 529) return null;
+    if (attempt >= RATE_LIMIT_RETRIES) return null;
+    const asked = retryAfterMs(headers);
+    const wait = asked ?? RATE_LIMIT_DEFAULT_WAIT_MS * (attempt + 1);
+    return wait <= RATE_LIMIT_MAX_WAIT_MS ? wait : null;
+  }
+
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
   /** Error con `status` HTTP, bandera de saldo y un mensaje que el usuario pueda accionar. */
   function friendlyError(provider, status, rawMessage) {
     const raw = rawMessage || `Error ${status}`;
@@ -252,6 +285,10 @@
       }
     } else if (status === 401) {
       message = "Error 401: Tu API Key de Claude es inválida o no autorizada. Cópiala directamente desde console.anthropic.com.";
+    } else if (status === 429 && !/credit balance|billing/.test(lower)) {
+      message = `Claude: se alcanzó el límite de uso por minuto de tu cuenta (429). Espera unos segundos y pulsa Reintentar. Detalle: ${raw}`;
+    } else if (status === 529 || lower.includes("overloaded")) {
+      message = `Claude está saturado en este momento (${status}). Espera unos segundos y pulsa Reintentar.`;
     } else if (outOfCredit) {
       message = `Claude sin saldo o sin capacidad (${status}): ${raw}. Recarga saldo en console.anthropic.com o configura el respaldo con Gemini.`;
     } else {
@@ -271,11 +308,12 @@
    * la key (configuración que ese modelo no acepta). Cualquier otro error
    * fallaría igual con el siguiente, y reintentar escondería la causa.
    */
-  async function callProvider(settings, provider, { model, body, timeoutMs }) {
+  async function callProvider(settings, provider, { model, body, timeoutMs, onRetry }) {
     const candidates = buildRequests(settings, provider, model, body);
     let lastError = null;
 
-    for (const request of candidates) {
+    for (let i = 0, attempt = 0; i < candidates.length; i++) {
+      const request = candidates[i];
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
@@ -310,11 +348,26 @@
       const errorObj = Array.isArray(errorData) ? errorData[0]?.error : errorData?.error;
       const rawMessage = errorObj?.message || `${response.status} ${response.statusText}`;
 
-      console.error("[JobFill AI] La IA rechazó la petición:", {
-        provider, status: response.status, model: request.sentModel, error: errorObj || errorData
-      });
+      // En una sola línea de texto: al copiar desde la consola, un objeto
+      // suelto se pega como "[object Object]" y se pierde la causa real.
+      const errorType = errorObj?.type ? ` [${errorObj.type}]` : "";
+      console.error(`[JobFill AI] ${describeProvider(provider)} rechazó la petición — HTTP ${response.status}${errorType}, modelo "${request.sentModel}": ${rawMessage}`);
 
       lastError = friendlyError(provider, response.status, rawMessage);
+
+      // Límite por minuto / saturación de Claude: mismo pedido, tras esperar.
+      const waitMs = provider === "anthropic" && !/credit balance|billing/i.test(rawMessage)
+        ? rateLimitWait(response.status, response.headers, attempt) : null;
+      if (waitMs !== null) {
+        attempt++;
+        console.warn(`[JobFill AI] Claude pidió esperar (HTTP ${response.status}); reintento ${attempt}/${RATE_LIMIT_RETRIES} en ${Math.round(waitMs / 1000)} s.`);
+        try { onRetry?.({ status: response.status, waitMs, attempt }); } catch (e) { /* solo informativo */ }
+        await sleep(waitMs);
+        i--; // repite este mismo candidato
+        continue;
+      }
+      if (response.status === 429 || response.status === 529) lastError.rateLimited = true;
+
       const tryNextModel = response.status === 404 ||
         (provider === "gemini" && (response.status === 429 || (response.status === 400 && !/api key/i.test(rawMessage))));
       if (!tryNextModel) throw lastError;
@@ -331,7 +384,7 @@
    * `thinking` solo se envía a Anthropic; Gemini se configura por modelo
    * (ver GEMINI_MODELS).
    */
-  async function callAi(settings, { model, system, messages, max_tokens = 1500, thinking, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+  async function callAi(settings, { model, system, messages, max_tokens = 1500, thinking, timeoutMs = DEFAULT_TIMEOUT_MS, onRetry }) {
     const problem = aiSettingsProblem(settings);
     if (problem) throw new Error(problem);
 
@@ -339,14 +392,15 @@
     if (system) body.system = system;
 
     if (settings.provider === "gemini") {
-      return callProvider(settings, "gemini", { model, body, timeoutMs });
+      return callProvider(settings, "gemini", { model, body, timeoutMs, onRetry });
     }
 
     try {
       return await callProvider(settings, "anthropic", {
         model,
         body: thinking ? { ...body, thinking } : body,
-        timeoutMs
+        timeoutMs,
+        onRetry
       });
     } catch (claudeError) {
       if (!claudeError.outOfCredit || !hasGeminiFallback(settings)) throw claudeError;
@@ -372,6 +426,8 @@
     hasGeminiFallback,
     describeProvider,
     isCreditOrCapacityError,
+    retryAfterMs,
+    rateLimitWait,
     toGeminiRequest,
     fromGeminiResponse,
     buildRequests,

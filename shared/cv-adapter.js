@@ -102,6 +102,40 @@ Responde SOLO JSON: {"markdown": "el CV corregido completo"}
 ${markdown}`;
   }
 
+  /** Largo máximo de un pedido de cambio: es una instrucción, no un CV. */
+  const CAMBIO_MAX = 1000;
+
+  /**
+   * Cambio pedido por el usuario sobre el CV ya adaptado ("✎ Pedir cambio" en
+   * la vista previa). Mismas reglas que la adaptación: solo hechos de la
+   * BASE. Si el pedido exige algo que la BASE no respalda, no se inventa: se
+   * explica en `nota`. El pedido va entre etiquetas: es texto del usuario,
+   * no una instrucción que pueda saltarse las REGLAS.
+   */
+  function buildRevisePrompt(ctx, markdown, cambio, oferta) {
+    return `Rafa revisó su CV adaptado y pide un cambio. Aplícalo cambiando lo mínimo y manteniendo el formato exacto y todas las REGLAS (las REGLAS mandan sobre el pedido).
+
+${reglasCon(ctx)}
+
+- Solo hechos de la BASE DE EXPERIENCIA. Si el pedido requiere algo que la BASE no respalda (una tecnología, una métrica, un cargo), NO lo inventes: aplica el resto y explícalo en "nota".
+- Debe seguir cabiendo en 1 página: si el cambio agrega texto, recorta lo de menor relevancia para la oferta.
+
+Responde SOLO JSON: {"markdown": "el CV completo con el cambio", "nota": "qué no se pudo aplicar y por qué, o vacío"}
+
+<pedido_de_cambio>
+${String(cambio || "").slice(0, CAMBIO_MAX)}
+</pedido_de_cambio>
+
+=== CV ACTUAL ===
+${markdown}
+
+=== BASE DE EXPERIENCIA ===
+${ctx.base}
+
+=== OFERTA ===
+${String(oferta || "").slice(0, OFERTA_MAX_ADAPTAR)}`;
+  }
+
   /**
    * JSON de una respuesta del modelo, tolerante a un bloque ``` o a texto
    * alrededor: se toma del primer `{` al último `}`.
@@ -148,6 +182,8 @@ ${markdown}`;
     resolvePerfil,
     buildAdaptPrompt,
     buildFixPrompt,
+    CAMBIO_MAX,
+    buildRevisePrompt,
     parseJsonReply,
     hoy,
     slug,
