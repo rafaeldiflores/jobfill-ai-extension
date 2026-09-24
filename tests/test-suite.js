@@ -645,28 +645,32 @@ it("Translates Messages API requests to Gemini generateContent on Vertex AI expr
     ] }]
   };
 
-  const [pro, flash] = ai.buildRequests(settings, "gemini", "claude-sonnet-5", body);
-  assert.strictEqual(pro.url, "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-pro:generateContent");
-  assert.strictEqual(pro.headers["x-goog-api-key"], "AQ.test-key");
-  assert.strictEqual("x-api-key" in pro.headers, false);
-  assert.strictEqual(flash.sentModel, "gemini-2.5-flash");
+  const sonnetReqs = ai.buildRequests(settings, "gemini", "claude-sonnet-5", body);
+  assert.strictEqual(JSON.stringify(sonnetReqs.map(r => r.sentModel)),
+    JSON.stringify(["gemini-3.8-flash", "gemini-3.8-flash-preview", "gemini-2.5-flash"]));
+  const [flash38] = sonnetReqs;
+  assert.strictEqual(flash38.url, "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-3.8-flash:generateContent");
+  assert.strictEqual(flash38.headers["x-goog-api-key"], "AQ.test-key");
+  assert.strictEqual("x-api-key" in flash38.headers, false);
 
-  const req = pro.body;
+  const req = flash38.body;
   assert.strictEqual(JSON.stringify(req.systemInstruction), JSON.stringify({ parts: [{ text: "Reglas" }] }));
   assert.strictEqual(req.contents[0].role, "user");
   assert.strictEqual(JSON.stringify(req.contents[0].parts), JSON.stringify([
     { text: "Perfil" }, { inlineData: { mimeType: "image/png", data: "iVBOR" } }, { text: "Pregunta" }
   ]));
-  // Pro no permite apagar el razonamiento: se le da margen extra de salida.
-  assert.strictEqual(req.generationConfig.thinkingConfig.thinkingBudget, 128);
+  // Gemini 3 no permite apagar el razonamiento: nivel bajo + margen de salida.
+  assert.strictEqual(req.generationConfig.thinkingConfig.thinkingLevel, "low");
   assert.ok(req.generationConfig.maxOutputTokens > 300);
 
-  // Haiku → Flash, con el razonamiento apagado y el presupuesto tal cual.
-  const [haiku] = ai.buildRequests(settings, "gemini", "claude-haiku-4-5", { max_tokens: 60, messages: [{ role: "assistant", content: "x" }] });
-  assert.strictEqual(haiku.sentModel, "gemini-2.5-flash");
-  assert.strictEqual(haiku.body.generationConfig.thinkingConfig.thinkingBudget, 0);
-  assert.strictEqual(haiku.body.generationConfig.maxOutputTokens, 60);
-  assert.strictEqual(haiku.body.contents[0].role, "model");
+  // Haiku → 3.8 Flash con razonamiento mínimo; 2.5 Flash (último recurso) sin razonar.
+  const haikuReqs = ai.buildRequests(settings, "gemini", "claude-haiku-4-5", { max_tokens: 60, messages: [{ role: "assistant", content: "x" }] });
+  assert.strictEqual(haikuReqs[0].body.generationConfig.thinkingConfig.thinkingLevel, "minimal");
+  assert.strictEqual(haikuReqs[0].body.contents[0].role, "model");
+  const last = haikuReqs[haikuReqs.length - 1];
+  assert.strictEqual(last.sentModel, "gemini-2.5-flash");
+  assert.strictEqual(last.body.generationConfig.thinkingConfig.thinkingBudget, 0);
+  assert.strictEqual(last.body.generationConfig.maxOutputTokens, 60);
 
   // Respuesta: las partes de razonamiento (`thought`) nunca llegan como texto.
   const parsed = ai.fromGeminiResponse({
@@ -694,7 +698,7 @@ it("Falls back to Gemini only when Claude runs out of credit or capacity, and sa
   claudeReply = () => jsonResponse(400, { error: { type: "invalid_request_error", message: "Your credit balance is too low to access the Anthropic API." } });
   const data = await ai.callAi(settings, request);
   assert.strictEqual(data._provider, "gemini");
-  assert.strictEqual(data._model, "gemini-2.5-flash");
+  assert.strictEqual(data._model, "gemini-3.8-flash");
   assert.match(data._fallbackReason, /credit balance/);
   assert.strictEqual(data.content[0].text, "Respuesta de Gemini");
   assert.strictEqual(calls.length, 2);
@@ -729,23 +733,34 @@ it("Falls back to Gemini only when Claude runs out of credit or capacity, and sa
   assert.strictEqual(calls.length, 1);
 });
 
-it("Within Gemini, moves from Pro to Flash on 404/429 but stops on an invalid key", async () => {
+it("Within Gemini, walks 3.8 Flash → preview → 2.5 Flash on 404/429/400, but stops on an invalid key", async () => {
   const calls = [];
-  let proReply;
+  let replies;
   const ai = loadRealAiClient(async url => {
     calls.push(url);
-    return url.includes("gemini-2.5-pro") ? proReply() : geminiOk("desde flash");
+    const model = url.match(/models\/([^:]+):/)[1];
+    return (replies[model] || (() => geminiOk(`desde ${model}`)))();
   });
   const settings = ai.readAiSettings({ aiProvider: "gemini", vertexApiKey: "AQ.k" });
   const request = { model: "claude-sonnet-5", messages: [{ role: "user", content: "hola" }] };
 
-  proReply = () => jsonResponse(429, [{ error: { code: 429, message: "Resource exhausted", status: "RESOURCE_EXHAUSTED" } }]);
+  // 3.8 no existe con ese ID, la preview no acepta la config → cae a 2.5 Flash.
+  replies = {
+    "gemini-3.8-flash": () => jsonResponse(404, { error: { code: 404, message: "Publisher model not found" } }),
+    "gemini-3.8-flash-preview": () => jsonResponse(400, [{ error: { code: 400, message: "Invalid thinking level", status: "INVALID_ARGUMENT" } }])
+  };
   const data = await ai.callAi(settings, request);
   assert.strictEqual(data._model, "gemini-2.5-flash");
-  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls.length, 3);
 
+  // Cuota del primero agotada → el siguiente responde.
   calls.length = 0;
-  proReply = () => jsonResponse(400, { error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT" } });
+  replies = { "gemini-3.8-flash": () => jsonResponse(429, { error: { message: "Resource exhausted" } }) };
+  assert.strictEqual((await ai.callAi(settings, request))._model, "gemini-3.8-flash-preview");
+
+  // Key inválida: se corta al primer intento.
+  calls.length = 0;
+  replies = { "gemini-3.8-flash": () => jsonResponse(400, { error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT" } }) };
   await assert.rejects(ai.callAi(settings, request), /API Key de Vertex AI/);
   assert.strictEqual(calls.length, 1);
 });

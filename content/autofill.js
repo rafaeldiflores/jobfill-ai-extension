@@ -1396,6 +1396,19 @@
   // servía de nada en cualquier página remotamente dinámica.
   let widgetDismissed = false;
 
+  /**
+   * Interruptor global (popup o botón ⏻ del widget). Arranca en `false` y
+   * solo pasa a `true` después de leer storage: así, en una instalación
+   * apagada, el widget nunca alcanza a parpadear en pantalla al cargar.
+   * `widgetCollapsed` es la preferencia de ver el widget minimizado a un
+   * botón redondo; vale para todas las páginas.
+   */
+  let extensionEnabled = false;
+  let widgetCollapsed = false;
+
+  /** Referencias a nodos dentro del Shadow DOM del widget (null si no existe). */
+  let widgetRefs = null;
+
   let currentActiveTarget = null;
   let repositionListenerAttached = false;
 
@@ -2270,7 +2283,9 @@
       align-items: center;
       justify-content: center;
       padding: 20px;
-      background: rgba(15, 23, 42, 0.55);
+      background: rgba(15, 23, 42, 0.5);
+      backdrop-filter: blur(3px);
+      -webkit-backdrop-filter: blur(3px);
       animation: jf-fade-in 0.15s ease;
     }
     .jobfill-confirm {
@@ -2279,18 +2294,22 @@
       max-height: 90vh;
       overflow-y: auto;
       padding: 22px;
-      border-radius: 14px;
+      border-radius: 16px;
       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
       color: #f8fafc;
       background: #0f172a;
-      border: 1px solid rgba(255, 255, 255, 0.12);
-      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.45);
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      box-shadow: 0 24px 60px -16px rgba(2, 6, 23, 0.7), 0 2px 8px rgba(2, 6, 23, 0.3);
       animation: jf-pop-in 0.2s cubic-bezier(0.16, 1, 0.3, 1);
     }
     .jobfill-confirm h3 {
       margin: 0 0 6px;
-      font-size: 15px;
+      font-size: 15.5px;
       font-weight: 700;
+      letter-spacing: 0.01em;
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .jobfill-overlay, .jobfill-confirm { animation: none; }
     }
     .jobfill-confirm p {
       margin: 0 0 14px;
@@ -2337,7 +2356,12 @@
       transition: filter 0.15s ease;
     }
     .jobfill-confirm button:hover { filter: brightness(1.12); }
-    .jobfill-confirm-ok { color: #fff; background: #6366f1; }
+    .jobfill-confirm button:focus-visible { outline: 2px solid #a5b4fc; outline-offset: 2px; }
+    .jobfill-confirm-ok {
+      color: #fff;
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+      box-shadow: 0 6px 16px -6px rgba(99, 102, 241, 0.7);
+    }
     .jobfill-confirm-cancel {
       color: #cbd5e1;
       background: transparent;
@@ -3498,7 +3522,7 @@
    * para que el chip nunca muestre un cargo que ya no está vigente.
    */
   async function refreshCacheChip() {
-    const chip = document.querySelector(".jobfill-cache-chip");
+    const chip = widgetRefs?.chip;
     if (!chip) return;
 
     const contexts = await loadJobContexts();
@@ -3510,8 +3534,8 @@
     }
 
     chip.hidden = false;
-    chip.querySelector(".jobfill-cache-chip-text").textContent =
-      `📄 ${latest.title}${latest.company ? ` — ${latest.company}` : ""}`;
+    widgetRefs.chipText.textContent = `${latest.title}${latest.company ? ` — ${latest.company}` : ""}`;
+    chip.title = `Cargo guardado: ${widgetRefs.chipText.textContent}. Clic para ver o editar.`;
     chip.dataset.contextUrl = latest.url;
   }
 
@@ -3551,13 +3575,192 @@
 
     setTimeout(() => {
       toast.style.opacity = "0";
-      toast.style.transform = "translateX(30px)";
+      toast.style.transform = "translateY(-8px)";
       setTimeout(() => toast.remove(), 350);
     }, 3800);
   }
 
+  /**
+   * Estilos del widget flotante. Viven dentro de su Shadow DOM: antes eran
+   * clases globales en autofill.css y cualquier regla del portal sobre
+   * `button` o `div` (tamaños, fuentes, `all: unset`…) deformaba el widget.
+   */
+  const WIDGET_STYLES = `
+    :host { all: initial; }
+    * { box-sizing: border-box; }
+    [hidden] { display: none !important; }
+
+    .dock {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      z-index: 2147483640;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      color: #e2e8f0;
+      user-select: none;
+      animation: jf-rise 0.28s cubic-bezier(0.16, 1, 0.3, 1);
+    }
+
+    .panel {
+      width: 276px;
+      padding: 10px;
+      border-radius: 16px;
+      background: rgba(15, 23, 42, 0.94);
+      backdrop-filter: blur(14px) saturate(140%);
+      -webkit-backdrop-filter: blur(14px) saturate(140%);
+      border: 1px solid rgba(148, 163, 184, 0.18);
+      box-shadow: 0 18px 40px -12px rgba(2, 6, 23, 0.55), 0 2px 6px rgba(2, 6, 23, 0.25);
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 2px 2px 4px;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 12.5px;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      color: #f8fafc;
+    }
+    .logo {
+      display: inline-grid;
+      place-items: center;
+      width: 22px;
+      height: 22px;
+      border-radius: 7px;
+      font-size: 12px;
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+      box-shadow: 0 2px 8px rgba(99, 102, 241, 0.45);
+    }
+    .hdr-actions { display: inline-flex; gap: 2px; }
+    .icon {
+      display: inline-grid;
+      place-items: center;
+      width: 24px;
+      height: 24px;
+      padding: 0;
+      border: 0;
+      border-radius: 7px;
+      background: transparent;
+      color: #94a3b8;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      line-height: 1;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+    .icon:hover { background: rgba(148, 163, 184, 0.14); color: #f8fafc; }
+    .icon.power:hover { background: rgba(248, 113, 113, 0.14); color: #fca5a5; }
+
+    .job {
+      display: flex;
+      flex-direction: column;
+      gap: 1px;
+      width: 100%;
+      padding: 7px 10px;
+      border: 1px solid rgba(99, 102, 241, 0.32);
+      border-radius: 10px;
+      background: rgba(99, 102, 241, 0.1);
+      text-align: left;
+      font: inherit;
+      color: inherit;
+      cursor: pointer;
+      transition: border-color 0.15s ease, background 0.15s ease;
+    }
+    .job:hover { border-color: rgba(129, 140, 248, 0.7); background: rgba(99, 102, 241, 0.16); }
+    .job-label {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: #a5b4fc;
+    }
+    .job-text {
+      overflow: hidden;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+      font-size: 12px;
+      font-weight: 600;
+      color: #e0e7ff;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 34px;
+      padding: 8px 12px;
+      border-radius: 10px;
+      font-family: inherit;
+      font-size: 12.5px;
+      font-weight: 600;
+      line-height: 1.2;
+      cursor: pointer;
+      transition: transform 0.15s ease, filter 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+    }
+    .btn:disabled { opacity: 0.6; cursor: progress; transform: none !important; }
+    .btn.primary {
+      width: 100%;
+      border: 0;
+      color: #fff;
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+      box-shadow: 0 6px 16px -6px rgba(99, 102, 241, 0.7);
+    }
+    .btn.primary:hover { filter: brightness(1.08); transform: translateY(-1px); }
+    .row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+    .btn.secondary {
+      padding: 8px 6px;
+      white-space: nowrap;
+      font-size: 11.5px;
+      color: #e2e8f0;
+      background: rgba(30, 41, 59, 0.9);
+      border: 1px solid rgba(148, 163, 184, 0.2);
+    }
+    .btn.secondary:hover { border-color: rgba(129, 140, 248, 0.6); background: #1e293b; }
+
+    .launcher {
+      display: grid;
+      place-items: center;
+      width: 44px;
+      height: 44px;
+      padding: 0;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 50%;
+      font-size: 18px;
+      color: #fff;
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+      box-shadow: 0 10px 24px -8px rgba(99, 102, 241, 0.75), 0 2px 6px rgba(2, 6, 23, 0.3);
+      cursor: pointer;
+      transition: transform 0.18s ease, filter 0.18s ease;
+    }
+    .launcher:hover { transform: translateY(-2px) scale(1.04); filter: brightness(1.08); }
+
+    .dock[data-collapsed="true"] .panel { display: none; }
+    .dock[data-collapsed="false"] .launcher { display: none; }
+
+    button:focus-visible { outline: 2px solid #a5b4fc; outline-offset: 2px; }
+
+    @keyframes jf-rise {
+      from { opacity: 0; transform: translateY(10px) scale(0.98); }
+      to { opacity: 1; transform: none; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .dock { animation: none; }
+      .btn, .launcher, .icon, .job { transition: none; }
+    }`;
+
   function initFloatingWidget() {
-    if (widgetDismissed) return;
+    if (!extensionEnabled || widgetDismissed) return;
 
     // El observer que dispara esto corre en CADA mutación del documento —
     // salir aquí si el widget ya existe evita repetir, en páginas ajenas muy
@@ -3575,71 +3778,99 @@
     const hasForms = document.querySelector("input, textarea, select, form");
     if (!hasForms && !extractJobTitle()) return;
 
-    const container = document.createElement("div");
-    container.className = "jobfill-floating-container";
+    // El host conserva la clase `jobfill-floating-container`: el vigía del
+    // top layer y la guarda de arriba lo buscan por ella.
+    const host = document.createElement("div");
+    host.className = "jobfill-floating-container";
+    const shadow = host.attachShadow({ mode: "open" });
 
-    // Orden de inserción = orden visual (columna anclada por abajo: el primer
-    // hijo queda arriba). El botón de cerrar va primero — arriba de TODO,
-    // separado físicamente del pill — porque vivía como una "x" de 18px
-    // incrustada dentro del pill: al fallar el clic por poco, caía en el pill
-    // y disparaba el autorrelleno sin querer. Debajo va el chip de cargo en
-    // caché (si hay uno), luego captura, luego el pill de autorrelleno.
-    const closeBtn = document.createElement("button");
-    closeBtn.type = "button";
-    closeBtn.className = "jobfill-widget-close";
-    closeBtn.textContent = "✕";
-    closeBtn.title = "Cerrar (vuelve a aparecer si recargas la página)";
-    closeBtn.addEventListener("click", () => {
+    const style = document.createElement("style");
+    style.textContent = WIDGET_STYLES;
+
+    const dock = document.createElement("div");
+    dock.className = "dock";
+    dock.dataset.collapsed = String(widgetCollapsed);
+    // Todo el texto es fijo (sin datos de la página): el título del cargo se
+    // escribe después con textContent en refreshCacheChip.
+    dock.innerHTML = `
+      <button type="button" class="launcher" title="Abrir JobFill AI" aria-label="Abrir JobFill AI">⚡</button>
+      <section class="panel" aria-label="JobFill AI">
+        <header>
+          <span class="brand"><span class="logo" aria-hidden="true">⚡</span>JobFill AI</span>
+          <span class="hdr-actions">
+            <button type="button" class="icon" data-action="collapse" title="Minimizar" aria-label="Minimizar">–</button>
+            <button type="button" class="icon power" data-action="power" title="Desactivar JobFill AI en todas las páginas" aria-label="Desactivar en todas las páginas">⏻</button>
+            <button type="button" class="icon" data-action="close" title="Ocultar en esta página (vuelve al recargar)" aria-label="Ocultar en esta página">✕</button>
+          </span>
+        </header>
+        <button type="button" class="job" hidden>
+          <span class="job-label">Cargo guardado</span>
+          <span class="job-text"></span>
+        </button>
+        <button type="button" class="btn primary" data-action="autofill">⚡ Autorrellenar formulario</button>
+        <div class="row">
+          <button type="button" class="btn secondary" data-action="answer-all" title="Detecta todas las preguntas abiertas del formulario y las responde con una sola llamada a la IA">✨ Responder todas</button>
+          <button type="button" class="btn secondary" data-action="capture" title="Lee el cargo de esta página y lo guarda para usarlo al postular (atajo: Ctrl+Shift+0, configurable en chrome://extensions/shortcuts)">📄 Guardar cargo</button>
+        </div>
+      </section>`;
+
+    const $ = selector => dock.querySelector(selector);
+    const setCollapsed = collapsed => {
+      widgetCollapsed = collapsed;
+      dock.dataset.collapsed = String(collapsed);
+      chrome.storage.local.set({ widgetCollapsed: collapsed }).catch(() => {});
+    };
+
+    $(".launcher").addEventListener("click", () => setCollapsed(false));
+    $('[data-action="collapse"]').addEventListener("click", () => setCollapsed(true));
+    $('[data-action="close"]').addEventListener("click", () => {
       widgetDismissed = true;
-      container.remove();
+      teardownPageUi();
     });
-
-    const chip = document.createElement("div");
-    chip.className = "jobfill-cache-chip";
-    chip.hidden = true;
-    chip.title = "Ver / editar el cargo guardado";
-    chip.innerHTML = `<span class="jobfill-cache-chip-text"></span>`;
-    chip.addEventListener("click", async () => {
+    $('[data-action="power"]').addEventListener("click", async () => {
+      await chrome.storage.local.set({ extensionEnabled: false });
+      // No se espera a storage.onChanged: el aviso tiene que salir DESPUÉS de
+      // desmontar, y solo en esta pestaña (no en todas las abiertas).
+      applyEnabledState(false);
+      showToast("JobFill AI desactivada en todas las páginas. Reactívala desde el ícono ⚡ de la barra del navegador.", "info");
+    });
+    $(".job").addEventListener("click", async () => {
       const contexts = await loadJobContexts();
       const latest = contexts[0];
       if (!latest) return;
       openJobContextPanel({ ...latest, source: "cache" });
     });
-
-    const answerAllBtn = document.createElement("button");
-    answerAllBtn.type = "button";
-    answerAllBtn.className = "jobfill-capture-btn";
-    answerAllBtn.textContent = "✨ Responder todas";
-    answerAllBtn.title = "Detecta todas las preguntas abiertas del formulario y las responde con una sola llamada a Claude IA";
+    $('[data-action="autofill"]').addEventListener("click", () => executeAutofill());
+    const answerAllBtn = $('[data-action="answer-all"]');
     answerAllBtn.addEventListener("click", () => handleAnswerAllQuestions(answerAllBtn));
-
-    const captureBtn = document.createElement("button");
-    captureBtn.type = "button";
-    captureBtn.className = "jobfill-capture-btn";
-    captureBtn.textContent = "📄 Guardar cargo";
-    captureBtn.title = "Lee el cargo de esta página y lo guarda para usarlo al postular (atajo: Ctrl+Shift+0, configurable en chrome://extensions/shortcuts)";
+    const captureBtn = $('[data-action="capture"]');
     captureBtn.addEventListener("click", () => manualCaptureJobContext(captureBtn));
 
-    const pill = document.createElement("div");
-    pill.className = "jobfill-floating-pill";
-    pill.innerHTML = `
-      <span class="jobfill-pill-icon">⚡</span>
-      <span>JobFill AI</span>
-    `;
-    pill.addEventListener("click", () => executeAutofill());
+    widgetRefs = { host, chip: $(".job"), chipText: $(".job-text") };
 
-    container.appendChild(closeBtn);
-    container.appendChild(chip);
-    container.appendChild(answerAllBtn);
-    container.appendChild(captureBtn);
-    container.appendChild(pill);
-    attachToTopLayerHost(container);
+    shadow.append(style, dock);
+    attachToTopLayerHost(host);
     ensureTopLayerWatcher();
 
     refreshCacheChip();
   }
 
+  /** Quita de la página todo lo que la extensión dibuja de forma persistente. */
+  function teardownPageUi() {
+    document.querySelector(".jobfill-floating-container")?.remove();
+    widgetRefs = null;
+    removeAiButton();
+  }
+
+  /** Aplica el interruptor global en esta pestaña, sin recargar. */
+  function applyEnabledState(enabled) {
+    extensionEnabled = enabled;
+    if (enabled) initFloatingWidget();
+    else teardownPageUi();
+  }
+
   document.addEventListener("focusin", (e) => {
+    if (!extensionEnabled) return;
     const el = e.target;
     if (!el) return;
 
@@ -3669,6 +3900,10 @@
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (message.type === "TRIGGER_AUTOFILL") {
+      if (!extensionEnabled) {
+        sendResponse({ success: false, count: 0, disabled: true });
+        return false;
+      }
       executeAutofill().then(res => sendResponse(res));
       return true;
     }
@@ -3678,7 +3913,7 @@
       // remapeado a esa combinación) dispara la misma captura manual que el
       // botón del widget — se le pasa `null` como botón porque no hay uno
       // visible que poner en estado "cargando".
-      manualCaptureJobContext(null);
+      if (extensionEnabled) manualCaptureJobContext(null);
       return false;
     }
   });
@@ -3700,6 +3935,7 @@
 
   // Dynamic MutationObserver to monitor LinkedIn Easy Apply / Getonbrd modals & step transitions
   const observer = new MutationObserver(() => {
+    if (!extensionEnabled) return;
     initFloatingWidget();
     // Cubre las SPA: en LinkedIn o Getonbrd la pantalla de "postulación
     // enviada" aparece sin recargar la página, así que un chequeo único al
@@ -3708,9 +3944,29 @@
   });
   observer.observe(document.body, { childList: true, subtree: true });
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", initFloatingWidget);
-  } else {
-    initFloatingWidget();
-  }
+  // El interruptor se cambia desde el popup o desde otra pestaña: todas las
+  // pestañas abiertas reaccionan al instante, sin recargar.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local") return;
+    if (changes.extensionEnabled) applyEnabledState(changes.extensionEnabled.newValue !== false);
+    if (changes.widgetCollapsed) {
+      widgetCollapsed = changes.widgetCollapsed.newValue === true;
+      const dock = widgetRefs?.host.shadowRoot.querySelector(".dock");
+      if (dock) dock.dataset.collapsed = String(widgetCollapsed);
+    }
+  });
+
+  // Arranque: primero se lee el interruptor, recién después se dibuja algo.
+  chrome.storage.local.get(["extensionEnabled", "widgetCollapsed"]).then(prefs => {
+    widgetCollapsed = prefs.widgetCollapsed === true;
+    const start = () => applyEnabledState(prefs.extensionEnabled !== false);
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", start);
+    } else {
+      start();
+    }
+  }).catch(() => {
+    // Contexto de extensión invalidado (se recargó con la pestaña abierta):
+    // no hay nada que dibujar hasta que el usuario recargue la página.
+  });
 })();

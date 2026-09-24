@@ -484,8 +484,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // captura manual que el botón del widget flotante — es solo una segunda forma
 // de invocarla, así que se reenvía como un mensaje idéntico al que dispararía
 // el propio botón, en vez de duplicar la lógica de captura aquí.
-chrome.commands.onCommand.addListener((command, tab) => {
+/**
+ * Interruptor global (popup / widget): `extensionEnabled === false` apaga la
+ * extensión en todas las pestañas. El content script reacciona solo al cambio
+ * de storage; aquí solo se refleja en el ícono, para que se note sin abrir
+ * el popup que está apagada.
+ */
+function renderActionBadge(enabled) {
+  chrome.action.setBadgeText({ text: enabled ? "" : "OFF" });
+  chrome.action.setBadgeBackgroundColor({ color: "#64748b" });
+  chrome.action.setTitle({ title: enabled ? "JobFill AI" : "JobFill AI (desactivada)" });
+}
+
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === "local" && changes.extensionEnabled) {
+    renderActionBadge(changes.extensionEnabled.newValue !== false);
+  }
+});
+
+// El badge no persiste entre reinicios del navegador: se recalcula cada vez
+// que el service worker arranca.
+chrome.storage.local.get("extensionEnabled").then(s => renderActionBadge(s.extensionEnabled !== false));
+
+chrome.commands.onCommand.addListener(async (command, tab) => {
   if (command !== "capture-job-context" || !tab?.id) return;
+  const { extensionEnabled } = await chrome.storage.local.get("extensionEnabled");
+  if (extensionEnabled === false) return;
   chrome.tabs.sendMessage(tab.id, { type: "CAPTURE_JOB_CONTEXT_HOTKEY" }).catch(err => {
     // Pasa si la pestaña activa no tiene el content script inyectable (una
     // página chrome://, o el content script aún no cargó) — no es un error

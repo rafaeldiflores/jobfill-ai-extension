@@ -31,6 +31,8 @@ Extensión de navegador (Manifest V3) para Chrome, Edge y Brave que guarda tus d
    - 🤖 **Claude IA:** pega tu **Anthropic API Key** (`sk-ant-...`). Opcional: una **API Key de Vertex AI** (modo express, `AQ.…`) para que **Gemini responda automáticamente si Claude se queda sin saldo**, o para usar Gemini como modelo principal. Pulsa *"⚡ Probar Conexión"*: prueba cada proveedor por separado.
 3. Haz clic en **"💾 Guardar Cambios"**.
 
+> **Apagar la extensión:** el interruptor del popup (o el botón ⏻ del panel flotante) la desactiva en todas las páginas al instante; el ícono muestra "OFF" mientras esté apagada.
+
 ---
 
 ## 🧪 Cómo Probar la Extensión

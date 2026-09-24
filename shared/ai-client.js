@@ -39,25 +39,27 @@
   const MODEL_HAIKU = "claude-haiku-4-5";
 
   /**
-   * Equivalente en Gemini de cada modelo de Claude, en orden de preferencia.
-   * El siguiente candidato se prueba solo si el anterior da 404 (no existe en
-   * modo express) o 429 (cuota del modelo agotada: el modo express tiene
-   * cuotas bajas y Pro se agota antes que Flash).
+   * Equivalente en Gemini de cada modelo de Claude, en orden de preferencia:
+   * Gemini 3.8 Flash para todo (elección del usuario), con 2.5 Flash como red
+   * de seguridad. Se prueba el siguiente candidato si el anterior da 404 (el
+   * ID no existe en modo express: por eso también va la variante `-preview`),
+   * 429 (cuota de ese modelo) o 400 que no sea de la API key (p. ej. un
+   * `thinkingConfig` que ese modelo no acepta).
    *
-   * `thinkingBudget`: Gemini 2.5 razona por defecto y esos tokens salen de
+   * Razonamiento: Gemini razona por defecto y esos tokens salen de
    * `maxOutputTokens` — el mismo problema por el que se desactiva el thinking
-   * de Sonnet 5: con presupuestos chicos la respuesta llega vacía. Flash lo
-   * permite en 0; Pro exige un mínimo de 128, así que a Pro se le suma ese
-   * margen a `maxOutputTokens` (`extraOutputTokens`).
+   * de Sonnet 5: con presupuestos chicos la respuesta llega vacía. Gemini 3 lo
+   * regula con `thinkingLevel` (no se puede apagar del todo, así que se suma
+   * margen con `extraOutputTokens`); 2.5 Flash con `thinkingBudget: 0`.
+   * Sonnet → nivel "low" (redacción que decide entrevistas); Haiku → "minimal".
    */
+  const GEMINI_3_8_FLASH_IDS = ["gemini-3.8-flash", "gemini-3.8-flash-preview"];
+  const GEMINI_2_5_FLASH = { id: "gemini-2.5-flash", thinkingConfig: { thinkingBudget: 0 }, extraOutputTokens: 0 };
+  const gemini38 = thinkingLevel => GEMINI_3_8_FLASH_IDS.map(id => ({ id, thinkingConfig: { thinkingLevel }, extraOutputTokens: 1024 }));
+
   const GEMINI_MODELS = {
-    [MODEL_SONNET]: [
-      { id: "gemini-2.5-pro", thinkingBudget: 128, extraOutputTokens: 1024 },
-      { id: "gemini-2.5-flash", thinkingBudget: 0, extraOutputTokens: 0 }
-    ],
-    [MODEL_HAIKU]: [
-      { id: "gemini-2.5-flash", thinkingBudget: 0, extraOutputTokens: 0 }
-    ]
+    [MODEL_SONNET]: [...gemini38("low"), GEMINI_2_5_FLASH],
+    [MODEL_HAIKU]: [...gemini38("minimal"), GEMINI_2_5_FLASH]
   };
 
   const PROVIDER_LABELS = { anthropic: "Claude (Anthropic)", gemini: "Gemini (Vertex AI)" };
@@ -142,7 +144,7 @@
       })),
       generationConfig: {
         maxOutputTokens: (body.max_tokens || 1500) + geminiModel.extraOutputTokens,
-        thinkingConfig: { thinkingBudget: geminiModel.thinkingBudget }
+        thinkingConfig: geminiModel.thinkingConfig
       }
     };
     if (body.system) {
@@ -265,8 +267,9 @@
 
   /**
    * Llama a UN proveedor. Solo se pasa al siguiente modelo candidato ante 404
-   * (modelo inexistente) o, en Gemini, 429 (cuota de ese modelo): cualquier
-   * otro error fallaría igual con el siguiente y reintentar escondería la causa.
+   * (modelo inexistente) o, en Gemini, 429 (cuota de ese modelo) y 400 ajeno a
+   * la key (configuración que ese modelo no acepta). Cualquier otro error
+   * fallaría igual con el siguiente, y reintentar escondería la causa.
    */
   async function callProvider(settings, provider, { model, body, timeoutMs }) {
     const candidates = buildRequests(settings, provider, model, body);
@@ -312,7 +315,8 @@
       });
 
       lastError = friendlyError(provider, response.status, rawMessage);
-      const tryNextModel = response.status === 404 || (provider === "gemini" && response.status === 429);
+      const tryNextModel = response.status === 404 ||
+        (provider === "gemini" && (response.status === 429 || (response.status === 400 && !/api key/i.test(rawMessage))));
       if (!tryNextModel) throw lastError;
     }
 
