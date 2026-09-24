@@ -28,8 +28,7 @@ const GLOBAL_SETTING_KEYS = [
   "aiProvider",
   "claudeApiKey",
   "vertexApiKey",
-  "vertexProjectId",
-  "vertexRegion",
+  "aiFallbackToGemini",
   "claudeModel",
   "claudeModelSimple",
   "aiTone",
@@ -120,9 +119,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   const claudeApiKeyInput = document.getElementById("claudeApiKey");
   const aiProviderSelect = document.getElementById("aiProvider");
   const vertexApiKeyInput = document.getElementById("vertexApiKey");
-  const vertexProjectIdInput = document.getElementById("vertexProjectId");
-  const vertexRegionInput = document.getElementById("vertexRegion");
   const btnToggleVertexKey = document.getElementById("btnToggleVertexKey");
+  const aiFallbackCheckbox = document.getElementById("aiFallbackToGemini");
+  const geminiFallbackGroup = document.getElementById("geminiFallbackGroup");
 
   /**
    * Ajustes de IA tal como están AHORA en los inputs (aunque no se hayan
@@ -134,17 +133,13 @@ document.addEventListener("DOMContentLoaded", async () => {
       aiProvider: aiProviderSelect?.value,
       claudeApiKey: claudeApiKeyInput?.value,
       vertexApiKey: vertexApiKeyInput?.value,
-      vertexProjectId: vertexProjectIdInput?.value,
-      vertexRegion: vertexRegionInput?.value
+      aiFallbackToGemini: aiFallbackCheckbox ? aiFallbackCheckbox.checked : true
     });
   }
 
-  /** Muestra solo los campos del proveedor elegido. */
+  /** El respaldo con Gemini solo tiene sentido cuando Claude es el principal. */
   function syncProviderFields() {
-    const provider = aiProviderSelect?.value === "vertex" ? "vertex" : "anthropic";
-    document.querySelectorAll("[data-provider]").forEach(el => {
-      el.hidden = el.dataset.provider !== provider;
-    });
+    if (geminiFallbackGroup) geminiFallbackGroup.hidden = aiProviderSelect?.value === "gemini";
   }
   aiProviderSelect?.addEventListener("change", () => {
     syncProviderFields();
@@ -227,10 +222,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (storedData) {
     // Load Global API Key & Global Settings
     if (storedData.claudeApiKey && claudeApiKeyInput) claudeApiKeyInput.value = storedData.claudeApiKey;
-    if (aiProviderSelect) aiProviderSelect.value = storedData.aiProvider === "vertex" ? "vertex" : "anthropic";
+    if (aiProviderSelect) aiProviderSelect.value = storedData.aiProvider === "gemini" ? "gemini" : "anthropic";
     if (storedData.vertexApiKey && vertexApiKeyInput) vertexApiKeyInput.value = storedData.vertexApiKey;
-    if (storedData.vertexProjectId && vertexProjectIdInput) vertexProjectIdInput.value = storedData.vertexProjectId;
-    if (vertexRegionInput) vertexRegionInput.value = storedData.vertexRegion || "global";
+    if (aiFallbackCheckbox) aiFallbackCheckbox.checked = storedData.aiFallbackToGemini !== false;
     syncProviderFields();
     if (storedData.aiTone && document.getElementById("aiTone")) document.getElementById("aiTone").value = storedData.aiTone;
     if (storedData.customAiInstructions && document.getElementById("customAiInstructions")) document.getElementById("customAiInstructions").value = storedData.customAiInstructions;
@@ -467,11 +461,10 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     const storagePayload = {
       ...candidateDataFromProfiles(localProfiles, activeProfileId),
-      aiProvider: aiProviderSelect?.value === "vertex" ? "vertex" : "anthropic",
+      aiProvider: aiProviderSelect?.value === "gemini" ? "gemini" : "anthropic",
       claudeApiKey: claudeApiKeyInput?.value?.trim() || "",
       vertexApiKey: vertexApiKeyInput?.value?.trim() || "",
-      vertexProjectId: vertexProjectIdInput?.value?.trim() || "",
-      vertexRegion: vertexRegionInput?.value?.trim() || "global",
+      aiFallbackToGemini: aiFallbackCheckbox ? aiFallbackCheckbox.checked : true,
       aiTone: document.getElementById("aiTone")?.value || "profesional y persuasivo",
       customAiInstructions: document.getElementById("customAiInstructions")?.value || "",
       // El content script trata cualquier valor distinto de false como "sí
@@ -503,7 +496,10 @@ document.addEventListener("DOMContentLoaded", async () => {
   wireVisibilityToggle(btnToggleKey, claudeApiKeyInput);
   wireVisibilityToggle(btnToggleVertexKey, vertexApiKeyInput);
 
-  // Test Claude connection (Anthropic o Vertex AI, según el proveedor elegido)
+  // Probar conexión: cada proveedor configurado POR SEPARADO, con los dos
+  // modelos que usa la extensión. Se llama a `callProvider` y no a `callAi`
+  // a propósito: `callAi` saltaría a Gemini si Claude no tiene saldo, y la
+  // prueba diría "OK" escondiendo justo el problema que hay que ver.
   btnTestClaude.addEventListener("click", async () => {
     const ai = aiSettingsFromDOM();
     const problem = JobFillAi.aiSettingsProblem(ai);
@@ -513,43 +509,47 @@ document.addEventListener("DOMContentLoaded", async () => {
       return;
     }
 
-    claudeTestResult.textContent = `⏳ Conectando con Claude vía ${JobFillAi.describeProvider(ai)}...`;
+    const providers = [];
+    if (ai.anthropicKey) providers.push("anthropic");
+    if (ai.geminiKey) providers.push("gemini");
+
+    claudeTestResult.textContent = `⏳ Probando ${providers.map(JobFillAi.describeProvider).join(" y ")}...`;
     claudeTestResult.className = "api-test-badge show";
 
-    // Se prueban LOS DOS modelos que usa la extensión: en Vertex cada modelo
-    // se habilita por separado en Model Garden, y un Haiku sin habilitar solo
-    // se notaría al fallar la primera pregunta logística.
     const results = [];
-    for (const model of [JobFillAi.MODEL_SONNET, JobFillAi.MODEL_HAIKU]) {
-      try {
-        const data = await JobFillAi.callClaude(ai, {
-          model,
-          max_tokens: 20,
-          thinking: { type: "disabled" },
-          messages: [{ role: "user", content: "Responde únicamente con 'OK' para verificar la conexión." }],
-          timeoutMs: 30000
-        });
-        results.push({ model, ok: true, reply: extractClaudeText(data) || "(sin texto)" });
-      } catch (err) {
-        results.push({ model, ok: false, error: err.message });
+    for (const provider of providers) {
+      for (const model of [JobFillAi.MODEL_SONNET, JobFillAi.MODEL_HAIKU]) {
+        try {
+          const data = await JobFillAi.callProvider(ai, provider, {
+            model,
+            body: {
+              max_tokens: 20,
+              messages: [{ role: "user", content: "Responde únicamente con 'OK' para verificar la conexión." }],
+              ...(provider === "anthropic" ? { thinking: { type: "disabled" } } : {})
+            },
+            timeoutMs: 30000
+          });
+          results.push({ provider, label: data._model, ok: true, reply: extractClaudeText(data) || "(sin texto)" });
+        } catch (err) {
+          results.push({ provider, label: `${JobFillAi.describeProvider(provider)} · ${model}`, ok: false, error: err.message });
+        }
       }
     }
 
-    if (results.every(r => r.ok)) {
-      claudeTestResult.textContent = `✅ Conexión exitosa vía ${JobFillAi.describeProvider(ai)} (Sonnet 5 y Haiku 4.5). Respuesta: "${results[0].reply}"`;
-      claudeTestResult.className = "api-test-badge show success";
-      // Solo se persiste lo que ya se comprobó que funciona.
+    const primaryOk = results.filter(r => r.provider === ai.provider).every(r => r.ok);
+    claudeTestResult.textContent = results
+      .map(r => r.ok ? `✅ ${r.label}: "${r.reply}"` : `❌ ${r.label}: ${r.error}`)
+      .join("  ·  ");
+    claudeTestResult.className = `api-test-badge show ${results.every(r => r.ok) ? "success" : "error"}`;
+
+    // Se persisten las credenciales solo si el proveedor PRINCIPAL respondió.
+    if (primaryOk) {
       await chrome.storage.local.set({
         aiProvider: ai.provider,
-        ...(ai.provider === "vertex"
-          ? { vertexApiKey: ai.vertexCredential, vertexProjectId: ai.vertexProjectId, vertexRegion: ai.vertexRegion }
-          : { claudeApiKey: ai.anthropicKey })
+        claudeApiKey: ai.anthropicKey,
+        vertexApiKey: ai.geminiKey,
+        aiFallbackToGemini: ai.fallbackToGemini
       });
-    } else {
-      claudeTestResult.textContent = results
-        .map(r => r.ok ? `✅ ${r.model}: OK` : `❌ ${r.model}: ${r.error}`)
-        .join("  ·  ");
-      claudeTestResult.className = "api-test-badge show error";
     }
   });
 
@@ -927,7 +927,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
       // max_tokens holgado: el JSON de un CV con varios cargos y proyectos
       // supera fácilmente 3000 tokens, y un JSON cortado a la mitad no parsea
       // y termina en el parser local (mucho peor) sin que se note por qué.
-      const data = await JobFillAi.callClaude(ai, {
+      const data = await JobFillAi.callAi(ai, {
         model,
         max_tokens: 8000,
         thinking: { type: "disabled" },

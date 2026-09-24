@@ -2988,7 +2988,8 @@
       const missing = response.missingIds?.length || 0;
       showToast(
         `✨ ${filledCount} respuesta${filledCount === 1 ? "" : "s"} redactada${filledCount === 1 ? "" : "s"} con una sola llamada.` +
-          (missing ? ` (${missing} sin respuesta, revísalas manualmente)` : ""),
+          (missing ? ` (${missing} sin respuesta, revísalas manualmente)` : "") +
+          providerNote(response),
         filledCount ? "success" : "error"
       );
 
@@ -3123,19 +3124,19 @@
       mustCover: confirmedSkills
     };
 
-    const applyAnswer = answer => {
+    const applyAnswer = (answer, result = null) => {
       const finalAnswer = maxCharacters ? enforceSafeCharacterLimit(answer, maxCharacters) : answer;
       setElementValue(textarea, finalAnswer);
       rememberGeneratedAnswer(textarea, finalAnswer);
       textarea.classList.add("jobfill-highlight-ai");
       setTimeout(() => textarea.classList.remove("jobfill-highlight-ai"), 2500);
-      showToast(`✨ Respuesta redactada (${finalAnswer.length}${maxCharacters ? `/${maxCharacters}` : ""} caracteres).`, "success");
+      showToast(`✨ Respuesta redactada (${finalAnswer.length}${maxCharacters ? `/${maxCharacters}` : ""} caracteres).${providerNote(result)}`, "success");
       return finalAnswer;
     };
 
     try {
       const result = await requestClaudeAnswer(basePayload);
-      applyAnswer(result.answer);
+      applyAnswer(result.answer, result);
 
       // Verificación de cobertura: qué requisitos de la oferta quedaron fuera de
       // la respuesta. Se hace DESPUÉS de rellenar para que el usuario ya tenga
@@ -3154,7 +3155,7 @@
       if (decision && decision.terms.length) {
         btn.classList.add("jobfill-loading");
         const improved = await requestClaudeAnswer({ ...basePayload, mustCover: decision.terms });
-        applyAnswer(improved.answer);
+        applyAnswer(improved.answer, improved);
 
         if (decision.termsToSaveInProfile.length) {
           await addSkillsToProfile(decision.termsToSaveInProfile);
@@ -3210,7 +3211,7 @@
             }
 
             if (response && response.success && response.answer) {
-              resolve({ answer: response.answer, coverage: response.coverage });
+              resolve({ answer: response.answer, coverage: response.coverage, provider: response.provider, fallbackReason: response.fallbackReason });
             } else {
               reject(new Error(response?.error || "El service worker se cerró antes de responder. Recarga la extensión en chrome://extensions e inténtalo de nuevo."));
             }
@@ -3512,6 +3513,18 @@
     chip.querySelector(".jobfill-cache-chip-text").textContent =
       `📄 ${latest.title}${latest.company ? ` — ${latest.company}` : ""}`;
     chip.dataset.contextUrl = latest.url;
+  }
+
+  /**
+   * Nota para el toast de éxito cuando no respondió Claude: el usuario debe
+   * saber que el texto lo escribió otro modelo (y por qué), sobre todo si fue
+   * un respaldo automático por falta de saldo.
+   */
+  function providerNote(result) {
+    if (result?.provider !== "gemini") return "";
+    return result.fallbackReason
+      ? " Redactó Gemini: Claude se quedó sin saldo."
+      : " Redactó Gemini.";
   }
 
   function showToast(message, type = "info") {

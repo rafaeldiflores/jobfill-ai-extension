@@ -601,11 +601,17 @@ it("Detects character limits from attributes / text labels and safely trims answ
 // propio test, así que seguía en verde aunque el código real cambiara.
 function loadRealAiClient(fetchImpl) {
   const src = fs.readFileSync(path.join(__dirname, "..", "shared", "ai-client.js"), "utf8");
-  const sandbox = { console: { log() {}, error() {} }, fetch: fetchImpl, AbortController, setTimeout, clearTimeout };
+  const sandbox = { console: { log() {}, warn() {}, error() {} }, fetch: fetchImpl, AbortController, setTimeout, clearTimeout };
   sandbox.self = sandbox;
   require("vm").runInNewContext(src, sandbox);
   return sandbox.JobFillAi;
 }
+
+const jsonResponse = (status, body) => ({ ok: status < 300, status, statusText: "", json: async () => body });
+const geminiOk = text => jsonResponse(200, {
+  candidates: [{ content: { role: "model", parts: [{ text: "pensando…", thought: true }, { text }] }, finishReason: "STOP" }],
+  usageMetadata: { promptTokenCount: 7, candidatesTokenCount: 2 }
+});
 
 it("Builds Anthropic requests with only Sonnet 5 / Haiku 4.5 and the model in the body", () => {
   const ai = loadRealAiClient();
@@ -613,74 +619,135 @@ it("Builds Anthropic requests with only Sonnet 5 / Haiku 4.5 and the model in th
   assert.strictEqual(settings.provider, "anthropic");
   assert.strictEqual(settings.anthropicKey, "sk-ant-test-123");
 
-  const [sonnet] = ai.buildClaudeRequests(settings, "claude-sonnet-5", { max_tokens: 10, messages: [] });
+  const [sonnet] = ai.buildRequests(settings, "anthropic", "claude-sonnet-5", { max_tokens: 10, messages: [] });
   assert.strictEqual(sonnet.url, "https://api.anthropic.com/v1/messages");
   assert.strictEqual(sonnet.body.model, "claude-sonnet-5");
   assert.strictEqual(sonnet.headers["x-api-key"], "sk-ant-test-123");
 
   // Cualquier variante (incluido el ID con sufijo de fecha, que da 404) se
   // normaliza al ID permitido.
-  const [haiku] = ai.buildClaudeRequests(settings, "claude-haiku-4-5-20251001", { max_tokens: 10, messages: [] });
+  const [haiku] = ai.buildRequests(settings, "anthropic", "claude-haiku-4-5-20251001", { max_tokens: 10, messages: [] });
   assert.strictEqual(haiku.body.model, "claude-haiku-4-5");
 });
 
-it("Builds Vertex AI rawPredict requests: model in the URL, anthropic_version in the body, key or token auth", () => {
+it("Translates Messages API requests to Gemini generateContent on Vertex AI express mode", () => {
   const ai = loadRealAiClient();
-  const settings = ai.readAiSettings({ aiProvider: "vertex", vertexApiKey: "AIzaTestKey", vertexProjectId: "mi-proyecto" });
-  assert.strictEqual(settings.vertexRegion, "global");
+  const settings = ai.readAiSettings({ aiProvider: "gemini", vertexApiKey: "AQ.test-key" });
   assert.strictEqual(ai.aiSettingsProblem(settings), null);
 
-  const [sonnet] = ai.buildClaudeRequests(settings, "claude-sonnet-5", { max_tokens: 10, messages: [] });
-  assert.strictEqual(sonnet.url, "https://aiplatform.googleapis.com/v1/projects/mi-proyecto/locations/global/publishers/anthropic/models/claude-sonnet-5:rawPredict");
-  assert.strictEqual(sonnet.body.anthropic_version, "vertex-2023-10-16");
-  assert.strictEqual("model" in sonnet.body, false);
-  assert.strictEqual(sonnet.headers["x-goog-api-key"], "AIzaTestKey");
-  assert.strictEqual("x-api-key" in sonnet.headers, false);
+  const body = {
+    max_tokens: 300,
+    system: [{ type: "text", text: "Reglas", cache_control: { type: "ephemeral" } }],
+    messages: [{ role: "user", content: [
+      { type: "text", text: "Perfil", cache_control: { type: "ephemeral" } },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBOR" } },
+      { type: "text", text: "Pregunta" }
+    ] }]
+  };
 
-  // Haiku 4.5 es snapshot fechado en Vertex (separador @), con el ID sin
-  // versión como respaldo ante 404.
-  const haikuIds = ai.buildClaudeRequests(settings, "claude-haiku-4-5", { messages: [] }).map(r => r.sentModel);
-  assert.strictEqual(JSON.stringify(haikuIds), JSON.stringify(["claude-haiku-4-5@20251001", "claude-haiku-4-5"]));
+  const [pro, flash] = ai.buildRequests(settings, "gemini", "claude-sonnet-5", body);
+  assert.strictEqual(pro.url, "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-2.5-pro:generateContent");
+  assert.strictEqual(pro.headers["x-goog-api-key"], "AQ.test-key");
+  assert.strictEqual("x-api-key" in pro.headers, false);
+  assert.strictEqual(flash.sentModel, "gemini-2.5-flash");
 
-  // Región específica → host regional. Access token OAuth → Bearer.
-  const regional = ai.readAiSettings({ aiProvider: "vertex", vertexApiKey: "ya29.token", vertexProjectId: "p1", vertexRegion: "us-east5" });
-  const [req] = ai.buildClaudeRequests(regional, "claude-sonnet-5", { messages: [] });
-  assert.ok(req.url.startsWith("https://us-east5-aiplatform.googleapis.com/v1/projects/p1/locations/us-east5/"));
-  assert.strictEqual(req.headers.authorization, "Bearer ya29.token");
-  assert.strictEqual("x-goog-api-key" in req.headers, false);
+  const req = pro.body;
+  assert.strictEqual(JSON.stringify(req.systemInstruction), JSON.stringify({ parts: [{ text: "Reglas" }] }));
+  assert.strictEqual(req.contents[0].role, "user");
+  assert.strictEqual(JSON.stringify(req.contents[0].parts), JSON.stringify([
+    { text: "Perfil" }, { inlineData: { mimeType: "image/png", data: "iVBOR" } }, { text: "Pregunta" }
+  ]));
+  // Pro no permite apagar el razonamiento: se le da margen extra de salida.
+  assert.strictEqual(req.generationConfig.thinkingConfig.thinkingBudget, 128);
+  assert.ok(req.generationConfig.maxOutputTokens > 300);
 
-  // Configuración incompleta: se dice qué falta, sin llamar a la red.
-  assert.match(ai.aiSettingsProblem(ai.readAiSettings({ aiProvider: "vertex", vertexApiKey: "k" })), /proyecto/);
-  assert.match(ai.aiSettingsProblem(ai.readAiSettings({ aiProvider: "vertex", vertexProjectId: "p" })), /Vertex AI/);
-  assert.strictEqual(ai.hasAiCredentials({ claudeApiKey: "sk-ant-x" }), true);
-  assert.strictEqual(ai.hasAiCredentials({ aiProvider: "vertex", claudeApiKey: "sk-ant-x" }), false);
+  // Haiku → Flash, con el razonamiento apagado y el presupuesto tal cual.
+  const [haiku] = ai.buildRequests(settings, "gemini", "claude-haiku-4-5", { max_tokens: 60, messages: [{ role: "assistant", content: "x" }] });
+  assert.strictEqual(haiku.sentModel, "gemini-2.5-flash");
+  assert.strictEqual(haiku.body.generationConfig.thinkingConfig.thinkingBudget, 0);
+  assert.strictEqual(haiku.body.generationConfig.maxOutputTokens, 60);
+  assert.strictEqual(haiku.body.contents[0].role, "model");
+
+  // Respuesta: las partes de razonamiento (`thought`) nunca llegan como texto.
+  const parsed = ai.fromGeminiResponse({
+    candidates: [{ content: { parts: [{ text: "razono", thought: true }, { text: "Hola" }] }, finishReason: "MAX_TOKENS" }]
+  }, "gemini-2.5-flash");
+  assert.strictEqual(parsed.content[0].text, "Hola");
+  assert.strictEqual(parsed.content.length, 1);
+  assert.strictEqual(parsed.stop_reason, "max_tokens");
+  assert.throws(() => ai.fromGeminiResponse({ promptFeedback: { blockReason: "SAFETY" } }), /SAFETY/);
+
+  assert.match(ai.aiSettingsProblem(ai.readAiSettings({ aiProvider: "gemini" })), /Vertex AI/);
 });
 
-it("Falls back to the next Vertex model ID only on 404, and surfaces permission errors immediately", async () => {
+it("Falls back to Gemini only when Claude runs out of credit or capacity, and says so", async () => {
   const calls = [];
-  const respond = (status, body) => ({ ok: status < 300, status, statusText: "", json: async () => body });
+  let claudeReply;
   const ai = loadRealAiClient(async url => {
     calls.push(url);
-    if (url.includes("@20251001")) return respond(404, { error: { message: "Publisher model not found" } });
-    return respond(200, { content: [{ type: "text", text: "OK" }] });
+    return url.includes("anthropic.com") ? claudeReply() : geminiOk("Respuesta de Gemini");
   });
-  const settings = ai.readAiSettings({ aiProvider: "vertex", vertexApiKey: "AIzaK", vertexProjectId: "p" });
-  const data = await ai.callClaude(settings, { model: "claude-haiku-4-5", messages: [{ role: "user", content: "hola" }] });
-  assert.strictEqual(data.content[0].text, "OK");
-  assert.strictEqual(calls.length, 2);
-  assert.ok(calls[1].endsWith("/claude-haiku-4-5:rawPredict"));
+  const settings = ai.readAiSettings({ claudeApiKey: "sk-ant-x", vertexApiKey: "AQ.k" });
+  const request = { model: "claude-haiku-4-5", messages: [{ role: "user", content: "hola" }], thinking: { type: "disabled" } };
 
-  // Un 403 no se "arregla" probando otro ID: se corta y se explica.
-  const calls403 = [];
-  const ai403 = loadRealAiClient(async url => {
-    calls403.push(url);
-    return respond(403, [{ error: { code: 403, message: "Permission denied", status: "PERMISSION_DENIED" } }]);
+  // Saldo agotado: Anthropic lo informa como 400, no como 402/429.
+  claudeReply = () => jsonResponse(400, { error: { type: "invalid_request_error", message: "Your credit balance is too low to access the Anthropic API." } });
+  const data = await ai.callAi(settings, request);
+  assert.strictEqual(data._provider, "gemini");
+  assert.strictEqual(data._model, "gemini-2.5-flash");
+  assert.match(data._fallbackReason, /credit balance/);
+  assert.strictEqual(data.content[0].text, "Respuesta de Gemini");
+  assert.strictEqual(calls.length, 2);
+
+  // Sobrecarga (529) también activa el respaldo.
+  claudeReply = () => jsonResponse(529, { error: { message: "Overloaded" } });
+  assert.strictEqual((await ai.callAi(settings, request))._provider, "gemini");
+
+  // API key inválida (401): NO se esconde detrás de Gemini.
+  calls.length = 0;
+  claudeReply = () => jsonResponse(401, { error: { message: "invalid x-api-key" } });
+  await assert.rejects(ai.callAi(settings, request), /401/);
+  assert.strictEqual(calls.length, 1);
+
+  // Respaldo desactivado o sin key de Gemini: el error de saldo llega tal cual.
+  claudeReply = () => jsonResponse(429, { error: { message: "rate limited" } });
+  for (const noFallback of [
+    ai.readAiSettings({ claudeApiKey: "sk-ant-x", vertexApiKey: "AQ.k", aiFallbackToGemini: false }),
+    ai.readAiSettings({ claudeApiKey: "sk-ant-x" })
+  ]) {
+    calls.length = 0;
+    await assert.rejects(ai.callAi(noFallback, request), err => err.outOfCredit === true);
+    assert.strictEqual(calls.length, 1);
+  }
+
+  // Claude OK: Gemini ni se toca.
+  calls.length = 0;
+  claudeReply = () => jsonResponse(200, { content: [{ type: "text", text: "OK" }], stop_reason: "end_turn" });
+  const ok = await ai.callAi(settings, request);
+  assert.strictEqual(ok._provider, "anthropic");
+  assert.strictEqual(ok._fallbackReason, undefined);
+  assert.strictEqual(calls.length, 1);
+});
+
+it("Within Gemini, moves from Pro to Flash on 404/429 but stops on an invalid key", async () => {
+  const calls = [];
+  let proReply;
+  const ai = loadRealAiClient(async url => {
+    calls.push(url);
+    return url.includes("gemini-2.5-pro") ? proReply() : geminiOk("desde flash");
   });
-  await assert.rejects(
-    ai403.callClaude(settings, { model: "claude-haiku-4-5", messages: [] }),
-    err => err.status === 403 && /Model Garden/.test(err.message) && /Permission denied/.test(err.message)
-  );
-  assert.strictEqual(calls403.length, 1);
+  const settings = ai.readAiSettings({ aiProvider: "gemini", vertexApiKey: "AQ.k" });
+  const request = { model: "claude-sonnet-5", messages: [{ role: "user", content: "hola" }] };
+
+  proReply = () => jsonResponse(429, [{ error: { code: 429, message: "Resource exhausted", status: "RESOURCE_EXHAUSTED" } }]);
+  const data = await ai.callAi(settings, request);
+  assert.strictEqual(data._model, "gemini-2.5-flash");
+  assert.strictEqual(calls.length, 2);
+
+  calls.length = 0;
+  proReply = () => jsonResponse(400, { error: { code: 400, message: "API key not valid. Please pass a valid API key.", status: "INVALID_ARGUMENT" } });
+  await assert.rejects(ai.callAi(settings, request), /API Key de Vertex AI/);
+  assert.strictEqual(calls.length, 1);
 });
 
 // 11b. RESPONSE TEXT EXTRACTION — never assume content[0] is the text block

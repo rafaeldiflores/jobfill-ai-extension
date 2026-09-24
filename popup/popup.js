@@ -57,7 +57,10 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
 
     if (JobFillAi.hasAiCredentials(storedData)) {
-      aiStatusBadge.textContent = storedData.aiProvider === "vertex" ? "Claude IA Activo (Vertex)" : "Claude IA Activo";
+      const ai = JobFillAi.readAiSettings(storedData);
+      aiStatusBadge.textContent = ai.provider === "gemini"
+        ? "Gemini IA Activo"
+        : JobFillAi.hasGeminiFallback(ai) ? "Claude IA Activo (+ Gemini)" : "Claude IA Activo";
       aiStatusBadge.classList.remove("inactive");
     } else {
       aiStatusBadge.textContent = "IA Sin Configurar";

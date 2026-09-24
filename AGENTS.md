@@ -28,9 +28,7 @@ Extensión de navegador (Manifest V3) para Chrome, Edge y Brave que guarda tus d
    - 💼 **Experiencia y Salario** (Cargo, Años de experiencia, Pretensiones, Inglés).
    - 🎓 **Educación y Habilidades** (Tu stack técnico, ej: JavaScript, Python, etc.).
    - 🧩 **Campos Flexibles** (Agrega cualquier dato extra: *Licencia de conducir, Renta líquida, etc.* con sus palabras clave).
-   - 🤖 **Claude IA:** elige el proveedor y pulsa *"⚡ Probar Conexión"* (prueba Sonnet 5 y Haiku 4.5):
-     - **Anthropic API:** pega tu API Key (`sk-ant-...`).
-     - **Google Cloud Vertex AI:** pega tu API Key de Google Cloud o un access token (`gcloud auth print-access-token`, dura 1 hora), el **ID del proyecto** y la **región** (`global` por defecto). Requisitos: API "Vertex AI" habilitada, Claude Sonnet 5 y Haiku 4.5 habilitados en Model Garden y rol "Vertex AI User" para la cuenta de la credencial.
+   - 🤖 **Claude IA:** pega tu **Anthropic API Key** (`sk-ant-...`). Opcional: una **API Key de Vertex AI** (modo express, `AQ.…`) para que **Gemini responda automáticamente si Claude se queda sin saldo**, o para usar Gemini como modelo principal. Pulsa *"⚡ Probar Conexión"*: prueba cada proveedor por separado.
 3. Haz clic en **"💾 Guardar Cambios"**.
 
 ---
@@ -52,4 +50,4 @@ Extensión de navegador (Manifest V3) para Chrome, Edge y Brave que guarda tus d
 ## 🔒 Privacidad y Seguridad
 
 - **100% Local:** Tus datos personales nunca se envían a ningún servidor intermedio; residen en el almacenamiento local de tu navegador (`chrome.storage.local`). Ojo: ese almacenamiento **no está cifrado**; la API key queda legible para quien tenga acceso a tu perfil del navegador.
-- **Llamadas directas a Claude:** Las solicitudes de redacción viajan directamente (HTTPS) desde tu navegador a Anthropic (`api.anthropic.com`) o a Google Cloud (`aiplatform.googleapis.com`) según el proveedor elegido. Toda la lógica de llamada vive en `shared/ai-client.js`.
+- **Llamadas directas a Claude:** Las solicitudes de redacción viajan directamente (HTTPS) desde tu navegador a Anthropic (`api.anthropic.com`) o a Google Cloud (`aiplatform.googleapis.com`, Gemini) según el proveedor elegido o el respaldo. Toda la lógica de llamada vive en `shared/ai-client.js`.

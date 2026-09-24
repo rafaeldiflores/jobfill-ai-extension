@@ -3,8 +3,9 @@
  * Handles background operations, Anthropic Claude API requests, and default state.
  */
 
-// Cliente único de Claude (Anthropic directo o Vertex AI), compartido con la
-// página de opciones. Ruta absoluta: importScripts resuelve relativo al SW.
+// Cliente único de IA (Claude, con respaldo en Gemini vía Vertex AI),
+// compartido con opciones y popup. Ruta absoluta: importScripts resuelve
+// relativo al SW.
 importScripts("/shared/ai-client.js");
 
 // `targetRole` vacío por defecto: alimenta `headline`, que el autofill escribe
@@ -173,6 +174,8 @@ function buildAutofillProfileView(storage) {
   // content script: este objeto llega a cada página donde corre el autofill,
   // y el content script jamás llama a la API (lo hace este service worker).
   const {
+    // vertexProjectId/vertexRegion: restos de una versión previa, por si
+    // quedaron en storage.
     claudeApiKey, vertexApiKey, vertexProjectId, vertexRegion,
     profiles_backup_v1, ...safeStorage
   } = storage;
@@ -280,13 +283,14 @@ const DEFAULT_GLOBAL_SETTINGS = {
   candidateBase: createDefaultCandidateBase(),
   cvIndexes: [ createDefaultCvIndex() ],
   activeCvIndexId: "idx_default",
-  // Proveedor de Claude: "anthropic" (API key sk-ant-…) o "vertex" (Google
-  // Cloud Vertex AI: API key o access token + proyecto + región).
+  // Proveedor principal: "anthropic" (Claude, API key sk-ant-…) o "gemini"
+  // (Vertex AI modo express, API key de Google Cloud). Con Claude como
+  // principal y una key de Gemini cargada, Gemini responde automáticamente
+  // cuando Claude se queda sin saldo (ver shared/ai-client.js).
   aiProvider: "anthropic",
   claudeApiKey: "",
   vertexApiKey: "",
-  vertexProjectId: "",
-  vertexRegion: "global",
+  aiFallbackToGemini: true,
   // Debe coincidir literalmente con un <option value="..."> de #aiTone en
   // options.html — "professional" (inglés) no calzaba con ninguno, así que el
   // select quedaba sin selección real y el prompt de sistema mezclaba idiomas
@@ -507,7 +511,7 @@ async function captureJobTitleNearMouse(tab, { x, y, dpr }) {
 
   const ai = JobFillAi.readAiSettings(await chrome.storage.local.get(null));
   if (!JobFillAi.hasAiCredentials(ai)) {
-    throw new Error("Configura tu acceso a Claude (Anthropic o Vertex AI) para usar la captura por pantalla.");
+    throw new Error("Configura tu API Key de Claude o de Gemini para usar la captura por pantalla.");
   }
 
   const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
@@ -583,8 +587,10 @@ function arrayBufferToBase64(buffer) {
 }
 
 /**
- * Llama a Claude con el proveedor configurado (Anthropic o Vertex AI). La
- * implementación vive en shared/ai-client.js, compartida con options.js.
+ * Llama a la IA con el proveedor configurado: Claude, con respaldo automático
+ * en Gemini si Claude se queda sin saldo. La implementación vive en
+ * shared/ai-client.js, compartida con options.js; la respuesta siempre llega
+ * en formato Messages API, responda quien responda.
  *
  * `thinking: disabled` siempre: Sonnet 5 activa "adaptive thinking" por
  * defecto si se omite, y los tokens de razonamiento se descuentan de
@@ -592,13 +598,18 @@ function arrayBufferToBase64(buffer) {
  * respuesta llega vacía. Aquí siempre queremos texto directo y acotado.
  */
 async function callAnthropicMessagesApi({ ai, model, system, messages, max_tokens = 1500 }) {
-  return JobFillAi.callClaude(ai, {
+  return JobFillAi.callAi(ai, {
     model,
     system,
     messages,
     max_tokens,
     thinking: { type: "disabled" }
   });
+}
+
+/** Quién respondió, para avisarle al usuario cuando no fue Claude. */
+function providerInfo(data) {
+  return { provider: data?._provider || "anthropic", fallbackReason: data?._fallbackReason || null };
 }
 
 /**
@@ -1656,7 +1667,7 @@ ${isEnglish ? `Generate an exceptional, persuasive, and directly focused answer 
     term => !confirmedTerms.some(c => c.toLowerCase() === term.toLowerCase())
   );
 
-  return { success: true, answer, coverage };
+  return { success: true, answer, coverage, ...providerInfo(data) };
 }
 
 /**
@@ -1787,5 +1798,5 @@ Longitud objetivo: entre ${effectiveMin} y ${effectiveMax} caracteres${ceiling ?
     term => !confirmedTerms.some(c => c.toLowerCase() === term.toLowerCase())
   );
 
-  return { success: true, results, coverage, missingIds: results.filter(r => !r.answer).map(r => r.id) };
+  return { success: true, results, coverage, missingIds: results.filter(r => !r.answer).map(r => r.id), ...providerInfo(data) };
 }
