@@ -41,25 +41,28 @@
   /**
    * Equivalente en Gemini de cada modelo de Claude, en orden de preferencia:
    * Gemini 3.8 Flash para todo (elección del usuario), con 2.5 Flash como red
-   * de seguridad. Se prueba el siguiente candidato si el anterior da 404 (el
-   * ID no existe en modo express: por eso también va la variante `-preview`),
+   * de seguridad. Se prueba el siguiente candidato si el anterior da 404,
    * 429 (cuota de ese modelo) o 400 que no sea de la API key (p. ej. un
-   * `thinkingConfig` que ese modelo no acepta).
+   * `thinkingConfig` que ese modelo no acepta). Sin la variante `-preview`:
+   * verificado en la cuenta real, `gemini-3.8-flash` existe en modo express y
+   * la preview da 404 en su región (southamerica-west1): era una llamada
+   * perdida en cada respaldo.
    *
    * Razonamiento: Gemini razona por defecto y esos tokens salen de
    * `maxOutputTokens` — el mismo problema por el que se desactiva el thinking
    * de Sonnet 5: con presupuestos chicos la respuesta llega vacía. Gemini 3 lo
    * regula con `thinkingLevel` (no se puede apagar del todo, así que se suma
    * margen con `extraOutputTokens`); 2.5 Flash con `thinkingBudget: 0`.
-   * Sonnet → nivel "low" (redacción que decide entrevistas); Haiku → "minimal".
+   * Nivel "low" para todo: 3.8 Flash rechaza "minimal" con un 400
+   * ("Thinking level is unsupported: THINKING_LEVEL_MINIMAL").
    */
-  const GEMINI_3_8_FLASH_IDS = ["gemini-3.8-flash", "gemini-3.8-flash-preview"];
+  const GEMINI_3_8_FLASH_IDS = ["gemini-3.8-flash"];
   const GEMINI_2_5_FLASH = { id: "gemini-2.5-flash", thinkingConfig: { thinkingBudget: 0 }, extraOutputTokens: 0 };
   const gemini38 = thinkingLevel => GEMINI_3_8_FLASH_IDS.map(id => ({ id, thinkingConfig: { thinkingLevel }, extraOutputTokens: 1024 }));
 
   const GEMINI_MODELS = {
     [MODEL_SONNET]: [...gemini38("low"), GEMINI_2_5_FLASH],
-    [MODEL_HAIKU]: [...gemini38("minimal"), GEMINI_2_5_FLASH]
+    [MODEL_HAIKU]: [...gemini38("low"), GEMINI_2_5_FLASH]
   };
 
   const PROVIDER_LABELS = { anthropic: "Claude (Anthropic)", gemini: "Gemini (Vertex AI)" };

@@ -257,7 +257,35 @@
     return (cut > 0 ? first.slice(0, cut) : first).replace(/\s+/g, " ").trim().slice(0, 80);
   }
 
+  /**
+   * Valor para un <input type="number">, o null si no hay uno sensato.
+   * Chrome rechaza cualquier texto no numérico ("The specified value
+   * '19974960-9' cannot be parsed") y el campo queda vacío en silencio:
+   *   - RUT "19.974.960-9" → "19974960" (el cuerpo: un campo numérico no
+   *     puede llevar el dígito verificador, que puede ser K),
+   *   - teléfono "+56 9 1234 5678" → "56912345678",
+   *   - "3,5" → "3.5"; "$1.200.000" → "1200000",
+   *   - texto sin número ("No especificado") → null: no se toca el campo.
+   * Respeta min/max del campo.
+   */
+  function toNumberInputValue(value, { min, max } = {}) {
+    const raw = String(value ?? "").trim();
+    if (!raw) return null;
+    let out = null;
+    const rut = raw.match(/^(\d{1,2}(?:\.?\d{3}){2})-?[\dkK]$/);
+    if (rut && /[-.]|[kK]$/.test(raw)) out = rut[1].replace(/\./g, "");
+    else if (/^-?\d+(?:[.,]\d+)?$/.test(raw)) out = raw.replace(",", ".");
+    else if (/^[\s$+()\d.\-]+$/.test(raw) && /\d/.test(raw)) out = raw.replace(/\D/g, "");
+    if (out === null || out === "") return null;
+    const n = Number(out);
+    if (!Number.isFinite(n)) return null;
+    if (min !== undefined && min !== "" && n < Number(min)) return null;
+    if (max !== undefined && max !== "" && n > Number(max)) return null;
+    return out;
+  }
+
   root.JobFillPortals = {
+    toNumberInputValue,
     cleanCompanyName,
     PLACEHOLDER_RE,
     isPlaceholderOption,
