@@ -39,6 +39,8 @@ Con el vault conectado, el panel flotante suma dos botones:
 
 El registro en el Tracker siempre pide confirmación: nunca es automático.
 
+**🚀 Postular** funciona en la mayoría de los portales. Encuentra el formulario aunque esté dentro de un iframe (Greenhouse, Workable, iCIMS o Indeed embebidos en el sitio de la empresa) o en Shadow DOM (SuccessFactors, SmartRecruiters). Reconoce el campo del CV por los selectores de cada ATS (Greenhouse, Lever, Workday, Ashby, LinkedIn, Workable, Teamtailor y otros), por el nombre del campo o por su etiqueta. Si el portal solo ofrece una zona de "arrastra tu CV", suelta el archivo ahí. En formularios de varios pasos (LinkedIn Easy Apply, Workday, Taleo), si el campo del CV todavía no aparece, el PDF queda **pendiente** y se adjunta solo al llegar a ese paso (misma pestaña, 30 min). Si no está seguro de cuál es el campo del CV, no adjunta nada y te deja el botón de descarga.
+
 Extras: **💬 Respuestas guardadas** (Q&A y campos flexibles), **🎯 Perfiles de CV** (facetas con palabras clave, opcional) y **💾 Respaldo**.
 
 > **Apagar la extensión:** el interruptor del popup (o el botón ⏻ del panel flotante) la desactiva en todas las páginas al instante; el ícono muestra "OFF" mientras esté apagada.
@@ -71,5 +73,6 @@ Extras: **💬 Respuestas guardadas** (Q&A y campos flexibles), **🎯 Perfiles 
 
 - `npm test` corre la suite completa (sin dependencias). Carga el código **real** de la extensión (nunca copias) y verifica la sintaxis de cada script. GitHub Actions la corre en cada push (`.github/workflows/ci.yml`).
 - `shared/vault-client.js` es el cliente OAuth 2.1 (registro dinámico + PKCE con `chrome.identity`) y MCP (Streamable HTTP) del postulador (`rdf-grafo/postulador-mcp`). El token del vault no sale en los respaldos ni llega a las páginas.
+- `content/portals.js` concentra lo específico de cada portal: selectores del CV por ATS, puntaje de "¿es el campo del CV?", búsqueda en Shadow DOM y elección del frame. El content script corre con `all_frames`: el widget y la orquestación viven solo en el frame principal, y el service worker llama a la API `JobFillFrame` de cada frame con `chrome.scripting.executeScript` (mismo mundo aislado).
 - `shared/ai-client.js` es el único cliente de IA (Claude + respaldo Gemini); no agregues `fetch()` a proveedores en otros archivos.
 - El autorrelleno **nunca pisa un campo que ya tiene valor**; para reemplazarlo, bórralo y vuelve a autorrellenar.

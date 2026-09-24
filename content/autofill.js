@@ -7,6 +7,12 @@
   if (window.__JOBFILL_AI_LOADED__) return;
   window.__JOBFILL_AI_LOADED__ = true;
 
+  // El content script corre en todos los frames (all_frames) para llegar a
+  // los formularios embebidos en iframes. El widget, los diálogos y la
+  // orquestación de "Postular" viven SOLO en el frame principal; los iframes
+  // exponen una API mínima (JobFillFrame, abajo) que el service worker llama.
+  const IS_TOP_FRAME = (() => { try { return window.top === window; } catch (e) { return false; } })();
+
   let activeProfile = null;
   let currentAiBtn = null;
 
@@ -961,6 +967,16 @@
    * ruidosas. Aplanarlo todo en un string hacía que un match accidental en el
    * texto vecino pesara igual que el label real del campo.
    */
+  /**
+   * Documento o ShadowRoot donde vive el campo: `label[for]` y
+   * `aria-labelledby` apuntan a ids de ESE árbol, no del documento, cuando
+   * el formulario usa web components (SuccessFactors, SmartRecruiters).
+   */
+  function rootOf(el) {
+    const r = el.getRootNode?.();
+    return r && typeof r.getElementById === "function" ? r : document;
+  }
+
   function getFieldContextParts(el) {
     const label = [];
     const attrs = [];
@@ -987,7 +1003,7 @@
     if (labelledBy) {
       labelledBy.split(" ").forEach(id => {
         try {
-          const labelEl = document.getElementById(id);
+          const labelEl = rootOf(el).getElementById(id);
           if (labelEl && labelEl.innerText) label.push(labelEl.innerText);
         } catch (e) {}
       });
@@ -995,7 +1011,7 @@
 
     if (el.id) {
       try {
-        const forLabel = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        const forLabel = rootOf(el).querySelector(`label[for="${CSS.escape(el.id)}"]`);
         if (forLabel && forLabel.innerText) label.push(forLabel.innerText);
       } catch (e) {}
     }
@@ -1409,8 +1425,7 @@
 
     const scanForNewFields = async () => {
       pending = false;
-      const found = Array.from(document.querySelectorAll(AUTOFILLABLE_SELECTOR))
-        .filter(el => !alreadyProcessed.has(el) && isFillableVisible(el));
+      const found = collectFillableFields().filter(el => !alreadyProcessed.has(el));
 
       for (const el of found) {
         alreadyProcessed.add(el);
@@ -1446,7 +1461,21 @@
   // otra la está leyendo, y terminan eligiendo la opción equivocada.
   let autofillInProgress = false;
 
-  async function executeAutofill() {
+  /**
+   * Campos rellenables visibles de ESTE frame, incluidos los que viven en
+   * Shadow DOM abierto (web components de SuccessFactors, SmartRecruiters…).
+   */
+  function collectFillableFields() {
+    return Portals.deepQuerySelectorAll(AUTOFILLABLE_SELECTOR, document, isOwnUi).filter(isFillableVisible);
+  }
+
+  /**
+   * Rellena el frame actual y, desde el frame principal, también los iframes
+   * de la pestaña (Greenhouse, Workable, iCIMS o Indeed embebidos en el sitio
+   * de la empresa). En los iframes corre en modo `quiet`: el resumen único lo
+   * muestra el frame principal con el total.
+   */
+  async function executeAutofill({ quiet = false } = {}) {
     if (autofillInProgress) return { count: 0, alreadyRunning: true };
     autofillInProgress = true;
 
@@ -1455,16 +1484,17 @@
       try {
         profile = await loadProfile();
       } catch (e) {
-        showToast(e.message, "error");
+        if (!quiet) showToast(e.message, "error");
         return { count: 0, error: e.message };
       }
       if (!profile) {
-        showToast("Por favor abre JobFill AI y configura tus datos.", "error");
+        if (!quiet) showToast("Por favor abre JobFill AI y configura tus datos.", "error");
         return { count: 0 };
       }
 
-      // Search across the entire document and filter by visibility to support dynamic DOMs (LinkedIn, Getonbrd)
-      const inputs = Array.from(document.querySelectorAll(AUTOFILLABLE_SELECTOR)).filter(isFillableVisible);
+      // Todo el documento (y sus shadow roots), filtrado por visibilidad para
+      // los DOM dinámicos (LinkedIn, Getonbrd)
+      const inputs = collectFillableFields();
 
       let filledCount = 0;
       let keptCount = 0;
@@ -1478,9 +1508,17 @@
 
       const missingRequired = listMissingRequiredFields(inputs);
       highlightMissingFields(missingRequired);
-      showToast(buildAutofillSummary(filledCount, keptCount, missingRequired), missingRequired.length ? "info" : (filledCount ? "success" : "info"));
-
       watchForLateFields(profile, new Set(inputs));
+      if (quiet) return { count: filledCount, kept: keptCount, missing: missingRequired.length };
+
+      const frames = IS_TOP_FRAME ? await sendToWorker("AUTOFILL_SUBFRAMES") : null;
+      if (frames?.success && frames.frames > 0) {
+        filledCount += frames.count;
+        keptCount += frames.kept;
+      }
+      const summary = buildAutofillSummary(filledCount, keptCount, missingRequired);
+      const note = frames?.frames > 0 && frames.count > 0 ? ` Incluye ${frames.count} dentro de un formulario embebido.` : "";
+      showToast(summary + note, missingRequired.length ? "info" : (filledCount ? "success" : "info"));
 
       return { count: filledCount };
     } finally {
@@ -1812,7 +1850,7 @@
     // 1. Explicit <label for="...">  — la fuente más específica: apunta exactamente a este campo.
     if (el.id) {
       try {
-        const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        const label = rootOf(el).querySelector(`label[for="${CSS.escape(el.id)}"]`);
         if (label && label.innerText) questionCandidates.push(label.innerText);
       } catch (e) {}
     }
@@ -1822,7 +1860,7 @@
     if (labelledBy) {
       const parts = labelledBy.split(" ").map(id => {
         try {
-          const labelEl = document.getElementById(id);
+          const labelEl = rootOf(el).getElementById(id);
           return labelEl && labelEl.innerText ? labelEl.innerText : "";
         } catch (e) { return ""; }
       }).filter(Boolean);
@@ -2022,9 +2060,12 @@
       // Bumeran / Laborum / Trabajando / Indeed
       ".box_detail h1", "[class*='JobTitle']", ".job-detail__title", ".title-jobs",
       "h1[data-testid='jobsearch-JobInfoHeader-title']",
-      // Genéricos
-      "[class*='job-title']", "[class*='jobtitle']", "h1.title", "h1"
-    ], { min: 3, max: 120, reject: NON_TITLE_PATTERNS });
+      // Workable
+      "[data-ui='job-title']"
+    ], { min: 3, max: 120, reject: NON_TITLE_PATTERNS })
+      // JSON-LD antes que los genéricos: un <h1> puede ser cualquier cosa.
+      || jsonLdTitle()
+      || firstMatchingText(["[class*='job-title']", "[class*='jobtitle']", "h1.title", "h1"], { min: 3, max: 120, reject: NON_TITLE_PATTERNS });
   }
 
   function extractCompanyName() {
@@ -2043,10 +2084,10 @@
       ".box_detail.post a[href*='/empresas/']",
       // Getonbrd / Bumeran / Indeed
       ".gb-company-name", "[class*='company-name']", "[class*='CompanyName']",
-      "[data-testid='inlineHeader-companyName']",
-      // Genéricos
-      "[class*='employer']", "[class*='company']"
-    ], { min: 2, max: 80 });
+      "[data-testid='inlineHeader-companyName']"
+    ], { min: 2, max: 80 })
+      || jsonLdCompany()
+      || firstMatchingText(["[class*='employer']", "[class*='company']"], { min: 2, max: 80 });
   }
 
   /**
@@ -2203,20 +2244,48 @@
     return markers.filter(m => text.includes(m)).length >= 2;
   }
 
-  /** Oferta publicada como datos estructurados schema.org/JobPosting. */
-  function extractJobPostingJsonLd() {
+  /**
+   * Oferta publicada como datos estructurados schema.org/JobPosting (la
+   * publican Greenhouse, Lever, Ashby, Workable, SmartRecruiters, Teamtailor,
+   * Personio, Getonbrd y casi cualquier sitio que quiera salir en Google
+   * Jobs). Acepta un objeto, un array o un `@graph` (WordPress/Yoast).
+   */
+  function findJobPostingJsonLd() {
+    const isPosting = o => o && (o["@type"] === "JobPosting" || (Array.isArray(o["@type"]) && o["@type"].includes("JobPosting")));
     for (const script of document.querySelectorAll('script[type="application/ld+json"]')) {
       try {
         const parsed = JSON.parse(script.textContent);
-        const entries = Array.isArray(parsed) ? parsed : [parsed];
-        const posting = entries.find(o => o && (o["@type"] === "JobPosting" || (Array.isArray(o["@type"]) && o["@type"].includes("JobPosting"))));
-        if (posting?.description) {
-          const text = String(posting.description).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
-          if (text.length > 200) return text.slice(0, 6000);
-        }
+        const entries = (Array.isArray(parsed) ? parsed : [parsed])
+          .flatMap(o => (o && Array.isArray(o["@graph"]) ? o["@graph"] : [o]));
+        const posting = entries.find(isPosting);
+        if (posting) return posting;
       } catch (e) { /* JSON-LD malformado: se ignora y se sigue con el DOM */ }
     }
-    return "";
+    return null;
+  }
+
+  /** Texto plano de un valor JSON-LD (la descripción suele venir en HTML). DOMParser es inerte: no carga imágenes ni ejecuta nada. */
+  function jsonLdText(value) {
+    const doc = new DOMParser().parseFromString(String(value || ""), "text/html");
+    return (doc.body?.textContent || "").replace(/\s+/g, " ").trim();
+  }
+
+  function jsonLdTitle() {
+    const t = jsonLdText(findJobPostingJsonLd()?.title);
+    return t.length >= 3 && t.length <= 120 && !NON_TITLE_PATTERNS.test(t) ? t : "";
+  }
+
+  function jsonLdCompany() {
+    const org = findJobPostingJsonLd()?.hiringOrganization;
+    const t = jsonLdText(typeof org === "string" ? org : org?.name);
+    return t.length >= 2 && t.length <= 80 ? t : "";
+  }
+
+  function extractJobPostingJsonLd() {
+    const posting = findJobPostingJsonLd();
+    if (!posting?.description) return "";
+    const text = jsonLdText(posting.description);
+    return text.length > 200 ? text.slice(0, 6000) : "";
   }
 
   /**
@@ -2294,6 +2363,10 @@
       "[data-automation-id='jobPostingDescription']",
       // Lever
       ".posting-description", ".section-wrapper.page-full-width",
+      // Microdatos schema.org (muchos sitios de empleo propios)
+      "[itemprop='description']",
+      // Workable / SmartRecruiters / Ashby
+      "[data-ui='job-description']", ".job-sections", "[class*='descriptionText']",
       // Genérico de respaldo
       "[class*='jobdescription']", "[class*='job_description']", "main"
     ];
@@ -4211,34 +4284,64 @@
     return ui;
   }
 
-  /** Texto de contexto de un <input type=file>, para decidir si es el campo del CV. */
-  function fileInputContext(input) {
-    const parts = [getFieldContext(input), input.accept || ""];
-    const container = input.closest("label, .form-group, .field, [class*='upload'], [class*='file'], [class*='dropzone'], [class*='resume'], [class*='cv']");
-    if (container && container.innerText) parts.push(container.innerText.slice(0, 200));
-    return parts.join(" ");
+  const Portals = self.JobFillPortals;
+
+  /** Hosts de la propia extensión: la búsqueda profunda no entra en ellos. */
+  function isOwnUi(el) {
+    return Boolean(el.closest?.(".jobfill-floating-container, .jobfill-dialog-host"));
   }
 
-  const CV_FILE_RE = /\b(cv|c\.v\.|curr[ií]cul|resume|r[ée]sum[ée]|hoja de vida|curriculum)/i;
-  const NOT_CV_FILE_RE = /(carta|cover|motivaci|foto|photo|imagen|image|portafolio|portfolio|certificad|t[ií]tulo|diploma|transcript)/i;
+  /** Texto de contexto de un <input type=file> o una zona de soltar, para puntuarlo. */
+  function fileTargetText(el) {
+    const attrs = ["id", "name", "data-automation-id", "data-testid", "data-test", "data-ui", "data-field", "aria-label"]
+      .map(a => el.getAttribute?.(a) || "").join(" ");
+    const labelParts = [getFieldContext(el)];
+    const container = el.closest("label, fieldset, .form-group, .field, [class*='upload' i], [class*='file' i], [class*='dropzone' i], [class*='drop-zone' i], [class*='resume' i], [class*='attachment' i], [data-automation-id*='upload' i]");
+    if (container && container.innerText) labelParts.push(container.innerText.slice(0, 200));
+    return { attrs, label: labelParts.join(" ") };
+  }
 
   /**
-   * Elige el <input type=file> del CV. Solo se adjunta cuando el campo se
-   * identifica como CV (o es el ÚNICO campo de archivo y acepta PDF): con
+   * Mejor destino para el CV en ESTE frame: un <input type=file> (también
+   * dentro de Shadow DOM) o, si la zona no tiene input, la zona de soltar.
+   * Devuelve { el, kind, score } o { el: null, reason }.
+   *
+   * Solo se adjunta a algo identificado como CV (puntaje ≥ 60). Un campo
+   * neutro (15) cuenta solo si es el ÚNICO campo de archivo del frame: con
    * varios campos ambiguos (CV, carta, certificados) no se adivina.
    */
-  function findCvFileInput() {
-    const inputs = [...document.querySelectorAll('input[type="file"]')].filter(i => !i.disabled);
-    const acceptsPdf = i => !i.accept || /pdf|application\/\*|\*\/\*/i.test(i.accept);
-    const candidates = inputs.filter(acceptsPdf).map(input => {
-      const ctx = fileInputContext(input);
-      return { input, isCv: CV_FILE_RE.test(ctx), notCv: NOT_CV_FILE_RE.test(ctx) && !CV_FILE_RE.test(ctx) };
+  function findCvTarget() {
+    const portalHits = new Set();
+    for (const sel of Portals.PORTAL_CV_SELECTORS) {
+      try { Portals.deepQuerySelectorAll(sel, document, isOwnUi).forEach(el => portalHits.add(el)); } catch (e) { /* selector no soportado */ }
+    }
+    const inputs = Portals.deepQuerySelectorAll('input[type="file"]', document, isOwnUi).filter(i => !i.disabled);
+    const scored = inputs.map(el => {
+      const { attrs, label } = fileTargetText(el);
+      return { el, kind: "input", score: Portals.scoreCvCandidate({ portalMatch: portalHits.has(el), attrs, label, accept: el.accept }) };
     });
-    const explicit = candidates.filter(c => c.isCv);
-    if (explicit.length) return { input: explicit[0].input };
-    const neutral = candidates.filter(c => !c.notCv);
-    if (inputs.length === 1 && neutral.length === 1) return { input: neutral[0].input };
-    return { input: null, reason: inputs.length ? "no se identificó con certeza cuál es el campo del CV" : "la página no tiene un campo para subir archivos" };
+
+    // Zonas de soltar SIN input adentro (con input, ya se puntuó el input).
+    const zones = Portals.deepQuerySelectorAll(Portals.DROPZONE_SELECTOR, document, isOwnUi)
+      .filter(z => !z.querySelector('input[type="file"]') && !z.parentElement?.closest(Portals.DROPZONE_SELECTOR));
+    for (const el of zones) {
+      const { attrs, label } = fileTargetText(el);
+      scored.push({ el, kind: "dropzone", score: Portals.scoreCvCandidate({ attrs, label }) });
+    }
+
+    const total = inputs.length + zones.length;
+    const best = scored.filter(c => c.score >= 60).sort((a, b) => b.score - a.score)[0];
+    if (best) return best;
+    const neutral = scored.filter(c => c.score > 0);
+    if (total === 1 && neutral.length === 1) return neutral[0];
+    return { el: null, score: 0, total, reason: total ? "no se identificó con certeza cuál es el campo del CV" : "la página no tiene un campo para subir archivos" };
+  }
+
+  /** Lo que el service worker necesita para elegir frame, sin tocar nada. */
+  function probeCvTarget() {
+    const t = findCvTarget();
+    const filled = t.kind === "input" && t.el.files?.length > 0;
+    return { score: filled ? 0 : t.score, total: t.total ?? 1, filled, kind: t.kind || "", reason: filled ? "el campo del CV ya tiene un archivo (no se reemplaza)" : t.reason || "" };
   }
 
   function base64ToBytes(b64) {
@@ -4249,20 +4352,34 @@
   }
 
   /**
-   * Adjunta el PDF al campo del CV. Mismo principio que el autorrelleno:
-   * nunca se reemplaza un archivo que el usuario ya eligió.
+   * Adjunta el PDF al campo del CV de ESTE frame. Mismo principio que el
+   * autorrelleno: nunca se reemplaza un archivo que el usuario ya eligió.
+   *
+   * Con un input: DataTransfer → `input.files` + eventos input/change que
+   * burbujean (así lo ven React/Vue/Angular, que escuchan en la raíz). Con una
+   * zona sin input: dragenter/dragover/drop sintéticos con el mismo
+   * DataTransfer, que es lo que hace el navegador al soltar un archivo.
    */
   function attachPdfToForm(base64, fileName) {
-    const { input, reason } = findCvFileInput();
-    if (!input) return { attached: false, reason };
-    if (input.files && input.files.length) return { attached: false, reason: "el campo del CV ya tiene un archivo (no se reemplaza)" };
+    const target = findCvTarget();
+    if (!target.el) return { attached: false, reason: target.reason };
     const file = new File([base64ToBytes(base64)], fileName, { type: "application/pdf" });
     const dt = new DataTransfer();
     dt.items.add(file);
-    input.files = dt.files;
-    input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
-    input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
-    return { attached: true };
+
+    if (target.kind === "input") {
+      const input = target.el;
+      if (input.files && input.files.length) return { attached: false, reason: "el campo del CV ya tiene un archivo (no se reemplaza)" };
+      input.files = dt.files;
+      input.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
+      return { attached: true, kind: "input" };
+    }
+
+    for (const type of ["dragenter", "dragover", "drop"]) {
+      target.el.dispatchEvent(new DragEvent(type, { bubbles: true, cancelable: true, composed: true, dataTransfer: dt }));
+    }
+    return { attached: true, kind: "dropzone" };
   }
 
   function downloadPdf(base64, fileName) {
@@ -4290,9 +4407,20 @@
     if (activeApplyFlow) return;
     let job = {};
     try { job = await resolveJobContext(); } catch (e) { /* se valida abajo */ }
-    const oferta = (job.description || "").trim();
-    const empresa = job.company || extractCompanyName() || "";
-    const cargo = job.title || extractJobTitle() || "";
+    let oferta = (job.description || "").trim();
+    let empresa = job.company || extractCompanyName() || "";
+    let cargo = job.title || extractJobTitle() || "";
+    if (oferta.length < 80) {
+      // Formulario embebido: la oferta puede estar dentro del iframe del ATS.
+      const fromFrames = await sendToWorker("FRAMES_JOB_CONTEXT");
+      if (fromFrames?.description) {
+        // El cargo y la empresa del iframe mandan: el <h1> del sitio que lo
+        // envuelve suele ser "Trabaja con nosotros", no el cargo.
+        oferta = fromFrames.description.trim();
+        empresa = fromFrames.company || empresa;
+        cargo = fromFrames.title || cargo;
+      }
+    }
     if (oferta.length < 80) {
       showToast("No encontré la descripción de la oferta en esta página. Abre la oferta y guárdala con 📄 Guardar cargo, y después vuelve al formulario.", "error");
       return;
@@ -4318,7 +4446,7 @@
       }
 
       ui.setStep("adjuntar", "Buscando el campo para subir el CV…");
-      const attach = attachPdfToForm(res.base64, res.archivo);
+      const attach = await sendToWorker("APPLY_ATTACH_CV", { base64: res.base64, archivo: res.archivo });
       ui.setStep("rellenar", "Rellenando el resto del formulario…");
       const fill = await executeAutofill();
       ui.finishSteps();
@@ -4327,9 +4455,11 @@
       ui.showResult([
         { text: `✓ CV ${res.perfil} adaptado${res.ajustado ? " (con un ajuste automático)" : ""} y guardado en tu vault: cv/generados/${res.archivo}`, tone: "ok" },
         attach.attached
-          ? { text: "✓ PDF adjuntado al campo del CV. Revísalo antes de enviar.", tone: "ok" }
-          : { text: `⚠ No se adjuntó automáticamente: ${attach.reason}. Descárgalo y súbelo a mano.`, tone: "warn" },
-        { text: fill?.count ? `✓ ${fill.count} campos del formulario rellenados.` : "Formulario sin campos vacíos que rellenar." },
+          ? { text: `✓ PDF adjuntado al campo del CV${attach.inFrame ? " (formulario embebido)" : ""}. Revísalo antes de enviar.`, tone: "ok" }
+          : attach.pending
+            ? { text: "⏳ Este paso del formulario aún no pide el CV: se adjuntará solo cuando aparezca el campo (en esta pestaña, durante 30 min).", tone: "warn" }
+            : { text: `⚠ No se adjuntó automáticamente: ${attach.reason || attach.error || "error desconocido"}. Descárgalo y súbelo a mano.`, tone: "warn" },
+        { text: fill?.count ? `✓ ${fill.count === 1 ? "1 campo del formulario rellenado" : `${fill.count} campos del formulario rellenados`}.` : "Formulario sin campos vacíos que rellenar." },
         res.cobertura ? { text: `Requisitos de la oferta respaldados por tu grafo: ${res.cobertura}` } : null,
         res.faltantes?.length ? { text: "Sin respaldo en tu BASE (no se mencionan en el CV):", tone: "warn", items: res.faltantes } : null,
         warnings.length ? { text: "Avisos del verificador:", tone: "warn", items: warnings } : null
@@ -4364,6 +4494,59 @@
     if (d) d.textContent = "";
   }
 
+  /**
+   * API de este frame para el service worker (chrome.scripting corre en el
+   * mismo mundo aislado que el content script). Nunca la ve la página: vive
+   * en el mundo aislado, no en `window` de la página.
+   */
+  globalThis.JobFillFrame = {
+    probeCv: () => extensionEnabled ? probeCvTarget() : { score: 0, total: 0, reason: "JobFill AI está apagado" },
+    attachCv: (base64, fileName) => extensionEnabled ? attachPdfToForm(base64, fileName) : { attached: false, reason: "JobFill AI está apagado" },
+    autofill: () => (IS_TOP_FRAME || !extensionEnabled) ? { skipped: true } : executeAutofill({ quiet: true }),
+    job: () => {
+      const { text, reliable } = extractJobDescriptionWithSource();
+      return { title: extractJobTitle(), company: extractCompanyName(), text, reliable };
+    }
+  };
+
+  /*
+   * CV pendiente (formularios de varios pasos). Mientras el service worker
+   * tenga un PDF pendiente para esta pestaña, cada frame vigila si aparece el
+   * campo del CV y lo reclama una sola vez. Fuera de ese estado no se busca
+   * nada: la búsqueda profunda no corre en cada mutación de cada página.
+   */
+  let pendingCvWatch = false;
+  let pendingCvTimer = null;
+  const offeredCvTargets = new WeakSet();
+
+  function setPendingCvWatch(active) {
+    pendingCvWatch = active;
+    clearTimeout(pendingCvTimer);
+    if (active) schedulePendingCvCheck();
+  }
+
+  function schedulePendingCvCheck() {
+    if (!pendingCvWatch || pendingCvTimer) return;
+    pendingCvTimer = setTimeout(checkPendingCv, 700);
+  }
+
+  async function checkPendingCv() {
+    pendingCvTimer = null;
+    if (!pendingCvWatch || !extensionEnabled) return;
+    const target = findCvTarget();
+    if (!target.el || offeredCvTargets.has(target.el)) return;
+    offeredCvTargets.add(target.el);
+    if (target.kind === "input" && target.el.files?.length) return;
+
+    const claim = await sendToWorker("CLAIM_PENDING_CV");
+    if (!claim?.base64) return;
+    const result = attachPdfToForm(claim.base64, claim.archivo);
+    showToast(result.attached
+      ? `📎 CV adaptado adjuntado: ${claim.archivo}. Revísalo antes de enviar.`
+      : `No se pudo adjuntar el CV adaptado: ${result.reason}. Descárgalo desde tu vault (cv/generados).`,
+      result.attached ? "success" : "error");
+  }
+
   /** Quita de la página todo lo que la extensión dibuja de forma persistente. */
   function teardownPageUi() {
     document.querySelector(".jobfill-floating-container")?.remove();
@@ -4374,8 +4557,8 @@
   /** Aplica el interruptor global en esta pestaña, sin recargar. */
   function applyEnabledState(enabled) {
     extensionEnabled = enabled;
-    if (enabled) initFloatingWidget();
-    else teardownPageUi();
+    if (enabled && IS_TOP_FRAME) initFloatingWidget();
+    else if (!enabled) teardownPageUi();
   }
 
   document.addEventListener("focusin", (e) => {
@@ -4408,6 +4591,15 @@
   });
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === "CV_PENDING") {
+      setPendingCvWatch(message.active === true);
+      return false;
+    }
+
+    // El popup envía a todos los frames; responde solo el principal, que
+    // además rellena los iframes (AUTOFILL_SUBFRAMES) y suma el total.
+    if (!IS_TOP_FRAME) return false;
+
     if (message.type === "TRIGGER_AUTOFILL") {
       if (!extensionEnabled) {
         sendResponse({ success: false, count: 0, disabled: true });
@@ -4450,6 +4642,8 @@
   // Dynamic MutationObserver to monitor LinkedIn Easy Apply / Getonbrd modals & step transitions
   const observer = new MutationObserver(() => {
     if (!extensionEnabled) return;
+    schedulePendingCvCheck();
+    if (!IS_TOP_FRAME) return;
     initFloatingWidget();
     // Cubre las SPA: en LinkedIn o Getonbrd la pantalla de "postulación
     // enviada" aparece sin recargar la página, así que un chequeo único al
@@ -4478,7 +4672,16 @@
   chrome.storage.local.get(["extensionEnabled", "widgetCollapsed", "vaultLastSync"]).then(prefs => {
     widgetCollapsed = prefs.widgetCollapsed === true;
     vaultConnected = Boolean(prefs.vaultLastSync);
-    const start = () => applyEnabledState(prefs.extensionEnabled !== false);
+    const start = () => {
+      applyEnabledState(prefs.extensionEnabled !== false);
+      // Un paso nuevo del formulario puede ser una página nueva (Taleo,
+      // iCIMS): se pregunta si quedó un CV pendiente. Solo el frame principal
+      // y los iframes con campos preguntan; los de anuncios no despiertan al
+      // service worker.
+      if (extensionEnabled && (IS_TOP_FRAME || document.querySelector("input, textarea, select"))) {
+        sendToWorker("HAS_PENDING_CV").then(r => { if (r?.pending) setPendingCvWatch(true); });
+      }
+    };
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", start);
     } else {

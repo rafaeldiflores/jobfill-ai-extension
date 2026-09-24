@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "JobFill AI - Auto-rellenador de Empleos",
-  "version": "1.5.0",
+  "version": "1.6.0",
   "description": "Guarda tu perfil profesional y autocompleta formularios de postulación laboral con 1 clic. Asistente con Claude IA.",
   "permissions": [
     "storage",
@@ -44,12 +44,14 @@
         "<all_urls>"
       ],
       "js": [
+        "content/portals.js",
         "content/autofill.js"
       ],
       "css": [
         "content/autofill.css"
       ],
-      "run_at": "document_idle"
+      "run_at": "document_idle",
+      "all_frames": true
     }
   ],
   "icons": {
@@ -63,7 +65,9 @@
         "options/pdf.worker.min.js",
         "options/pdf.min.js"
       ],
-      "matches": ["<all_urls>"]
+      "matches": [
+        "<all_urls>"
+      ]
     }
   ]
 }
