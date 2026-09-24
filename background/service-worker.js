@@ -852,6 +852,8 @@ async function adaptCvForOffer({ oferta, empresa, cargo, resume = false, cambio 
     const pedido = String(cambio || "").trim().slice(0, JobFillCv.CAMBIO_MAX);
     if (pedido) cp.cambioPendiente = pedido;
   } else {
+    // Ofertas guardadas antes de limpiar el nombre traían "3IT Follow August 31…".
+    empresa = JobFillPortals.cleanCompanyName(empresa);
     cp = { input: { oferta, empresa, cargo } };
     await writeApplyCheckpoint(tabId, null);
   }

@@ -2885,27 +2885,43 @@ it("Apply flow: a requested change keeps the vault rules, uses only BASE facts a
   assert.ok(sw.indexOf("cp.cambioPendiente) {") < sw.indexOf("let validacion = cp.validacion;"), "el cambio se aplica antes de validar");
 });
 
-it("CV from the AI: a missing frontmatter/titulo is repaired without AI instead of crashing the flow", () => {
+it("CV from the AI: the frontmatter is rebuilt so the Worker's YAML parser always finds a text titulo", () => {
   const C = loadRealCvAdapter();
   const body = "## RESUMEN PROFESIONAL\nTexto.";
   const T = "Ingeniero en Informática | AI Engineer";
-  // Sin frontmatter (el error real: "El CV necesita titulo en el frontmatter").
-  assert.strictEqual(C.normalizeCvMarkdown(body, T), `---\ntitulo: "${T}"\n---\n${body}`);
-  // Envuelto en ```markdown.
-  assert.strictEqual(C.normalizeCvMarkdown("```markdown\n" + body + "\n```", T), `---\ntitulo: "${T}"\n---\n${body}`);
-  // Frontmatter sin titulo, o con `title:`.
-  assert.strictEqual(C.normalizeCvMarkdown(`---\nperfil: AI\n---\n${body}`, T), `---\ntitulo: "${T}"\nperfil: AI\n---\n${body}`);
-  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitle: "X | Y"\n---\n${body}`, T), `---\ntitulo: "X | Y"\n---\n${body}`);
-  // Un CV correcto no se toca (CRLF incluido).
-  const ok = `---\ntitulo: "A | B"\n---\n${body}`;
-  assert.strictEqual(C.normalizeCvMarkdown(ok, T), ok);
-  assert.strictEqual(C.normalizeCvMarkdown(ok.replace(/\n/g, "\r\n"), T), ok);
-  // Comillas del titulo de respaldo no rompen el YAML.
-  assert.match(C.normalizeCvMarkdown(body, 'Ing | "Dev"'), /^---\ntitulo: "Ing \| 'Dev'"\n---/);
+  const fm = t => `---\ntitulo: ${JSON.stringify(t)}\n---\n${body}`;
+  // Casos reales que el Worker (gray-matter) rechazaba con "El CV necesita titulo en el frontmatter" o un error de YAML.
+  assert.strictEqual(C.normalizeCvMarkdown(body, T), fm(T), "sin frontmatter");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitulo: "Ing | Full-Stack ("GenAI")"\n---\n${body}`, T), fm('Ing | Full-Stack ("GenAI")'), "comillas dentro de comillas");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitulo: Ing | Full-Stack: AI\n---\n${body}`, T), fm("Ing | Full-Stack: AI"), "dos puntos sin comillas");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitle: "X | Y"\n---\n${body}`, T), fm("X | Y"), "title en inglés");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\\ntitulo: \\"A | B\\"\\n---\\n## RESUMEN PROFESIONAL\\nTexto.`, T), fm("A | B"), "\\n literales");
+  assert.strictEqual(C.normalizeCvMarkdown(`Aquí está tu CV:\n\n---\ntitulo: "A | B"\n---\n${body}`, T), fm("A | B"), "texto previo");
+  assert.strictEqual(C.normalizeCvMarkdown("```markdown\n---\ntitulo: \"A | B\"\n---\n" + body + "\n```", T), fm("A | B"), "bloque ```");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitulo: ""\n---\n${body}`, T), fm(T), "titulo vacío");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\n---\n${body}`, T), fm(T), "frontmatter vacío");
+  assert.strictEqual(C.normalizeCvMarkdown(`Hola\n${body}`, T), fm(T), "texto antes de la primera sección");
+  // perfil se conserva; un CV correcto queda equivalente (CRLF/BOM incluidos).
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitulo: "A | B"\nperfil: AI\n---\n${body}`, T), `---\ntitulo: "A | B"\nperfil: "AI"\n---\n${body}`);
+  assert.strictEqual(C.normalizeCvMarkdown("\uFEFF" + fm("A | B").replace(/\n/g, "\r\n"), T), fm("A | B"));
+  // Idempotente.
+  const once = C.normalizeCvMarkdown(`---\ntitulo: Ing: AI\n---\n${body}`, T);
+  assert.strictEqual(C.normalizeCvMarkdown(once, T), once);
   // tituloDePerfil lee titulos con o sin comillas.
   assert.strictEqual(C.tituloDePerfil('---\ntitulo: "A | B"\n---'), "A | B");
   assert.strictEqual(C.tituloDePerfil("---\ntitulo: A | B\n---"), "A | B");
   assert.strictEqual(C.tituloDePerfil(body), "");
+});
+
+it("Company names lose the portal noise glued to them (Follow, dates, 'Last replied…')", () => {
+  const P = loadRealPortals();
+  assert.strictEqual(P.cleanCompanyName("3IT Follow August 31, 2026 Last replied to candidates about 4 hours ago"), "3IT");
+  assert.strictEqual(P.cleanCompanyName("3IT\nFollow\nAugust 31"), "3IT");
+  assert.strictEqual(P.cleanCompanyName("Acme Labs · Santiago, Chile"), "Acme Labs");
+  assert.strictEqual(P.cleanCompanyName("Banco Estado Seguir"), "Banco Estado");
+  assert.strictEqual(P.cleanCompanyName("Falabella 12.345 seguidores"), "Falabella");
+  assert.strictEqual(P.cleanCompanyName("Empresa X Publicado hace 3 días"), "Empresa X");
+  for (const ok of ["Mayo Clinic", "Hace Group", "Posted Labs", "BCI", ""]) assert.strictEqual(P.cleanCompanyName(ok), ok);
 });
 
 it("Postulador rejecting the CV content becomes a verifier finding for the automatic fix, not a crash", () => {

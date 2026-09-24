@@ -2205,6 +2205,10 @@
   }
 
   function extractCompanyName() {
+    return Portals.cleanCompanyName(extractCompanyNameRaw());
+  }
+
+  function extractCompanyNameRaw() {
     return firstMatchingText([
       "[itemprop='hiringOrganization']",
       // LinkedIn
@@ -2324,7 +2328,7 @@
       const hasEvidence = best.score >= 40;
       return {
         title: best.context.title,
-        company: best.context.company,
+        company: Portals.cleanCompanyName(best.context.company),
         description: best.context.description,
         fromCache: true,
         capturedAt: best.context.capturedAt,
@@ -4699,7 +4703,7 @@
     let job = {};
     try { job = await resolveJobContext(); } catch (e) { /* se valida abajo */ }
     let oferta = (job.description || "").trim();
-    let empresa = job.company || extractCompanyName() || "";
+    let empresa = Portals.cleanCompanyName(job.company) || extractCompanyName() || "";
     let cargo = job.title || extractJobTitle() || "";
     if (oferta.length < 80) {
       // Formulario embebido: la oferta puede estar dentro del iframe del ATS.
@@ -4708,7 +4712,7 @@
         // El cargo y la empresa del iframe mandan: el <h1> del sitio que lo
         // envuelve suele ser "Trabaja con nosotros", no el cargo.
         oferta = fromFrames.description.trim();
-        empresa = fromFrames.company || empresa;
+        empresa = Portals.cleanCompanyName(fromFrames.company) || empresa;
         cargo = fromFrames.title || cargo;
       }
     }

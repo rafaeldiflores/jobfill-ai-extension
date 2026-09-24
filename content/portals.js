@@ -235,7 +235,30 @@
     });
   }
 
+  /**
+   * Nombre de empresa limpio. El elemento de la empresa en LinkedIn y otros
+   * portales trae pegado el botón "Follow"/"Seguir", la fecha y "Last replied
+   * to candidates…"; al aplanar el texto quedaba "3IT Follow August 31, 2026
+   * Last replied to candidates about 4 hours ago" y eso llegaba al CV y al
+   * Tracker. Se corta en el primer marcador de ese ruido.
+   */
+  const COMPANY_NOISE_RE = new RegExp([
+    "\\s+(?:follow|following|seguir|siguiendo)\\b",
+    "\\s+(?:posted|reposted|publicad[oa]|last replied|actively|responds?|hace\\s+\\d|\\d+\\s+(?:minutes?|hours?|days?|weeks?|months?)\\s+ago)\\b",
+    "\\s+(?:january|february|march|april|may|june|july|august|september|october|november|december|enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\\s+\\d{1,2}\\b",
+    "\\s+\\d{1,2}\\s+de\\s+[a-záéíóú]+\\s+de\\s+\\d{4}",
+    "\\s+[·•|]\\s+",
+    "\\s+\\d[\\d.,]*\\s*(?:followers|seguidores|employees|empleados)\\b"
+  ].join("|"), "i");
+
+  function cleanCompanyName(text) {
+    const first = String(text || "").split(/\n/).map(l => l.trim()).find(Boolean) || "";
+    const cut = first.search(COMPANY_NOISE_RE);
+    return (cut > 0 ? first.slice(0, cut) : first).replace(/\s+/g, " ").trim().slice(0, 80);
+  }
+
   root.JobFillPortals = {
+    cleanCompanyName,
     PLACEHOLDER_RE,
     isPlaceholderOption,
     pickOptionIndex,
