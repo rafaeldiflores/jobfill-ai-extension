@@ -8,6 +8,19 @@
  * NUNCA asumir que content[0] es el bloque de texto: si el modelo razona, los
  * primeros bloques son de tipo "thinking" y content[0].text es undefined.
  */
+/**
+ * Escapa un valor del usuario antes de meterlo en un template de innerHTML.
+ * Las tarjetas de Q&A, campos flexibles, cargos y proyectos se arman con
+ * `value="${...}"` y `<textarea>${...}</textarea>`: sin escapar, un valor con
+ * comillas (`Proyecto "MAZA"`) cortaba el atributo y el resto se PERDÍA al
+ * guardar, y un `</textarea>` en una respuesta rompía la tarjeta entera.
+ */
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, c => (
+    { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
+  ));
+}
+
 function extractClaudeText(data) {
   const blocks = Array.isArray(data?.content) ? data.content : [];
   return blocks
@@ -47,6 +60,9 @@ const GLOBAL_SETTING_KEYS = [
  * CV — estas dos funciones son el único puente hacia/desde el esquema real.
  */
 const CV_INDEX_OWN_FIELDS = ["id", "name", "targetRole", "keywords"];
+
+/** Credenciales que nunca salen ni entran por un archivo de respaldo. */
+const BACKUP_EXCLUDED_KEYS = ["claudeApiKey", "vertexApiKey", "vertexProjectId", "vertexRegion"];
 
 /** `candidateBase` + cada `cvIndexes[]` → un array de objetos "con forma de perfil". */
 function profilesFromCandidateData(candidateBase, cvIndexes) {
@@ -570,9 +586,9 @@ document.addEventListener("DOMContentLoaded", async () => {
           <label>Palabras clave (separadas por coma):</label>
           <button type="button" class="btn-delete-qa" data-idx="${idx}">✕ Eliminar</button>
         </div>
-        <input type="text" class="qa-keywords-input" value="${qa.keywords || ""}" placeholder="ej: motivacion, por que quieres trabajar, why work here">
+        <input type="text" class="qa-keywords-input" value="${escapeHtml(qa.keywords)}" placeholder="ej: motivacion, por que quieres trabajar, why work here">
         <label style="margin-top: 4px;">Respuesta predefinida:</label>
-        <textarea class="qa-answer-input" rows="3" placeholder="Escribe tu respuesta aquí...">${qa.answer || ""}</textarea>
+        <textarea class="qa-answer-input" rows="3" placeholder="Escribe tu respuesta aquí...">${escapeHtml(qa.answer)}</textarea>
       `;
       qaList.appendChild(card);
     });
@@ -623,13 +639,13 @@ document.addEventListener("DOMContentLoaded", async () => {
           <label><strong>Nombre / Etiqueta del Campo:</strong></label>
           <button type="button" class="btn-delete-cf" data-idx="${idx}">✕ Eliminar</button>
         </div>
-        <input type="text" class="cf-label-input" value="${cf.label || ""}" placeholder="Ej: Licencia de Conducir, Renta Líquida, Nacionalidad">
+        <input type="text" class="cf-label-input" value="${escapeHtml(cf.label)}" placeholder="Ej: Licencia de Conducir, Renta Líquida, Nacionalidad">
         
         <label style="margin-top: 6px;"><strong>Valor a rellenar:</strong></label>
-        <input type="text" class="cf-value-input" value="${cf.value || ""}" placeholder="Ej: Clase B al día / $2.000.000 CLP / Chilena">
+        <input type="text" class="cf-value-input" value="${escapeHtml(cf.value)}" placeholder="Ej: Clase B al día / $2.000.000 CLP / Chilena">
 
         <label style="margin-top: 6px;"><strong>Palabras clave y sinónimos (separadas por comas):</strong></label>
-        <input type="text" class="cf-keywords-input" value="${cf.keywords || ""}" placeholder="Ej: licencia, conducir, driver license, carnet conducir">
+        <input type="text" class="cf-keywords-input" value="${escapeHtml(cf.keywords)}" placeholder="Ej: licencia, conducir, driver license, carnet conducir">
       `;
       customFieldsList.appendChild(card);
     });
@@ -1502,28 +1518,28 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
           <div class="cv-exp-grid">
             <div>
               <label>Empresa:</label>
-              <input type="text" class="cv-exp-company" value="${exp.company || ""}" placeholder="Ej: Tech Corp">
+              <input type="text" class="cv-exp-company" value="${escapeHtml(exp.company)}" placeholder="Ej: Tech Corp">
             </div>
             <div>
               <label>Cargo / Rol:</label>
-              <input type="text" class="cv-exp-role" value="${exp.role || ""}" placeholder="Ej: Senior Full Stack Developer">
+              <input type="text" class="cv-exp-role" value="${escapeHtml(exp.role)}" placeholder="Ej: Senior Full Stack Developer">
             </div>
             <div>
               <label>Período:</label>
-              <input type="text" class="cv-exp-period" value="${exp.period || ""}" placeholder="Ej: 2022 - Presente">
+              <input type="text" class="cv-exp-period" value="${escapeHtml(exp.period)}" placeholder="Ej: 2022 - Presente">
             </div>
           </div>
           <div>
             <label style="margin-top: 4px;">Responsabilidades Principales:</label>
-            <textarea class="cv-exp-desc" rows="2" placeholder="Resumen de responsabilidades...">${exp.description || ""}</textarea>
+            <textarea class="cv-exp-desc" rows="2" placeholder="Resumen de responsabilidades...">${escapeHtml(exp.description)}</textarea>
           </div>
           <div>
             <label style="margin-top: 4px;">Logros Clave y Métricas (Utilizados por Claude para argumentar idoneidad en postulaciones):</label>
-            <textarea class="cv-exp-achieve" rows="2" placeholder="Ej: Aumento del 40% en performance, reducción de costos AWS en 25%...">${exp.achievements || ""}</textarea>
+            <textarea class="cv-exp-achieve" rows="2" placeholder="Ej: Aumento del 40% en performance, reducción de costos AWS en 25%...">${escapeHtml(exp.achievements)}</textarea>
           </div>
           <div>
             <label style="margin-top: 4px;">Tecnologías Utilizadas:</label>
-            <input type="text" class="cv-exp-tech" value="${exp.technologies || ""}" placeholder="Ej: React, Python, PostgreSQL, Docker, AWS">
+            <input type="text" class="cv-exp-tech" value="${escapeHtml(exp.technologies)}" placeholder="Ej: React, Python, PostgreSQL, Docker, AWS">
           </div>
         `;
         cvExperiencesList.appendChild(card);
@@ -1544,16 +1560,16 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
           <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
             <div>
               <label>Nombre del Proyecto:</label>
-              <input type="text" class="cv-proj-name" value="${proj.name || ""}" placeholder="Ej: Plataforma de E-Commerce">
+              <input type="text" class="cv-proj-name" value="${escapeHtml(proj.name)}" placeholder="Ej: Plataforma de E-Commerce">
             </div>
             <div>
               <label>Stack Tecnológico:</label>
-              <input type="text" class="cv-proj-tech" value="${proj.technologies || ""}" placeholder="Ej: FastAPI, React, Redis">
+              <input type="text" class="cv-proj-tech" value="${escapeHtml(proj.technologies)}" placeholder="Ej: FastAPI, React, Redis">
             </div>
           </div>
           <div>
             <label style="margin-top: 4px;">Descripción e Impacto:</label>
-            <textarea class="cv-proj-desc" rows="2" placeholder="Objetivo del proyecto e impacto alcanzado...">${proj.description || ""}</textarea>
+            <textarea class="cv-proj-desc" rows="2" placeholder="Objetivo del proyecto e impacto alcanzado...">${escapeHtml(proj.description)}</textarea>
           </div>
         `;
         cvProjectsList.appendChild(card);
@@ -1639,13 +1655,19 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
   if (btnExportJson) {
     btnExportJson.addEventListener("click", async () => {
       const allData = await chrome.storage.local.get(null);
+      // Las API keys NO van en el respaldo: es un archivo que termina en
+      // Descargas, Drive o un correo, y con la key cualquiera puede gastar tu
+      // saldo. Al importarlo, las keys que ya tengas configuradas se
+      // conservan (storage.set fusiona).
+      for (const key of BACKUP_EXCLUDED_KEYS) delete allData[key];
       const blob = new Blob([JSON.stringify(allData, null, 2)], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
       a.download = `JobFill_AI_Backup_${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
-      URL.revokeObjectURL(url);
+      // Revocar en el mismo tick puede cancelar la descarga en algunos navegadores.
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
     });
   }
 
@@ -1663,6 +1685,18 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
       reader.onload = async (event) => {
         try {
           const importedData = JSON.parse(event.target.result);
+
+          // Solo se acepta algo con forma de respaldo de JobFill AI: un JSON
+          // cualquiera (o un array) se escribía tal cual en storage.
+          const isPlainObject = importedData && typeof importedData === "object" && !Array.isArray(importedData);
+          const looksLikeBackup = isPlainObject && (importedData.candidateBase || Array.isArray(importedData.profiles));
+          if (!looksLikeBackup) {
+            alert("❌ Ese archivo no parece un respaldo de JobFill AI (no trae datos de perfil).");
+            return;
+          }
+          // Un respaldo nunca debería traer keys (ya no se exportan), pero uno
+          // viejo sí: no se deja que pise las que están configuradas ahora.
+          for (const key of BACKUP_EXCLUDED_KEYS) delete importedData[key];
 
           // Respaldo PRE-rediseño (trae `profiles[]`, no `candidateBase`):
           // hay que borrar el esquema nuevo actual antes de escribirlo. Si no,

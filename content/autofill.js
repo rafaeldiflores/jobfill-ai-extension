@@ -397,16 +397,33 @@
     }
   ];
 
+  /**
+   * Pide el perfil al service worker. Distingue "no hay perfil" de "no hay
+   * conexión con la extensión": antes ambos caían en el mismo aviso de
+   * "configura tus datos", y tras recargar la extensión con la pestaña
+   * abierta el usuario iba a revisar un perfil que estaba bien.
+   */
+  const ORPHANED_CONTEXT_MSG = "Esta pestaña perdió la conexión con JobFill AI (la extensión se recargó o actualizó). Recarga la página (F5) y vuelve a intentarlo.";
+
   async function loadProfile() {
-    return new Promise((resolve) => {
-      chrome.runtime.sendMessage({ type: "GET_PROFILE" }, (response) => {
-        if (response && response.success && response.profile) {
-          activeProfile = response.profile;
-          resolve(activeProfile);
-        } else {
-          resolve(null);
-        }
-      });
+    return new Promise((resolve, reject) => {
+      try {
+        chrome.runtime.sendMessage({ type: "GET_PROFILE" }, (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(ORPHANED_CONTEXT_MSG));
+            return;
+          }
+          if (response && response.success && response.profile) {
+            activeProfile = response.profile;
+            resolve(activeProfile);
+          } else {
+            resolve(null);
+          }
+        });
+      } catch (e) {
+        // sendMessage lanza de forma síncrona si el contexto ya se invalidó.
+        reject(new Error(ORPHANED_CONTEXT_MSG));
+      }
     });
   }
 
@@ -1258,11 +1275,61 @@
       if (type === "radio" || type === "checkbox") continue;
       const value = el.isContentEditable ? el.innerText : el.value;
       if (value && value.trim()) continue;
-      const parts = getFieldContextParts(el);
-      const label = (parts.label || parts.attrs || "").trim().slice(0, 40) || "(campo sin nombre detectable)";
-      missing.push(label);
+      missing.push({ el, label: readableFieldLabel(el) });
     }
     return missing;
+  }
+
+  /**
+   * Nombre legible de un campo para mostrárselo al usuario. El contexto crudo
+   * junta el <label for>, el label padre y el del contenedor — casi siempre el
+   * MISMO texto dos o tres veces, con asteriscos de "obligatorio" — y el aviso
+   * de faltantes salía como "Nombre (First Name) * Nombre (First Name) …".
+   */
+  function readableFieldLabel(el) {
+    const parts = getFieldContextParts(el);
+    const raw = parts.label || el.getAttribute("aria-label") || el.placeholder || el.name || "";
+    const firstLine = raw.split(/\n/)[0];
+    const cleaned = firstLine.replace(/[*:]+/g, " ").replace(/\s+/g, " ").trim();
+    // Si el mismo texto quedó repetido ("Email Email"), se conserva una vez.
+    const half = cleaned.slice(0, Math.ceil(cleaned.length / 2)).trim();
+    const deduped = half && cleaned === `${half} ${half}` ? half : cleaned;
+    if (!deduped) return "campo sin nombre";
+    return deduped.length > 36 ? `${deduped.slice(0, 35).trim()}…` : deduped;
+  }
+
+  /**
+   * Marca en la página los obligatorios que quedaron vacíos, para que se
+   * vean sin tener que leer el aviso. La marca se quita sola en cuanto el
+   * usuario escribe en el campo.
+   */
+  function highlightMissingFields(missing) {
+    for (const { el } of missing) {
+      el.classList.add("jobfill-highlight-missing");
+      const clear = () => {
+        el.classList.remove("jobfill-highlight-missing");
+        el.removeEventListener("input", clear);
+        el.removeEventListener("change", clear);
+      };
+      el.addEventListener("input", clear);
+      el.addEventListener("change", clear);
+    }
+  }
+
+  function buildAutofillSummary(filledCount, keptCount, missing) {
+    const plural = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+    const parts = [];
+    parts.push(filledCount
+      ? `⚡ ${plural(filledCount, "campo rellenado", "campos rellenados")}.`
+      : "No había campos vacíos que JobFill AI supiera rellenar.");
+    if (keptCount) parts.push(`${plural(keptCount, "campo ya tenía", "campos ya tenían")} datos y se respetaron.`);
+    if (missing.length) {
+      const names = missing.slice(0, 3).map(m => m.label).join(", ");
+      const list = `${names}${missing.length > 3 ? "…" : ""}`;
+      // Sin punto final si la lista ya cierra con "…" (evita "….").
+      parts.push(`Faltan ${plural(missing.length, "obligatorio", "obligatorios")} (marcados en amarillo): ${list}${list.endsWith("…") ? "" : "."}`);
+    }
+    return parts.join(" ");
   }
 
   /**
@@ -1291,8 +1358,40 @@
    * desprendido no hace nada visible, pero sí sumaría al contador de
    * "campos rellenados" — un resumen que miente es peor que uno bajo.
    */
+  /**
+   * ¿El campo ya tiene un valor que hay que respetar? El autorrelleno antes
+   * escribía encima de todo: lo que el usuario había tecleado a mano, lo que
+   * el portal precargó desde su cuenta y — lo peor — las respuestas que la IA
+   * acababa de redactar (una Q&A guardada que calzara con la pregunta pisaba
+   * la respuesta generada). Ahora solo se rellena lo vacío; para reemplazar
+   * un valor basta con borrarlo y volver a pulsar Autorrellenar.
+   */
+  function fieldAlreadyHasValue(el) {
+    const type = (el.type || "").toLowerCase();
+
+    if (el.tagName === "BUTTON") return false; // listbox ARIA: lo decide su propio flujo
+    if (el.tagName === "TRIX-EDITOR" || el.isContentEditable) return Boolean((el.innerText || "").trim());
+    if (el.tagName === "SELECT") {
+      // La opción 0 suele ser el placeholder ("Selecciona…"): solo cuenta
+      // como elegido algo distinto de ella.
+      return el.selectedIndex > 0 && Boolean((el.value || "").trim());
+    }
+    if (type === "checkbox") return el.checked;
+    if (type === "radio") {
+      if (!el.name) return el.checked;
+      const scope = el.form || document;
+      return Boolean(scope.querySelector(`input[type="radio"][name="${CSS.escape(el.name)}"]:checked`));
+    }
+
+    const value = (el.value || "").trim();
+    // Un prefijo de país precargado ("+56", "+1") no es un teléfono cargado.
+    if (type === "tel" && /^\+?\d{0,4}$/.test(value)) return false;
+    return value.length > 0;
+  }
+
   async function fillFieldSafely(el, profile) {
     if (!el || !el.isConnected) return false;
+    if (fieldAlreadyHasValue(el)) return false;
     try {
       return await tryFillField(el, profile);
     } catch (e) {
@@ -1352,7 +1451,13 @@
     autofillInProgress = true;
 
     try {
-      const profile = await loadProfile();
+      let profile;
+      try {
+        profile = await loadProfile();
+      } catch (e) {
+        showToast(e.message, "error");
+        return { count: 0, error: e.message };
+      }
       if (!profile) {
         showToast("Por favor abre JobFill AI y configura tus datos.", "error");
         return { count: 0 };
@@ -1362,20 +1467,18 @@
       const inputs = Array.from(document.querySelectorAll(AUTOFILLABLE_SELECTOR)).filter(isFillableVisible);
 
       let filledCount = 0;
+      let keptCount = 0;
       for (const el of inputs) {
+        if (fieldAlreadyHasValue(el)) {
+          keptCount++;
+          continue;
+        }
         if (await fillFieldSafely(el, profile)) filledCount++;
       }
 
       const missingRequired = listMissingRequiredFields(inputs);
-      const missingNote = missingRequired.length
-        ? ` ⚠️ ${missingRequired.length} obligatorio${missingRequired.length > 1 ? "s" : ""} sin completar: ${missingRequired.slice(0, 3).join(", ")}${missingRequired.length > 3 ? "…" : ""}.`
-        : "";
-
-      if (filledCount > 0) {
-        showToast(`⚡ ¡${filledCount} campo${filledCount > 1 ? "s" : ""} rellenado${filledCount > 1 ? "s" : ""} con éxito!${missingNote}`, missingRequired.length ? "info" : "success");
-      } else {
-        showToast(`No se detectaron campos de postulación pendientes en esta sección.${missingNote}`, "info");
-      }
+      highlightMissingFields(missingRequired);
+      showToast(buildAutofillSummary(filledCount, keptCount, missingRequired), missingRequired.length ? "info" : (filledCount ? "success" : "info"));
 
       watchForLateFields(profile, new Set(inputs));
 

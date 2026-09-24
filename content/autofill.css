@@ -131,6 +131,14 @@
   transition: background-color 0.4s ease, outline 0.4s ease;
 }
 
+/* Obligatorio que quedó vacío tras el autorrelleno: se mantiene hasta que
+   el usuario escribe en el campo (lo quita autofill.js). */
+.jobfill-highlight-missing {
+  outline: 2px dashed #f59e0b !important;
+  outline-offset: 2px !important;
+  background-color: rgba(245, 158, 11, 0.06) !important;
+}
+
 @keyframes jobfill-pop {
   from { opacity: 0; transform: scale(0.7); }
   to { opacity: 1; transform: scale(1); }
