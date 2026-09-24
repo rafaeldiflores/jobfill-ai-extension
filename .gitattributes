@@ -1,0 +1,8 @@
+# Finales de línea LF en todos los checkouts, también en Windows.
+# Los tests recortan el código real entre marcadores con "\n"; con
+# core.autocrlf=true git entregaba CRLF y 5 tests fallaban en local.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary

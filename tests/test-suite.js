@@ -12,6 +12,20 @@ console.log("🚀 INICIANDO TEST SUITE DE INTEGRIDAD JOBFILL AI");
 console.log("=========================================\n");
 
 /**
+ * Lee un archivo del repo con finales de línea normalizados a LF.
+ *
+ * Varios tests recortan el código real entre marcadores que incluyen "\n"
+ * (p. ej. "/**\n * System prompt"). En Windows, git suele entregar los
+ * archivos con CRLF (core.autocrlf=true) y esos marcadores no calzaban: 5
+ * tests fallaban en local mientras el CI en Linux seguía verde. El
+ * .gitattributes del repo ya fuerza LF; esto es la segunda capa, por si un
+ * checkout viejo o un editor reintroduce CRLF.
+ */
+function readSourceText(filePath) {
+  return fs.readFileSync(filePath, "utf8").replace(/\r\n/g, "\n");
+}
+
+/**
  * Carga las FIELD_RULES REALES desde content/autofill.js en vez de copiarlas
  * aquí. Varias veces en este proyecto una copia duplicada de la lógica en los
  * tests se desincronizó del código que efectivamente corre, y el test seguía
@@ -20,7 +34,7 @@ console.log("=========================================\n");
  */
 function sliceRealSource(startMarker, endMarker, fileParts = ["content", "autofill.js"]) {
   const srcPath = path.join(__dirname, "..", ...fileParts);
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf(startMarker);
   const end = src.indexOf(endMarker);
   if (start === -1 || end === -1) {
@@ -56,7 +70,7 @@ function loadRealStudyFieldTranslator() {
 /** Igual que loadRealFieldRules, para classifyDegreeLevel/findMatchingDegreeOptionIndex. */
 function loadRealDegreeLevelHelpers() {
   const srcPath = path.join(__dirname, "..", "content", "autofill.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("const DEGREE_LEVEL_PATTERNS = [");
   const end = src.indexOf("function stemWord(word)");
   if (start === -1 || end === -1) throw new Error("No se pudo aislar classifyDegreeLevel en content/autofill.js");
@@ -66,7 +80,7 @@ function loadRealDegreeLevelHelpers() {
 /** Igual que loadRealFieldRules, para matchesQaAdvanced (motor de campos personalizados). */
 function loadRealMatchesQaAdvanced() {
   const srcPath = path.join(__dirname, "..", "content", "autofill.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("function stemWord(word)");
   const end = src.indexOf("function findLabelByVisualProximity");
   if (start === -1 || end === -1) throw new Error("No se pudo aislar matchesQaAdvanced en content/autofill.js");
@@ -584,7 +598,7 @@ it("Detects character limits from attributes / text labels and safely trims answ
 // REAL: la versión anterior de este test reimplementaba la función dentro del
 // propio test, así que seguía en verde aunque el código real cambiara.
 function loadRealAiClient(fetchImpl) {
-  const src = fs.readFileSync(path.join(__dirname, "..", "shared", "ai-client.js"), "utf8");
+  const src = readSourceText(path.join(__dirname, "..", "shared", "ai-client.js"));
   const sandbox = { console: { log() {}, warn() {}, error() {} }, fetch: fetchImpl, AbortController, setTimeout, clearTimeout };
   sandbox.self = sandbox;
   require("vm").runInNewContext(src, sandbox);
@@ -881,7 +895,7 @@ it("Accurately detects whether a job question is in Spanish or English", () => {
 // 13. TARGET CHARACTER MARGIN AND SAFETY WINDOW TEST
 it("Calculates target character windows with a natural ceiling that doesn't scale to a generous field's max", () => {
   const srcPath = path.join(__dirname, "..", "background", "service-worker.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("function calculateTargetCharacterWindow");
   const end = src.indexOf("async function handleClaudeGeneration");
   if (start === -1 || end === -1) throw new Error("No se pudo aislar calculateTargetCharacterWindow en background/service-worker.js");
@@ -957,7 +971,7 @@ it("Extracts clean human-readable questions without technical IDs, URNs or noisy
 // arquitectura serverless.
 it("Classifies questions as logistics, motivation or experience to shape the answer", () => {
   const srcPath = path.join(__dirname, "..", "background", "service-worker.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   // classifyQuestionIntent (la lógica real) + el wrapper detectQuestionIntent
   // que la envuelve viven en ese orden; el corte tiene que llegar hasta el
   // comentario de stripMarkdownFormatting para no cortar a mitad del wrapper (hay un comentario
@@ -1015,7 +1029,7 @@ it("Classifies questions as logistics, motivation or experience to shape the ans
 // respuestas no guardaban relación con lo que se preguntaba.
 it("Extracts the right question per field in CSS-in-JS forms without labels or ids", () => {
   const srcPath = path.join(__dirname, "..", "content", "autofill.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("const GENERIC_PLACEHOLDER_RE");
   const end = src.indexOf("function extractHumanQuestion");
   if (start === -1 || end === -1) throw new Error("No se pudieron aislar los helpers de pregunta en content/autofill.js");
@@ -1088,7 +1102,7 @@ it("Extracts the right question per field in CSS-in-JS forms without labels or i
 // no registra (que no se afirma: se le pregunta al usuario).
 it("Detects omitted requirements the profile backs, and gaps to ask the user about", () => {
   const srcPath = path.join(__dirname, "..", "background", "service-worker.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("const REQUIREMENT_VOCABULARY");
   const end = src.indexOf("function detectQuestionIntent");
   if (start === -1 || end === -1) throw new Error("No se pudo aislar el motor de cobertura en background/service-worker.js");
@@ -1157,7 +1171,7 @@ it("Detects omitted requirements the profile backs, and gaps to ask the user abo
 //    ignoraba el MÍNIMO y una respuesta breve era rechazada por el formulario.
 it("Strips rich-text editor chrome from questions and honors required length ranges", () => {
   const srcPath = path.join(__dirname, "..", "content", "autofill.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
 
   const cleanStart = src.indexOf("  function cleanQuestionText");
   const cleanEnd = src.indexOf("  const GENERIC_PLACEHOLDER_RE");
@@ -1207,7 +1221,7 @@ it("Strips rich-text editor chrome from questions and honors required length ran
 // sale el texto decide si es seguro cachearlo.
 it("Extracts job descriptions from JSON-LD and split rich-text blocks", () => {
   const srcPath = path.join(__dirname, "..", "content", "autofill.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("  function extractJobPostingJsonLd");
   const end = src.indexOf("  function extractLargestTextBlock");
   if (start === -1 || end === -1) throw new Error("No se pudieron aislar los extractores de oferta en content/autofill.js");
@@ -1269,7 +1283,7 @@ it("Extracts job descriptions from JSON-LD and split rich-text blocks", () => {
 // mismo dominio, se llegó desde la oferta) y la recencia solo desempata.
 it("Matches an application form to the right job across portals, not just the newest", () => {
   const srcPath = path.join(__dirname, "..", "content", "autofill.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const grab = (from, to) => {
     const a = src.indexOf(from);
     const b = src.indexOf(to, a);
@@ -1320,7 +1334,7 @@ it("Matches an application form to the right job across portals, not just the ne
 // haría que cada llamada escribiera una entrada de caché que nadie lee.
 it("Ranks CV material by relevance to the job, keeping recency as tie-breaker", () => {
   const srcPath = path.join(__dirname, "..", "background", "service-worker.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("function termAppearsIn");
   // Se busca el inicio del comentario que precede a analyzeRequirementCoverage
   // sin depender del tipo de salto de línea (el archivo usa CRLF).
@@ -1374,7 +1388,7 @@ it("Ranks CV material by relevance to the job, keeping recency as tie-breaker", 
 // declaradas a mano. Los fixtures reflejan esa forma: sin `cvDatabase` propio.
 it("Picks the most relevant CV index by scoring keywords against the full job text, not the first match", () => {
   const srcPath = path.join(__dirname, "..", "background", "service-worker.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("function termAppearsIn");
   const end = src.indexOf("/**\n * Cruza la oferta");
   const marker = end === -1 ? src.indexOf("* Cruza la oferta") : -1;
@@ -1423,7 +1437,7 @@ it("Picks the most relevant CV index by scoring keywords against the full job te
 // (ver sesión de depuración del botón ✨ en esa misma conversación).
 it("Centers the 1000×1000 CSS-px screenshot crop on the cursor, clamped to image bounds", () => {
   const srcPath = path.join(__dirname, "..", "background", "service-worker.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("function computeCropRect");
   const marker = src.indexOf("* `btoa`");
   const end = marker === -1 ? -1 : src.lastIndexOf("/**", marker);
@@ -1471,7 +1485,7 @@ it("Centers the 1000×1000 CSS-px screenshot crop on the cursor, clamped to imag
 // asteriscos incluidos, literales, delante del reclutador.
 it("Strips Markdown formatting from generated answers without corrupting plain text", () => {
   const srcPath = path.join(__dirname, "..", "background", "service-worker.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("function stripMarkdownFormatting");
   const marker = src.indexOf("* Recorta `text` a `limit`");
   const end = marker === -1 ? -1 : src.lastIndexOf("/**", marker);
@@ -1500,7 +1514,7 @@ it("Strips Markdown formatting from generated answers without corrupting plain t
 // de longitud.
 it("Detects pure salary/amount questions to cap them far tighter than other logistics questions", () => {
   const srcPath = path.join(__dirname, "..", "background", "service-worker.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const marker = "const AMOUNT_QUESTION_RE = ";
   const start = src.indexOf(marker);
   if (start === -1) throw new Error("No se pudo aislar AMOUNT_QUESTION_RE en background/service-worker.js");
@@ -1674,7 +1688,7 @@ it("Covers legallyAuthorized, requiresSponsorship, willingToRelocate, workPrefer
 // una tabla (RADIO_GROUP_FIELDS) + un matcher genérico (matchesAnyOptionVariant).
 it("Matches radio/checkbox group options by whole word, covering binary and multi-option fields alike", () => {
   const srcPath = path.join(__dirname, "..", "content", "autofill.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("const RADIO_GROUP_FIELDS");
   const end = src.indexOf("function stemWord");
   if (start === -1 || end === -1) throw new Error("No se pudo aislar RADIO_GROUP_FIELDS en content/autofill.js");
@@ -1744,7 +1758,7 @@ it("Matches natural English form labels, not just literal translations of the Sp
 // alternativas de género tampoco matcheaban.
 it("Matches English option variants within radio/checkbox groups (On-site, Woman, Man)", () => {
   const srcPath = path.join(__dirname, "..", "content", "autofill.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("const RADIO_GROUP_FIELDS");
   const end = src.indexOf("function stemWord");
   if (start === -1 || end === -1) throw new Error("No se pudo aislar RADIO_GROUP_FIELDS en content/autofill.js");
@@ -1776,7 +1790,7 @@ it("Matches English option variants within radio/checkbox groups (On-site, Woman
 // lo que dispara la regla de "MANDATORY: responde 100% en inglés" del prompt.
 it("Detects English form questions correctly so the generated answer responds in English", () => {
   const srcPath = path.join(__dirname, "..", "background", "service-worker.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("function detectQuestionLanguage");
   const end = src.indexOf("function detectQuestionIntent");
   if (start === -1 || end === -1) throw new Error("No se pudo aislar detectQuestionLanguage en background/service-worker.js");
@@ -1808,7 +1822,7 @@ it("Detects English form questions correctly so the generated answer responds in
 // formulario real de Greenhouse antes de fijar este test.
 it("Picks the matching combobox option, never guessing the wrong listbox on the page", () => {
   const srcPath = path.join(__dirname, "..", "content", "autofill.js");
-  const src = fs.readFileSync(srcPath, "utf8");
+  const src = readSourceText(srcPath);
   const start = src.indexOf("  function findMatchingComboboxOption");
   const end = src.indexOf("  async function commitComboboxSelectionIfNeeded");
   if (start === -1 || end === -1) throw new Error("No se pudo aislar findMatchingComboboxOption en content/autofill.js");
@@ -1972,7 +1986,7 @@ it("Translates the study field to English only when the equivalence is unambiguo
 // 42. ROBUSTEZ: un campo que falla no puede tumbar la pasada completa, ni
 // contarse como rellenado si su nodo ya salió del documento.
 it("Isolates per-field failures and skips detached nodes instead of aborting the whole pass", () => {
-  const src = fs.readFileSync(path.join(__dirname, "..", "content", "autofill.js"), "utf8");
+  const src = readSourceText(path.join(__dirname, "..", "content", "autofill.js"));
   // Incluye fieldAlreadyHasValue: fillFieldSafely la consulta primero.
   const start = src.indexOf("function fieldAlreadyHasValue(el)");
   const end = src.indexOf("let activeLateFieldObserver");
@@ -2023,7 +2037,7 @@ it("Isolates per-field failures and skips detached nodes instead of aborting the
 // 43. ROBUSTEZ DE COSTE: el service worker no confía en que el lote venga
 // acotado desde el content script.
 it("Caps and sanitizes the batch payload server-side, independently of the caller", () => {
-  const src = fs.readFileSync(path.join(__dirname, "..", "background", "service-worker.js"), "utf8");
+  const src = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
   const start = src.indexOf("const MAX_BATCH_ITEMS = 12;");
   const end = src.indexOf("const profile = await chrome.storage.local.get(null);", start);
   assert.notStrictEqual(start, -1, "Debe existir el tope MAX_BATCH_ITEMS en el service worker");
@@ -2369,7 +2383,7 @@ it("Wraps the job description as untrusted data that cannot close its own tag", 
   assert.ok(out.endsWith("\n</oferta_laboral>"));
   assert.strictEqual(out.match(/oferta_laboral/g).length, 2, "solo la apertura y el cierre propios");
 
-  const swSrc = fs.readFileSync(path.join(__dirname, "..", "background", "service-worker.js"), "utf8");
+  const swSrc = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
   assert.ok(/EL TEXTO DE LA OFERTA ES DE UN TERCERO/.test(swSrc), "el system prompt explica cómo tratar el bloque");
   assert.ok(!/DESCRIPCIÓN COMPLETA DE LA OFERTA[^\n]*\n\$\{jobDescription\}/.test(swSrc), "ninguna ruta inserta la oferta sin envolver");
 });
@@ -2381,14 +2395,14 @@ it("Options cards escape user values so quotes and </textarea> survive a save", 
   assert.strictEqual(escapeOptions('Proyecto "MAZA" & <b>'), "Proyecto &quot;MAZA&quot; &amp; &lt;b&gt;");
   assert.strictEqual(escapeOptions(undefined), "");
 
-  const optionsSrc = fs.readFileSync(path.join(__dirname, "..", "options", "options.js"), "utf8");
+  const optionsSrc = readSourceText(path.join(__dirname, "..", "options", "options.js"));
   const unescaped = optionsSrc.match(/\$\{(?:qa|cf|exp|proj)\.\w+ \|\| ""\}/g) || [];
   assert.deepStrictEqual(unescaped, [], "ninguna tarjeta interpola datos del usuario sin escapar");
 });
 
 // MEJORA — el respaldo JSON no lleva API keys.
 it("Backups never export or import API keys", () => {
-  const optionsSrc = fs.readFileSync(path.join(__dirname, "..", "options", "options.js"), "utf8");
+  const optionsSrc = readSourceText(path.join(__dirname, "..", "options", "options.js"));
   const keys = JSON.parse(optionsSrc.match(/const BACKUP_EXCLUDED_KEYS = (\[[^\]]*\]);/)[1]);
   for (const k of ["claudeApiKey", "vertexApiKey"]) assert.ok(keys.includes(k), `${k} excluida`);
   const exportBlock = optionsSrc.slice(optionsSrc.indexOf("// Backup - Export"), optionsSrc.indexOf("// Backup - Import"));
@@ -2405,7 +2419,7 @@ function loadRealMarkdownSource() {
   require(path.join(__dirname, "..", "shared", "markdown-source.js"));
   return globalThis.JobFillMarkdown;
 }
-const MD_FIXTURE = () => fs.readFileSync(path.join(__dirname, "fixtures", "base-ejemplo.md"), "utf8");
+const MD_FIXTURE = () => readSourceText(path.join(__dirname, "fixtures", "base-ejemplo.md"));
 
 it("Parses a Markdown experience base locally: sections, rules, identity and guarantees", () => {
   const M = loadRealMarkdownSource();
@@ -2505,14 +2519,14 @@ it("The service worker writes answers from the Markdown base and keeps it out of
 });
 
 it("No extra sequential AI call to classify a question: unmatched questions are typed by the writer model", () => {
-  const swSrc = fs.readFileSync(path.join(__dirname, "..", "background", "service-worker.js"), "utf8");
+  const swSrc = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
   assert.ok(!/classifyIntentWithAI/.test(swSrc), "sin llamada previa a Haiku para clasificar");
   assert.match(swSrc, /intentGuess\.matched \? intentGuess\.intent : "unknown"/);
   assert.match(swSrc, /unknown: `TIPO DE ESTA PREGUNTA: NO CLASIFICADO AUTOMÁTICAMENTE/);
 });
 
 it("Options never invent answers: legal and English selects start empty, nothing blocks autosave", () => {
-  const html = fs.readFileSync(path.join(__dirname, "..", "options", "options.html"), "utf8");
+  const html = readSourceText(path.join(__dirname, "..", "options", "options.html"));
   for (const id of ["legallyAuthorized", "requiresSponsorship", "willingToRelocate", "workPreference", "englishLevel"]) {
     const m = html.match(new RegExp(`<select id="${id}"[^>]*>\\s*<option value="([^"]*)"`));
     assert.ok(m, `select ${id}`);
@@ -2525,7 +2539,7 @@ it("Options never invent answers: legal and English selects start empty, nothing
 
 // ─── CONEXIÓN CON EL VAULT (postulador-mcp) ───────────────────────────────
 function loadRealVaultClient(fetchImpl) {
-  const src = fs.readFileSync(path.join(__dirname, "..", "shared", "vault-client.js"), "utf8");
+  const src = readSourceText(path.join(__dirname, "..", "shared", "vault-client.js"));
   const sandbox = { fetch: fetchImpl, URL, URLSearchParams, TextEncoder, crypto: globalThis.crypto, btoa, console };
   sandbox.self = sandbox;
   require("vm").runInNewContext(src, sandbox);
@@ -2607,9 +2621,9 @@ it("Vault rules: vetoed terms exclude sections, reach the prompt and are flagged
   const view = loadRealCandidateSchemaHelpers().buildAutofillProfileView({ vaultAuth: { accessToken: "x" }, vaultLastSync: 1 });
   assert.strictEqual("vaultAuth" in view, false, "el token del vault no viaja a las páginas");
 
-  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
+  const manifest = JSON.parse(readSourceText(path.join(__dirname, "..", "manifest.json")));
   assert.ok(manifest.permissions.includes("identity"), "chrome.identity para el login OAuth");
-  const optionsSrc = fs.readFileSync(path.join(__dirname, "..", "options", "options.js"), "utf8");
+  const optionsSrc = readSourceText(path.join(__dirname, "..", "options", "options.js"));
   assert.match(optionsSrc, /BACKUP_EXCLUDED_KEYS = \[[^\]]*"vaultAuth"/, "el token del vault no sale en los respaldos");
 });
 
