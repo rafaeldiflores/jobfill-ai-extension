@@ -19,45 +19,33 @@
       </div>
 
       <nav class="nav-menu">
-        <button class="nav-item active" data-tab="tab-personal">
+        <button class="nav-item active" data-tab="tab-home">
+          <span class="nav-icon">🏠</span>
+          <span>Inicio</span>
+        </button>
+        <button class="nav-item" data-tab="tab-source">
+          <span class="nav-icon">📚</span>
+          <span>Fuente de verdad</span>
+        </button>
+        <button class="nav-item" data-tab="tab-personal tab-links tab-experience tab-education tab-legal">
           <span class="nav-icon">👤</span>
-          <span>Datos Personales</span>
-        </button>
-        <button class="nav-item" data-tab="tab-links">
-          <span class="nav-icon">🔗</span>
-          <span>Redes y Enlaces</span>
-        </button>
-        <button class="nav-item" data-tab="tab-experience">
-          <span class="nav-icon">💼</span>
-          <span>Experiencia y Empleo</span>
-        </button>
-        <button class="nav-item" data-tab="tab-education">
-          <span class="nav-icon">🎓</span>
-          <span>Educación y Skills</span>
-        </button>
-        <button class="nav-item" data-tab="tab-cv">
-          <span class="nav-icon">📄</span>
-          <span>Curriculum Vitae (CV)</span>
-        </button>
-        <button class="nav-item" data-tab="tab-custom-fields">
-          <span class="nav-icon">🧩</span>
-          <span>Campos Flexibles</span>
-        </button>
-        <button class="nav-item" data-tab="tab-legal">
-          <span class="nav-icon">⚖️</span>
-          <span>Legal / EEO</span>
+          <span>Mis datos</span>
         </button>
         <button class="nav-item" data-tab="tab-claude">
           <span class="nav-icon">🤖</span>
-          <span>Claude IA (Anthropic)</span>
+          <span>Inteligencia artificial</span>
         </button>
-        <button class="nav-item" data-tab="tab-qa">
+        <button class="nav-item" data-tab="tab-qa tab-custom-fields">
           <span class="nav-icon">💬</span>
-          <span>Banco de Respuestas</span>
+          <span>Respuestas guardadas</span>
+        </button>
+        <button class="nav-item" data-tab="tab-profiles">
+          <span class="nav-icon">🎯</span>
+          <span>Perfiles de CV</span>
         </button>
         <button class="nav-item" data-tab="tab-backup">
           <span class="nav-icon">💾</span>
-          <span>Copia de Seguridad</span>
+          <span>Respaldo</span>
         </button>
       </nav>
 
@@ -75,45 +63,31 @@
         <!-- Floating Save Header -->
         <div class="top-bar">
           <div class="top-bar-left">
-            <h1 id="tabTitle">Datos Personales</h1>
+            <h1 id="tabTitle">Inicio</h1>
           </div>
           <div class="top-actions">
             <span id="saveStatus" class="save-status"></span>
-            <button type="submit" class="btn-save" id="btnSave">
-              <span>💾</span> Guardar Cambios
-            </button>
-          </div>
-        </div>
-
-        <!-- Global Master Profile Bar (Highest Level Context) -->
-        <div class="global-profile-master-bar" id="globalProfileMasterBar">
-          <div class="master-bar-main">
-            <div class="master-badge-icon">🎯</div>
-            <div class="master-select-group">
-              <label for="globalProfileSelect" class="master-select-label">
-                <strong>Perfil de CV Activo (Contexto Global):</strong>
-              </label>
-              <select id="globalProfileSelect" class="global-profile-select">
-                <!-- Dynamically loaded profiles -->
-              </select>
-            </div>
-          </div>
-          <div class="master-bar-actions">
-            <button type="button" class="btn-master btn-master-new" id="btnGlobalNewProfile" title="Crear un nuevo perfil de CV independiente">
-              <span>➕</span> Nuevo Perfil de CV
-            </button>
-            <button type="button" class="btn-master btn-master-secondary" id="btnGlobalRenameProfile" title="Renombrar perfil">
-              <span>✏️</span> Renombrar
-            </button>
-            <button type="button" class="btn-master btn-master-danger" id="btnGlobalDeleteProfile" title="Eliminar perfil">
-              <span>🗑️</span> Eliminar
+            <button type="submit" class="btn-save btn-save-quiet" id="btnSave" title="Los cambios se guardan solos; esto fuerza un guardado inmediato (Ctrl+S)">
+              Guardar ahora
             </button>
           </div>
         </div>
 
         <div class="tab-container">
+          <!-- INICIO: estado de la configuración -->
+          <section id="tab-home" class="tab-panel active">
+            <div class="section-desc">Tres pasos y JobFill AI queda listo. Todo se guarda solo mientras escribes.</div>
+            <div class="setup-steps" id="setupSteps">
+              <!-- Renderizado por options.js (renderSetupChecklist) -->
+            </div>
+            <div class="home-tip">
+              <strong>Cómo se usa:</strong> en un formulario de postulación pulsa <em>⚡ Autorrellenar</em> en el panel flotante. En preguntas abiertas, haz clic en el campo y pulsa <em>✨</em> para que la IA redacte con tu experiencia real.
+            </div>
+          </section>
+
           <!-- TAB 1: Personal -->
-          <section id="tab-personal" class="tab-panel active">
+          <section id="tab-personal" class="tab-panel">
+            <h2 class="panel-title">Contacto e identidad</h2>
             <div class="section-desc">Tu información de contacto básica para encabezados de postulación.</div>
             
             <div class="form-grid">
@@ -155,12 +129,12 @@
                 <span class="field-hint">Vacío por defecto — solo se rellena si algún formulario lo pide y tú la cargaste aquí.</span>
               </div>
               <div class="form-group">
-                <label for="email">Correo Electrónico *</label>
-                <input type="email" id="email" name="email" placeholder="tu_email@ejemplo.com" required>
+                <label for="email">Correo Electrónico</label>
+                <input type="email" id="email" name="email" placeholder="tu_email@ejemplo.com">
               </div>
               <div class="form-group">
-                <label for="phone">Teléfono / Móvil *</label>
-                <input type="tel" id="phone" name="phone" placeholder="+56 9 1234 5678" required>
+                <label for="phone">Teléfono / Móvil</label>
+                <input type="tel" id="phone" name="phone" placeholder="+56 9 1234 5678">
               </div>
               <div class="form-group">
                 <label for="country">País de Residencia</label>
@@ -183,6 +157,7 @@
 
           <!-- TAB 2: Links -->
           <section id="tab-links" class="tab-panel">
+            <h2 class="panel-title">Redes y enlaces</h2>
             <div class="section-desc">Tus perfiles profesionales y portafolios en línea.</div>
             
             <div class="form-grid">
@@ -207,6 +182,7 @@
 
           <!-- TAB 3: Experience -->
           <section id="tab-experience" class="tab-panel">
+            <h2 class="panel-title">Experiencia, renta y disponibilidad</h2>
             <div class="section-desc">Tu experiencia profesional, expectativas de salario y disponibilidad.</div>
             
             <div class="form-grid">
@@ -248,6 +224,7 @@
               <div class="form-group full-width">
                 <label for="englishLevel">Nivel de Inglés</label>
                 <select id="englishLevel" name="englishLevel">
+                  <option value="">— Sin especificar —</option>
                   <option value="Básico (A1/A2)">Básico (A1 / A2)</option>
                   <option value="Intermedio (B1/B2)">Intermedio (B1 / B2)</option>
                   <option value="Avanzado / Fluido (C1/C2)">Avanzado / Fluido Profesional (C1 / C2)</option>
@@ -264,6 +241,7 @@
 
           <!-- TAB 4: Education -->
           <section id="tab-education" class="tab-panel">
+            <h2 class="panel-title">Educación y habilidades</h2>
             <div class="section-desc">Tu formación académica y repertorio de habilidades técnicas y blandas.</div>
             
             <div class="form-grid">
@@ -287,28 +265,38 @@
             </div>
           </section>
 
-          <!-- TAB: CV / Base de Datos -->
-          <section id="tab-cv" class="tab-panel">
+          <!-- FUENTE DE VERDAD -->
+          <section id="tab-source" class="tab-panel">
             <div class="section-desc">
-              Tu <strong>Curriculum Vitae (PDF o texto)</strong> es la fuente principal de información para este perfil. Al procesarlo, el sistema extraerá y completará automáticamente <strong>todas tus pestañas</strong> (Datos Personales, Contacto, Redes, Titular, Resumen, Habilidades, Cargos y Proyectos).
+              Tu experiencia vive en <strong>archivos Markdown (.md)</strong>, por ejemplo tu <code>BASE_Experiencia.md</code>. JobFill AI los lee <strong>al instante y sin IA</strong>: respeta tus <strong>REGLAS DE USO</strong> tal cual, nunca envía métricas marcadas como ESTIMADA ni secciones que digan "NUNCA va en un CV", y elige para cada oferta la experiencia más relevante.
             </div>
 
-            <!-- Profile Target Role & Auto-detect Keywords -->
-            <div class="cv-profile-meta-card">
-              <div class="form-grid">
-                <div class="form-group">
-                  <label for="profileTargetRole">Cargo o Especialidad de este Perfil</label>
-                  <input type="text" id="profileTargetRole" name="targetRole" placeholder="Ej: Senior Full Stack Developer / Tech Lead / DevOps">
-                  <span class="field-hint">Identifica el enfoque laboral de esta versión de perfil.</span>
+            <div class="md-dropzone" id="mdDropzone" tabindex="0" role="button" aria-label="Importar archivos Markdown">
+              <input type="file" id="mdFileInput" accept=".md,.markdown,text/markdown" multiple hidden>
+              <div class="md-dropzone-icon">📥</div>
+              <div class="md-dropzone-text"><strong>Arrastra tus .md aquí</strong> o haz clic para elegirlos</div>
+              <div class="md-dropzone-hint">Puedes importar varios. Para actualizar, vuelve a importar el mismo archivo: reemplaza la versión anterior.</div>
+            </div>
+
+            <div id="mdSourcesList" class="md-sources-list">
+              <!-- Renderizado por options.js (renderMarkdownSources) -->
+            </div>
+
+            <div id="mdDetectedFields" class="md-detected" hidden>
+              <div class="md-detected-head">
+                <div>
+                  <h3>Datos detectados en tu archivo</h3>
+                  <p>Se usan para rellenar formularios. Solo se completan los campos que tienes vacíos en <em>Mis datos</em>.</p>
                 </div>
-                <div class="form-group">
-                  <label for="profileKeywords">Palabras Clave del Empleo para Auto-Detectar este Perfil</label>
-                  <input type="text" id="profileKeywords" name="keywords" placeholder="Ej: full stack, tech lead, react, node, microservicios, cloud">
-                  <span class="field-hint">JobFill AI seleccionará este perfil automáticamente cuando la oferta laboral contenga estas palabras.</span>
-                </div>
+                <button type="button" class="btn-primary" id="btnApplyMdFields">Completar Mis datos</button>
               </div>
+              <dl id="mdDetectedList" class="md-detected-list"></dl>
             </div>
 
+            <details class="alt-source">
+              <summary>¿No tienes tu experiencia en .md? Usa tu CV en PDF o texto</summary>
+              <div class="alt-source-body">
+                <p class="alt-source-note">Más lento (la IA lo interpreta, hasta ~1 minuto) y menos fiel que un .md. Si importas un .md, este CV se ignora al redactar.</p>
             <div class="cv-workflow-card">
               <div class="cv-upload-header">
                 <h3>📥 1. Documento CV del Perfil Activo (PDF o Texto)</h3>
@@ -341,6 +329,12 @@
               </div>
             </div>
 
+              </div>
+            </details>
+
+            <details class="alt-source">
+              <summary>Ver o editar la base estructurada (se genera sola)</summary>
+              <div class="alt-source-body">
             <!-- Visual Database Viewer & Editor -->
             <div class="cv-db-section" id="cvDatabaseSection" style="margin-top: 28px;">
               <div class="cv-db-header">
@@ -364,10 +358,62 @@
                 <!-- Rendered dynamically -->
               </div>
             </div>
+              </div>
+            </details>
+          </section>
+
+          <!-- PERFILES DE CV (facetas) -->
+          <section id="tab-profiles" class="tab-panel">
+            <div class="section-desc">
+              Opcional. Si postulas a cargos distintos (p. ej. <em>AI Engineer</em> y <em>Datos</em>), crea un perfil por faceta con sus palabras clave: JobFill AI elige solo el que calce con cada oferta. Tu experiencia es la misma en todos; solo cambia el título con el que te presentas.
+            </div>
+        <!-- Global Master Profile Bar (Highest Level Context) -->
+        <div class="global-profile-master-bar" id="globalProfileMasterBar">
+          <div class="master-bar-main">
+            <div class="master-badge-icon">🎯</div>
+            <div class="master-select-group">
+              <label for="globalProfileSelect" class="master-select-label">
+                <strong>Perfil de CV Activo (Contexto Global):</strong>
+              </label>
+              <select id="globalProfileSelect" class="global-profile-select">
+                <!-- Dynamically loaded profiles -->
+              </select>
+            </div>
+          </div>
+          <div class="master-bar-actions">
+            <button type="button" class="btn-master btn-master-new" id="btnGlobalNewProfile" title="Crear un nuevo perfil de CV independiente">
+              <span>➕</span> Nuevo Perfil de CV
+            </button>
+            <button type="button" class="btn-master btn-master-secondary" id="btnGlobalRenameProfile" title="Renombrar perfil">
+              <span>✏️</span> Renombrar
+            </button>
+            <button type="button" class="btn-master btn-master-danger" id="btnGlobalDeleteProfile" title="Eliminar perfil">
+              <span>🗑️</span> Eliminar
+            </button>
+          </div>
+        </div>
+
+            <!-- Profile Target Role & Auto-detect Keywords -->
+            <div class="cv-profile-meta-card">
+              <div class="form-grid">
+                <div class="form-group">
+                  <label for="profileTargetRole">Cargo o Especialidad de este Perfil</label>
+                  <input type="text" id="profileTargetRole" name="targetRole" placeholder="Ej: Senior Full Stack Developer / Tech Lead / DevOps">
+                  <span class="field-hint">Identifica el enfoque laboral de esta versión de perfil.</span>
+                </div>
+                <div class="form-group">
+                  <label for="profileKeywords">Palabras Clave del Empleo para Auto-Detectar este Perfil</label>
+                  <input type="text" id="profileKeywords" name="keywords" placeholder="Ej: full stack, tech lead, react, node, microservicios, cloud">
+                  <span class="field-hint">JobFill AI seleccionará este perfil automáticamente cuando la oferta laboral contenga estas palabras.</span>
+                </div>
+              </div>
+            </div>
+
           </section>
 
           <!-- TAB: Custom Fields -->
           <section id="tab-custom-fields" class="tab-panel">
+            <h2 class="panel-title">Campos flexibles</h2>
             <div class="section-desc">Define cualquier campo adicional que te pidan con frecuencia (Licencia de conducir, Renta líquida, Nacionalidad secundaria, etc.). Asígnale palabras clave o sinónimos y la extensión lo rellenará automáticamente al detectarlo.</div>
             
             <div class="qa-toolbar">
@@ -381,12 +427,14 @@
 
           <!-- TAB 5: Legal / EEO -->
           <section id="tab-legal" class="tab-panel">
+            <h2 class="panel-title">Legal y elegibilidad</h2>
             <div class="section-desc">Respuestas a preguntas legales y de elegibilidad frecuentes en portales de empleo.</div>
             
             <div class="form-grid">
               <div class="form-group">
                 <label for="legallyAuthorized">¿Estás legalmente autorizado para trabajar en tu país?</label>
                 <select id="legallyAuthorized" name="legallyAuthorized">
+                  <option value="">— Sin responder —</option>
                   <option value="yes">Sí (Yes)</option>
                   <option value="no">No</option>
                 </select>
@@ -394,6 +442,7 @@
               <div class="form-group">
                 <label for="requiresSponsorship">¿Requieres patrocinio de visa para trabajar?</label>
                 <select id="requiresSponsorship" name="requiresSponsorship">
+                  <option value="">— Sin responder —</option>
                   <option value="no">No (No requiero patrocinio)</option>
                   <option value="yes">Sí (Requiero patrocinio / Visa)</option>
                 </select>
@@ -401,6 +450,7 @@
               <div class="form-group">
                 <label for="willingToRelocate">¿Disposición a reubicarte geográficamente?</label>
                 <select id="willingToRelocate" name="willingToRelocate">
+                  <option value="">— Sin responder —</option>
                   <option value="no">No</option>
                   <option value="yes">Sí (Dispuesto a reubicación)</option>
                 </select>
@@ -408,6 +458,7 @@
               <div class="form-group">
                 <label for="workPreference">Modalidad de Trabajo Preferida</label>
                 <select id="workPreference" name="workPreference">
+                  <option value="">— Sin responder —</option>
                   <option value="remote">100% Remoto</option>
                   <option value="hybrid">Híbrido</option>
                   <option value="onsite">Presencial</option>
@@ -506,6 +557,7 @@
 
           <!-- TAB 7: Custom Q&A -->
           <section id="tab-qa" class="tab-panel">
+            <h2 class="panel-title">Banco de respuestas</h2>
             <div class="section-desc">Banco de respuestas fijas para preguntas recurrentes sin gastar tokens de la API.</div>
             
             <div class="qa-toolbar">
@@ -542,6 +594,7 @@
   </div>
 
   <script src="../shared/ai-client.js"></script>
+  <script src="../shared/markdown-source.js"></script>
   <script src="pdf.min.js"></script>
   <script src="pdf-parser.js"></script>
   <script src="options.js"></script>

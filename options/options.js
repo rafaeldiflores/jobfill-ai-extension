@@ -61,6 +61,15 @@ const GLOBAL_SETTING_KEYS = [
  */
 const CV_INDEX_OWN_FIELDS = ["id", "name", "targetRole", "keywords"];
 
+/** Etiquetas legibles de los campos que se pueden completar desde un .md. */
+const MD_FIELD_LABELS = {
+  fullName: "Nombre completo", firstName: "Nombre", middleName: "Segundo nombre", lastName: "Apellidos",
+  lastNamePaternal: "Apellido paterno", lastNameMaternal: "Apellido materno", email: "Email", phone: "Teléfono",
+  linkedinUrl: "LinkedIn", githubUrl: "GitHub", portfolioUrl: "Portafolio", city: "Ciudad", country: "País",
+  englishLevel: "Nivel de inglés", noticePeriod: "Disponibilidad", degree: "Título", university: "Institución",
+  skills: "Habilidades"
+};
+
 /** Credenciales que nunca salen ni entran por un archivo de respaldo. */
 const BACKUP_EXCLUDED_KEYS = ["claudeApiKey", "vertexApiKey", "vertexProjectId", "vertexRegion"];
 
@@ -195,6 +204,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   const cvProgressPercentage = document.getElementById("cvProgressPercentage");
   const cvProgressFill = document.getElementById("cvProgressFill");
 
+  let localMarkdownSources = [];
   let localProfiles = [];
   let activeProfileId = "prof_default";
   let localQA = [];
@@ -209,11 +219,16 @@ document.addEventListener("DOMContentLoaded", async () => {
       tabPanels.forEach(p => p.classList.remove("active"));
 
       item.classList.add("active");
-      const targetTab = item.getAttribute("data-tab");
-      const panel = document.getElementById(targetTab);
-      if (panel) panel.classList.add("active");
+      // Un ítem puede mostrar VARIAS secciones apiladas ("Mis datos" agrupa
+      // contacto, redes, experiencia, educación y legal): antes eran cinco
+      // pestañas separadas para datos que se llenan de una sola vez.
+      item.getAttribute("data-tab").split(/\s+/).forEach(id => {
+        document.getElementById(id)?.classList.add("active");
+      });
 
       tabTitle.textContent = item.querySelector("span:last-child").textContent;
+      document.querySelector(".main-content")?.scrollTo({ top: 0 });
+      if (item.getAttribute("data-tab") === "tab-home") renderSetupChecklist();
     });
   });
 
@@ -320,6 +335,7 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     loadActiveProfileIntoDOM();
     renderGlobalProfileSelector();
+    renderSetupChecklist();
   }
 
   // Profile-Centric DOM Load
@@ -350,6 +366,8 @@ document.addEventListener("DOMContentLoaded", async () => {
     localQA = current.customQA ? [...current.customQA] : [];
     localCustomFields = current.customFields ? [...current.customFields] : [];
     localCvDatabase = current.cvDatabase || { rawText: "", experiences: [], projects: [], education: [] };
+    localMarkdownSources = Array.isArray(current.markdownSources) ? [...current.markdownSources] : [];
+    renderMarkdownSources();
 
     renderQaList();
     renderCustomFieldsList();
@@ -376,6 +394,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     current.customQA = extractQaFromDOM();
     current.customFields = extractCustomFieldsFromDOM();
     current.cvDatabase = extractCvDatabaseFromDOM();
+    current.markdownSources = localMarkdownSources;
   }
 
   function renderGlobalProfileSelector() {
@@ -430,10 +449,10 @@ document.addEventListener("DOMContentLoaded", async () => {
       renderGlobalProfileSelector();
       loadActiveProfileIntoDOM();
 
-      showSaveFeedback(`✨ Nuevo índice creado: "${name.trim()}" — hereda tu CV. Ajusta sus keywords para distinguirlo.`);
+      scheduleSave();
 
       // Switch to CV tab automatically (ahí viven las keywords/título objetivo).
-      const cvTabBtn = document.querySelector('[data-tab="tab-cv"]');
+      const cvTabBtn = document.querySelector('[data-tab="tab-profiles"]');
       if (cvTabBtn) cvTabBtn.click();
     });
   }
@@ -446,7 +465,7 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (newName && newName.trim()) {
         current.name = newName.trim();
         renderGlobalProfileSelector();
-        showSaveFeedback("✓ Perfil renombrado");
+        scheduleSave();
       }
     });
   }
@@ -463,15 +482,19 @@ document.addEventListener("DOMContentLoaded", async () => {
         activeProfileId = localProfiles[0].id;
         renderGlobalProfileSelector();
         loadActiveProfileIntoDOM();
-        showSaveFeedback("✓ Perfil eliminado");
+        scheduleSave();
       }
     });
   }
 
-  // Save profile form submission
-  profileForm.addEventListener("submit", async (e) => {
-    e.preventDefault();
-
+  /**
+   * Guarda TODO (perfil compartido, índices y ajustes globales). Antes solo
+   * ocurría al pulsar "Guardar Cambios" — y el formulario exigía email y
+   * teléfono (`required`), así que ni siquiera se podía guardar la API key
+   * sin completarlos. Ahora se guarda solo, unos instantes después de cada
+   * cambio (ver scheduleSave).
+   */
+  async function persistAll() {
     saveActiveProfileFromDOM();
     syncSharedFieldsAcrossProfiles(localProfiles.find(p => p.id === activeProfileId), localProfiles);
 
@@ -490,13 +513,43 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     await chrome.storage.local.set(storagePayload);
     renderGlobalProfileSelector();
-    showSaveFeedback("✓ ¡Todos los datos del perfil guardados con éxito!");
+    showSaveFeedback("✓ Guardado");
+    if (document.getElementById("tab-home")?.classList.contains("active")) renderSetupChecklist();
+  }
+
+  let saveTimer = null;
+  function scheduleSave() {
+    clearTimeout(saveTimer);
+    saveStatus.textContent = "Guardando…";
+    saveStatus.classList.add("show");
+    saveTimer = setTimeout(() => { persistAll().catch(err => showSaveFeedback(`⚠️ No se pudo guardar: ${err.message}`)); }, 600);
+  }
+
+  profileForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    clearTimeout(saveTimer);
+    await persistAll();
   });
 
+  // Autoguardado: cualquier cambio en el formulario. Los <input type=file>
+  // se excluyen: su "cambio" es elegir un archivo, que tiene su propio flujo.
+  profileForm.addEventListener("input", e => { if (e.target.type !== "file") scheduleSave(); });
+  profileForm.addEventListener("change", e => { if (e.target.type !== "file") scheduleSave(); });
+
+  document.addEventListener("keydown", e => {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+      e.preventDefault();
+      clearTimeout(saveTimer);
+      persistAll();
+    }
+  });
+
+  let feedbackTimer = null;
   function showSaveFeedback(msg) {
+    clearTimeout(feedbackTimer);
     saveStatus.textContent = msg;
     saveStatus.classList.add("show");
-    setTimeout(() => {
+    feedbackTimer = setTimeout(() => {
       saveStatus.classList.remove("show");
     }, 2500);
   }
@@ -599,6 +652,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         localQA = extractQaFromDOM();
         localQA.splice(idx, 1);
         renderQaList();
+        scheduleSave();
       });
     });
   }
@@ -656,6 +710,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         localCustomFields = extractCustomFieldsFromDOM();
         localCustomFields.splice(idx, 1);
         renderCustomFieldsList();
+        scheduleSave();
       });
     });
   }
@@ -786,6 +841,13 @@ document.addEventListener("DOMContentLoaded", async () => {
       if (!file) return;
 
       const fileName = file.name.toLowerCase();
+
+      // Un .md es fuente de verdad, no un CV que haya que interpretar con IA.
+      if (fileName.endsWith(".md") || fileName.endsWith(".markdown")) {
+        e.target.value = "";
+        await importMarkdownFiles([file]);
+        return;
+      }
 
       if (fileName.endsWith(".pdf") || file.type === "application/pdf") {
         cvParseStatus.textContent = `⏳ Extrayendo texto del documento PDF "${file.name}"...`;
@@ -1583,6 +1645,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
         localCvDatabase = extractCvDatabaseFromDOM();
         localCvDatabase.experiences.splice(idx, 1);
         renderCvDatabase();
+        scheduleSave();
       });
     });
 
@@ -1592,6 +1655,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
         localCvDatabase = extractCvDatabaseFromDOM();
         localCvDatabase.projects.splice(idx, 1);
         renderCvDatabase();
+        scheduleSave();
       });
     });
   }
@@ -1648,6 +1712,224 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
       if (!localCvDatabase.projects) localCvDatabase.projects = [];
       localCvDatabase.projects.push({ id: `proj_${Date.now()}`, name: "", technologies: "", description: "" });
       renderCvDatabase();
+    });
+  }
+
+  // ─── Fuente de verdad en Markdown ─────────────────────────────────────────
+  // Búsquedas perezosas (no `const` de módulo): loadActiveProfileIntoDOM()
+  // llama a renderMarkdownSources() durante el arranque, ANTES de que la
+  // ejecución llegue a esta parte del archivo.
+  const mdDropzone = document.getElementById("mdDropzone");
+  const mdFileInput = document.getElementById("mdFileInput");
+  const btnApplyMdFields = document.getElementById("btnApplyMdFields");
+
+  function parsedMarkdown() {
+    return localMarkdownSources.length ? JobFillMarkdown.parseMarkdownSources(localMarkdownSources) : null;
+  }
+
+  function formatBytes(n) {
+    return n > 1024 ? `${(n / 1024).toFixed(1)} KB` : `${n} B`;
+  }
+
+  /** Tarjeta por archivo, con lo que se entendió de él (o por qué no sirve). */
+  function renderMarkdownSources() {
+    const mdSourcesList = document.getElementById("mdSourcesList");
+    if (!mdSourcesList) return;
+    mdSourcesList.replaceChildren();
+
+    for (const source of localMarkdownSources) {
+      const parsed = JobFillMarkdown.parseMarkdownSources([source]);
+      const summary = JobFillMarkdown.summarizeParsed(parsed);
+
+      const card = document.createElement("div");
+      card.className = "md-source-card";
+
+      const head = document.createElement("div");
+      head.className = "md-source-head";
+      const name = document.createElement("strong");
+      name.textContent = `📄 ${source.name}`;
+      const meta = document.createElement("span");
+      meta.className = "md-source-meta";
+      meta.textContent = `${formatBytes(source.content.length)} · importado ${new Date(source.importedAt).toLocaleString("es-CL")}`;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "btn-delete-cf";
+      remove.textContent = "Quitar";
+      remove.addEventListener("click", () => {
+        localMarkdownSources = localMarkdownSources.filter(s => s.name !== source.name);
+        syncStructuredDbFromMarkdown();
+        renderMarkdownSources();
+        scheduleSave();
+      });
+      head.append(name, meta, remove);
+
+      const facts = document.createElement("ul");
+      facts.className = "md-source-facts";
+      const fact = (text, tone = "") => {
+        const li = document.createElement("li");
+        li.textContent = text;
+        if (tone) li.className = tone;
+        facts.appendChild(li);
+      };
+      if (summary.sections) fact(`✓ ${summary.sections} experiencias/proyectos con ${summary.achievements} logros`);
+      else fact("⚠️ No se encontraron secciones de experiencia (encabezados ## con logros en viñetas).", "warn");
+      fact(summary.hasRules ? "✓ REGLAS DE USO: se aplican literalmente en cada respuesta" : "Sin sección REGLAS DE USO (opcional)");
+      if (summary.excluded.length) fact(`🚫 Nunca se envían (su nota dice "NUNCA va en un CV"): ${summary.excluded.join(", ")}`);
+      if (summary.estimatedMetricsRemoved) fact(`🚫 ${summary.estimatedMetricsRemoved} métricas ESTIMADA se omiten siempre`);
+
+      card.append(head, facts);
+      mdSourcesList.appendChild(card);
+    }
+
+    renderDetectedFields();
+  }
+
+  /** Campos que el .md trae, para ofrecer completar los vacíos de "Mis datos". */
+  function renderDetectedFields() {
+    const mdDetectedFields = document.getElementById("mdDetectedFields");
+    const mdDetectedList = document.getElementById("mdDetectedList");
+    if (!mdDetectedFields) return;
+    const parsed = parsedMarkdown();
+    const fields = parsed ? JobFillMarkdown.markdownToProfileFields(parsed) : {};
+    const keys = Object.keys(fields).filter(k => MD_FIELD_LABELS[k]);
+    mdDetectedFields.hidden = keys.length === 0;
+    mdDetectedList.replaceChildren();
+    for (const key of keys) {
+      const dt = document.createElement("dt");
+      dt.textContent = MD_FIELD_LABELS[key];
+      const dd = document.createElement("dd");
+      dd.textContent = fields[key].length > 140 ? `${fields[key].slice(0, 140)}…` : fields[key];
+      mdDetectedList.append(dt, dd);
+    }
+  }
+
+  /**
+   * La base estructurada (cargos/logros/tecnologías) se regenera desde el
+   * .md: la usan el ranking por oferta y la verificación de requisitos. Sin
+   * .md, se conserva la que haya (CV procesado o editado a mano).
+   */
+  function syncStructuredDbFromMarkdown() {
+    const parsed = parsedMarkdown();
+    if (!parsed || !parsed.sections.length) return;
+    localCvDatabase = JobFillMarkdown.markdownToCvDatabase(parsed, "");
+    renderCvDatabase();
+  }
+
+  async function importMarkdownFiles(fileList) {
+    const files = [...fileList].filter(f => /\.(md|markdown)$/i.test(f.name) || f.type === "text/markdown");
+    if (!files.length) {
+      showSaveFeedback("⚠️ Solo se aceptan archivos .md");
+      return;
+    }
+    const t0 = performance.now();
+    for (const file of files) {
+      const content = await file.text();
+      const entry = { name: file.name, content, importedAt: Date.now() };
+      // Reimportar el mismo archivo lo REEMPLAZA: así se actualiza la BASE.
+      const idx = localMarkdownSources.findIndex(s => s.name === file.name);
+      if (idx >= 0) localMarkdownSources[idx] = entry;
+      else localMarkdownSources.push(entry);
+    }
+    syncStructuredDbFromMarkdown();
+    renderMarkdownSources();
+    await persistAll();
+    showSaveFeedback(`✓ ${files.length} archivo${files.length > 1 ? "s" : ""} importado${files.length > 1 ? "s" : ""} en ${Math.max(1, Math.round(performance.now() - t0))} ms`);
+  }
+
+  if (mdDropzone && mdFileInput) {
+    mdDropzone.addEventListener("click", () => mdFileInput.click());
+    mdDropzone.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); mdFileInput.click(); }
+    });
+    mdFileInput.addEventListener("change", () => {
+      importMarkdownFiles(mdFileInput.files);
+      mdFileInput.value = "";
+    });
+    ["dragenter", "dragover"].forEach(type => mdDropzone.addEventListener(type, e => {
+      e.preventDefault();
+      mdDropzone.classList.add("is-dragging");
+    }));
+    ["dragleave", "drop"].forEach(type => mdDropzone.addEventListener(type, e => {
+      e.preventDefault();
+      mdDropzone.classList.remove("is-dragging");
+    }));
+    mdDropzone.addEventListener("drop", e => importMarkdownFiles(e.dataTransfer.files));
+  }
+
+  btnApplyMdFields?.addEventListener("click", () => {
+    const parsed = parsedMarkdown();
+    if (!parsed) return;
+    const fields = JobFillMarkdown.markdownToProfileFields(parsed);
+    let filled = 0;
+    for (const [key, value] of Object.entries(fields)) {
+      const input = profileForm.elements[key];
+      // Solo lo vacío: nunca se pisa algo que el usuario ya escribió.
+      if (!input || (input.value || "").trim()) continue;
+      if (input.tagName === "SELECT" && ![...input.options].some(o => o.value === value)) continue;
+      input.value = value;
+      filled++;
+    }
+    showSaveFeedback(filled ? `✓ ${filled} campos completados desde tu .md` : "Tus datos ya estaban completos: no se cambió nada");
+    if (filled) scheduleSave();
+  });
+
+  // ─── Inicio: checklist de configuración ──────────────────────────────────
+  async function renderSetupChecklist() {
+    const container = document.getElementById("setupSteps");
+    if (!container) return;
+    const stored = await chrome.storage.local.get(null);
+    const base = stored.candidateBase || {};
+    const mdCount = (base.markdownSources || []).length;
+    const expCount = base.cvDatabase?.experiences?.length || 0;
+    const ai = JobFillAi.readAiSettings(stored);
+
+    const steps = [
+      {
+        done: mdCount > 0 || expCount > 0,
+        title: "Carga tu experiencia",
+        detail: mdCount ? `${mdCount} archivo${mdCount > 1 ? "s" : ""} .md como fuente de verdad` : expCount ? `${expCount} cargos cargados desde tu CV` : "Importa tu BASE en Markdown (instantáneo) o tu CV",
+        tab: "tab-source",
+        action: "Ir a Fuente de verdad"
+      },
+      {
+        done: JobFillAi.hasAiCredentials(ai),
+        title: "Conecta la IA",
+        detail: JobFillAi.hasAiCredentials(ai)
+          ? `${JobFillAi.describeProvider(ai.provider)}${JobFillAi.hasGeminiFallback(ai) ? " + respaldo Gemini" : ""}`
+          : "Pega tu API Key de Claude (o de Gemini)",
+        tab: "tab-claude",
+        action: "Ir a Inteligencia artificial"
+      },
+      {
+        done: Boolean(base.email && base.phone && (base.firstName || base.fullName)),
+        title: "Revisa tus datos de contacto",
+        detail: base.email ? `${base.fullName || base.firstName || ""} · ${base.email}${base.phone ? ` · ${base.phone}` : " · falta teléfono"}` : "Nombre, email y teléfono (tu .md puede completarlos)",
+        tab: "tab-personal tab-links tab-experience tab-education tab-legal",
+        action: "Ir a Mis datos"
+      }
+    ];
+
+    container.replaceChildren();
+    steps.forEach((step, i) => {
+      const card = document.createElement("div");
+      card.className = `setup-step ${step.done ? "is-done" : ""}`;
+      const badge = document.createElement("div");
+      badge.className = "setup-step-badge";
+      badge.textContent = step.done ? "✓" : String(i + 1);
+      const text = document.createElement("div");
+      text.className = "setup-step-text";
+      const title = document.createElement("strong");
+      title.textContent = step.title;
+      const detail = document.createElement("span");
+      detail.textContent = step.detail;
+      text.append(title, detail);
+      const go = document.createElement("button");
+      go.type = "button";
+      go.className = step.done ? "btn-secondary" : "btn-primary";
+      go.textContent = step.done ? "Revisar" : step.action;
+      go.addEventListener("click", () => document.querySelector(`.nav-item[data-tab="${step.tab}"]`)?.click());
+      card.append(badge, text, go);
+      container.appendChild(card);
     });
   }
 

@@ -959,13 +959,13 @@ it("Classifies questions as logistics, motivation or experience to shape the ans
   const srcPath = path.join(__dirname, "..", "background", "service-worker.js");
   const src = fs.readFileSync(srcPath, "utf8");
   // classifyQuestionIntent (la lógica real) + el wrapper detectQuestionIntent
-  // que la envuelve viven en ese orden; el corte tiene que llegar hasta
-  // classifyIntentWithAI para no cortar a mitad del wrapper (hay un comentario
+  // que la envuelve viven en ese orden; el corte tiene que llegar hasta el
+  // comentario de stripMarkdownFormatting para no cortar a mitad del wrapper (hay un comentario
   // /** ... */ de una línea justo antes del wrapper que un corte ingenuo en el
   // primer "/**" cortaría de más).
   const start = src.indexOf("function classifyQuestionIntent");
   if (start === -1) throw new Error("No se pudo aislar classifyQuestionIntent en background/service-worker.js");
-  const end = src.indexOf("async function classifyIntentWithAI", start);
+  const end = src.indexOf("/**\n * Quita la sintaxis Markdown", start);
   if (end === -1) throw new Error("No se pudo aislar el final de detectQuestionIntent en background/service-worker.js");
   const classify = eval(src.slice(start, end) + "\ndetectQuestionIntent;");
 
@@ -2261,7 +2261,7 @@ it("Every extension script parses (a syntax error silently disables a whole file
   const { execFileSync } = require("child_process");
   const scripts = [
     ["background", "service-worker.js"], ["content", "autofill.js"], ["options", "options.js"],
-    ["options", "pdf-parser.js"], ["popup", "popup.js"], ["shared", "ai-client.js"]
+    ["options", "pdf-parser.js"], ["popup", "popup.js"], ["shared", "ai-client.js"], ["shared", "markdown-source.js"]
   ];
   for (const parts of scripts) {
     execFileSync(process.execPath, ["--check", path.join(__dirname, "..", ...parts)], { stdio: "pipe" });
@@ -2396,6 +2396,131 @@ it("Backups never export or import API keys", () => {
   const importBlock = optionsSrc.slice(optionsSrc.indexOf("// Backup - Import"));
   assert.ok(/for \(const key of BACKUP_EXCLUDED_KEYS\) delete importedData\[key\]/.test(importBlock));
   assert.ok(/looksLikeBackup/.test(importBlock), "valida que el archivo sea un respaldo");
+});
+
+// ─── FUENTE DE VERDAD EN MARKDOWN ─────────────────────────────────────────
+// Fixture sintético con el MISMO formato que la BASE real del usuario (la real
+// no se versiona: son datos personales).
+function loadRealMarkdownSource() {
+  require(path.join(__dirname, "..", "shared", "markdown-source.js"));
+  return globalThis.JobFillMarkdown;
+}
+const MD_FIXTURE = () => fs.readFileSync(path.join(__dirname, "fixtures", "base-ejemplo.md"), "utf8");
+
+it("Parses a Markdown experience base locally: sections, rules, identity and guarantees", () => {
+  const M = loadRealMarkdownSource();
+  const t0 = Date.now();
+  const parsed = M.parseMarkdownSources([{ name: "base-ejemplo.md", content: MD_FIXTURE() }]);
+  assert.ok(Date.now() - t0 < 200, "interpretar un .md es instantáneo (sin IA)");
+
+  assert.deepStrictEqual(parsed.sections.map(s => s.title), ["Plataforma X - SaaS de inventario", "Tienda Y - E-commerce familiar"]);
+  assert.strictEqual(parsed.sections[0].period, "Mar 2023 - presente");
+  assert.strictEqual(parsed.sections[0].role, "Fundadora y desarrolladora principal");
+  assert.strictEqual(parsed.sections[0].achievements.length, 2);
+  assert.strictEqual(parsed.sections[0].achievements[0].group, "Busqueda e IA");
+  assert.strictEqual(parsed.sections[1].achievements[0].title, "Dashboard de ventas");
+
+  // Garantías deterministas
+  assert.deepStrictEqual(parsed.excludedSections, ["Automatizador personal"], "la sección con 'NUNCA va en un CV' no se usa");
+  assert.strictEqual(parsed.sections[0].achievements[1].metrica, "", "la métrica ESTIMADA se elimina");
+  assert.strictEqual(parsed.estimatedRemoved, 1);
+  assert.match(parsed.rules.join("\n"), /NUNCA mencionar nivel C1/);
+
+  const summary = M.summarizeParsed(parsed);
+  assert.strictEqual(summary.sections, 2);
+  assert.strictEqual(summary.hasRules, true);
+});
+
+it("Builds the AI context from Markdown: rules verbatim, most relevant first, nothing forbidden", () => {
+  const M = loadRealMarkdownSource();
+  const parsed = M.parseMarkdownSources([{ name: "base-ejemplo.md", content: MD_FIXTURE() }]);
+
+  const aiJob = M.buildMarkdownContext(parsed, "Buscamos ingeniera de IA con embeddings, busqueda vectorial y Python", { maxDetailed: 1 });
+  assert.ok(aiJob.startsWith("--- REGLAS DEL CANDIDATO"), "las reglas del usuario van primero");
+  assert.match(aiJob, /MÁS RELEVANTES[\s\S]*### Plataforma X/);
+  assert.match(aiJob, /OTRA EXPERIENCIA \(resumen\) ---\n- Tienda Y/);
+
+  const biJob = M.buildMarkdownContext(parsed, "Analista BI con Power BI, SQL y dashboards de ventas", { maxDetailed: 1 });
+  assert.match(biJob, /MÁS RELEVANTES[^\n]*---\n### Tienda Y/, "la sección más relevante cambia con la oferta");
+
+  for (const ctx of [aiJob, biJob]) {
+    const outsideRules = ctx.slice(ctx.indexOf("--- IDENTIDAD"));
+    assert.ok(!/estimad/i.test(outsideRules), "ninguna métrica ESTIMADA llega al modelo");
+    assert.ok(!/Bot de postulaciones|Automatizador personal/.test(ctx), "la sección excluida nunca llega");
+    assert.ok(!/NO se envia a nadie/.test(ctx), "el preámbulo para humanos no se envía");
+    assert.ok(!/Nodo:|verificable:|\[\[|====/.test(ctx), "sin ruido del vault");
+  }
+
+  // Tope de logros por sección: los menos relacionados se resumen.
+  const capped = M.buildMarkdownContext(parsed, "embeddings Python", { maxDetailed: 1, maxAchievements: 1 });
+  assert.match(capped, /\+1 logros más de esta experiencia/);
+});
+
+it("Maps Markdown identity to profile fields without inventing anything", () => {
+  const M = loadRealMarkdownSource();
+  const parsed = M.parseMarkdownSources([{ name: "base-ejemplo.md", content: MD_FIXTURE() }]);
+  const f = M.markdownToProfileFields(parsed);
+
+  assert.strictEqual(f.fullName, "Ana Maria Perez Soto");
+  assert.strictEqual(f.firstName, "Ana");
+  assert.strictEqual(f.middleName, "Maria");
+  assert.strictEqual(f.lastNamePaternal, "Perez");
+  assert.strictEqual(f.lastNameMaternal, "Soto");
+  assert.strictEqual(f.email, "ana.perez@ejemplo.cl");
+  assert.strictEqual(f.phone, "+56 9 1111 2222");
+  assert.strictEqual(f.linkedinUrl, "https://linkedin.com/in/ana-perez");
+  assert.strictEqual(f.englishLevel, "Intermedio (B1/B2)", "B2 del texto, no el C1 que la regla prohíbe");
+  assert.strictEqual(f.city, "Santiago");
+  assert.strictEqual(f.country, "Chile");
+  assert.strictEqual(f.degree, "Ingenieria en Informatica");
+  assert.strictEqual(f.university, "Universidad Ejemplo, sede Centro");
+  assert.match(f.skills, /Python, TypeScript, SQL, Angular, React/);
+  assert.strictEqual("salaryExpectation" in f, false, "lo que el archivo no dice no se devuelve");
+  assert.strictEqual("rut" in f, false);
+
+  // Nombres de más de 4 palabras (partículas): no se adivina la partición.
+  assert.deepStrictEqual(M.splitFullName("Juan de la Cruz Perez Soto"), { fullName: "Juan de la Cruz Perez Soto" });
+
+  const db = M.markdownToCvDatabase(parsed, "");
+  assert.strictEqual(db.experiences.length, 2);
+  assert.match(db.experiences[0].technologies, /embeddings/);
+});
+
+it("The service worker writes answers from the Markdown base and keeps it out of the page", () => {
+  loadRealMarkdownSource();
+  const src = sliceRealSource("const REQUIREMENT_VOCABULARY = [", "async function handleClaudeGeneration(", ["background", "service-worker.js"]);
+  const resolve = eval(src + "\nresolveCandidateContext;");
+  const storage = {
+    candidateBase: { markdownSources: [{ name: "base-ejemplo.md", content: MD_FIXTURE() }], cvDatabase: {} },
+    cvIndexes: []
+  };
+  const { candidateContext, logisticsContext, hasRealCandidateData } = resolve(storage, "Ingeniera IA", "embeddings y Python");
+  assert.strictEqual(hasRealCandidateData, true, "un .md basta como material real");
+  assert.match(candidateContext, /ARCHIVO DE EXPERIENCIA DEL CANDIDATO/);
+  assert.match(candidateContext, /REGLAS DEL CANDIDATO/);
+  assert.match(logisticsContext, /NUNCA mencionar C1/, "las reglas también rigen las preguntas de datos puntuales");
+
+  const view = loadRealCandidateSchemaHelpers().buildAutofillProfileView(storage);
+  assert.strictEqual("markdownSources" in view, false, "el .md no viaja a cada página");
+});
+
+it("No extra sequential AI call to classify a question: unmatched questions are typed by the writer model", () => {
+  const swSrc = fs.readFileSync(path.join(__dirname, "..", "background", "service-worker.js"), "utf8");
+  assert.ok(!/classifyIntentWithAI/.test(swSrc), "sin llamada previa a Haiku para clasificar");
+  assert.match(swSrc, /intentGuess\.matched \? intentGuess\.intent : "unknown"/);
+  assert.match(swSrc, /unknown: `TIPO DE ESTA PREGUNTA: NO CLASIFICADO AUTOMÁTICAMENTE/);
+});
+
+it("Options never invent answers: legal and English selects start empty, nothing blocks autosave", () => {
+  const html = fs.readFileSync(path.join(__dirname, "..", "options", "options.html"), "utf8");
+  for (const id of ["legallyAuthorized", "requiresSponsorship", "willingToRelocate", "workPreference", "englishLevel"]) {
+    const m = html.match(new RegExp(`<select id="${id}"[^>]*>\\s*<option value="([^"]*)"`));
+    assert.ok(m, `select ${id}`);
+    assert.strictEqual(m[1], "", `${id}: la primera opción debe ser vacía (si no, guardar la página inventa la respuesta)`);
+  }
+  assert.ok(!/\srequired[\s>]/.test(html), "ningún campo required bloquea el guardado");
+  assert.match(html, /id="mdDropzone"/);
+  assert.match(html, /markdown-source\.js/);
 });
 
 // Espera a los tests async antes de contar: si el resumen se imprimiera de

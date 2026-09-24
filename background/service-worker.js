@@ -6,7 +6,7 @@
 // Cliente único de IA (Claude, con respaldo en Gemini vía Vertex AI),
 // compartido con opciones y popup. Ruta absoluta: importScripts resuelve
 // relativo al SW.
-importScripts("/shared/ai-client.js");
+importScripts("/shared/ai-client.js", "/shared/markdown-source.js");
 
 // `targetRole` vacío por defecto: alimenta `headline`, que el autofill escribe
 // en campos "Job Title"/"Titular" y que el prompt le pasa a Claude como el cargo
@@ -180,9 +180,14 @@ function buildAutofillProfileView(storage) {
     profiles_backup_v1, ...safeStorage
   } = storage;
 
+  // `markdownSources` (tu BASE .md, decenas de KB) tampoco viaja: el
+  // autorrelleno usa los campos ya extraídos, y mandarlo a cada página solo
+  // haría más lento cada "Autorrellenar".
+  const { markdownSources, ...candidateFields } = candidateBase;
+
   return {
     ...safeStorage,
-    ...candidateBase,
+    ...candidateFields,
     headline: activeIndex?.targetRole || candidateBase.headline || candidateBase.currentTitle || ""
   };
 }
@@ -950,7 +955,7 @@ async function handlePreviewUnbackedTerms({ jobDescription }) {
  * clave reconoció la pregunta, el "experience" que se retorna es un default
  * por descarte, no una decisión real — el llamador puede usar `matched` para
  * decidir si vale la pena pedirle una segunda opinión a un modelo antes de
- * confiar en ese default (ver `classifyIntentWithAI`).
+ * confiar en ese default (ver el tipo "unknown" en handleClaudeGeneration).
  */
 function classifyQuestionIntent(text) {
   if (!text) return { intent: "experience", matched: false };
@@ -1023,40 +1028,6 @@ function classifyQuestionIntent(text) {
 /** Compatibilidad: código y tests existentes que solo necesitan el string. */
 function detectQuestionIntent(text) {
   return classifyQuestionIntent(text).intent;
-}
-
-/**
- * Respaldo por IA para cuando el clasificador por palabras clave no reconoce
- * NINGUNA señal — el caso que antes se resolvía en silencio como "experience"
- * por descarte, aunque fuera un dato puntual con una redacción que nadie
- * había anticipado (así se coló "Indique su título académico, año de
- * titulación..." antes de agregar esas palabras clave a mano).
- *
- * Deliberadamente NO se llama para toda pregunta: el camino determinista ya
- * cubre la enorme mayoría con costo cero, y duplicar la llamada en cada
- * pregunta anularía el ahorro de enrutar preguntas simples a Haiku. Esta
- * llamada SÍ usa Haiku — es una clasificación de una palabra, no redacción —
- * y solo se paga en el subconjunto que el diccionario no reconoce.
- */
-async function classifyIntentWithAI(question, ai) {
-  try {
-    const data = await callAnthropicMessagesApi({
-      ai,
-      model: MODEL_SIMPLE,
-      max_tokens: 10,
-      system: "Clasificas preguntas de formularios de postulación laboral en una sola palabra:\nLOGISTICS: pide un dato puntual del candidato, sin narrativa — disponibilidad, modalidad de trabajo, ubicación, renta, licencias, o una credencial académica (título, institución, año de titulación).\nMOTIVATION: pregunta por qué le interesa el puesto o la empresa.\nEXPERIENCE: pide narrar un caso, logro, proyecto o capacidad técnica.\nResponde ÚNICAMENTE con una de esas tres palabras en mayúsculas, nada más — ni explicación ni puntuación.",
-      messages: [{ role: "user", content: [{ type: "text", text: question }] }]
-    });
-    const raw = extractTextFromResponse(data).trim().toUpperCase();
-    if (raw.includes("LOGISTICS")) return "logistics";
-    if (raw.includes("MOTIVATION")) return "motivation";
-    return "experience";
-  } catch (e) {
-    // Sin respaldo disponible (sin red, API caída): el default seguro de
-    // siempre. Nunca debe bloquear la generación de la respuesta.
-    console.warn("[JobFill AI] Respaldo de clasificación por IA falló, se usa 'experience' por defecto:", e);
-    return "experience";
-  }
 }
 
 /**
@@ -1242,11 +1213,20 @@ function resolveCandidateContext(profile, jobTitle, jobDescription) {
   const targetResumeText = p.resumeText || cvDb.rawText || "";
   const matchedProfileName = activeIndex?.area || activeIndex?.targetRole || "";
 
+  // Fuente de verdad en Markdown (BASE .md del usuario): si existe, MANDA
+  // sobre el CV estructurado. Se interpreta aquí, en cada pregunta, a
+  // propósito: son ~5 ms locales, y así nunca hay una versión "cacheada"
+  // desincronizada del archivo que el usuario acaba de reimportar.
+  const markdownSources = (p.markdownSources || []).filter(src => src && typeof src.content === "string" && src.content.trim());
+  const mdParsed = markdownSources.length ? JobFillMarkdown.parseMarkdownSources(markdownSources) : null;
+  const hasMarkdown = Boolean(mdParsed && mdParsed.sections.length);
+
   // Sin material real del candidato, la regla "no niegues experiencia" del
   // prompt empuja al modelo a producir una respuesta convincente sostenida por
   // nada — es decir, inventada, y firmada por el usuario ante un reclutador.
   // Mejor fallar de forma visible que redactar algo verosímil y falso.
   const hasRealCandidateData = Boolean(
+    hasMarkdown ||
     (cvDb.experiences && cvDb.experiences.length > 0) ||
     (cvDb.projects && cvDb.projects.length > 0) ||
     (targetResumeText && targetResumeText.trim().length > 80) ||
@@ -1385,7 +1365,21 @@ PERFIL DEL CANDIDATO (datos para preguntas de disponibilidad, condiciones y cred
 ${educationEntries.length ? `- Educación registrada: ${educationEntries.join(" | ")}` : ""}
 ${customFieldsContext ? `\n--- CAMPOS PERSONALIZADOS DEL CANDIDATO ---\n${customFieldsContext}` : ""}
 ${customQaContext ? `\n--- BANCO DE PREGUNTAS Y RESPUESTAS FRECUENTES DEL CANDIDATO ---\n${customQaContext}` : ""}
+${hasMarkdown && mdParsed.rules.length ? `\n--- REGLAS DEL CANDIDATO (OBLIGATORIAS) ---\n${mdParsed.rules.join("\n\n")}` : ""}
+${hasMarkdown && mdParsed.identityText.length ? `\n--- IDENTIDAD (de su archivo de experiencia) ---\n${mdParsed.identityText.join("\n\n")}` : ""}
 `.trim();
+
+  // Con Markdown, el material de experiencia sale del archivo del usuario
+  // (con sus reglas literales y las secciones más relevantes para la oferta)
+  // en vez de la base estructurada, que es una versión resumida de lo mismo.
+  const experienceMaterial = hasMarkdown
+    ? `--- ARCHIVO DE EXPERIENCIA DEL CANDIDATO (fuente de verdad) ---\n${JobFillMarkdown.buildMarkdownContext(mdParsed, jobText)}`
+    : `--- BASE DE DATOS DE EXPERIENCIA LABORAL Y CARGOS ---
+${experiencesContext || "Sin cargos desglosados en BD"}
+
+--- PROYECTOS DESTACADOS ---
+${projectsContext || "Sin proyectos en BD"}
+${resumeTextBlock}`;
 
   const candidateContext = `
 PERFIL DEL CANDIDATO:
@@ -1403,12 +1397,7 @@ ${matchedProfileName ? `- Versión de Perfil / CV Aplicada: ${matchedProfileName
 ${customFieldsContext ? `\n--- CAMPOS PERSONALIZADOS DEL CANDIDATO ---\n${customFieldsContext}` : ""}
 ${customQaContext ? `\n--- BANCO DE PREGUNTAS Y RESPUESTAS FRECUENTES DEL CANDIDATO ---\n${customQaContext}` : ""}
 
---- BASE DE DATOS DE EXPERIENCIA LABORAL Y CARGOS ---
-${experiencesContext || "Sin cargos desglosados en BD"}
-
---- PROYECTOS DESTACADOS ---
-${projectsContext || "Sin proyectos en BD"}
-${resumeTextBlock}
+${experienceMaterial}
 `.trim();
 
   return { p, cvDb, matchedProfileName, hasRealCandidateData, logisticsContext, candidateContext };
@@ -1433,17 +1422,17 @@ async function handleClaudeGeneration({ question, fieldType, jobTitle, companyNa
   const detectedLang = detectQuestionLanguage(question);
   const isEnglish = detectedLang === "en";
 
-  // Híbrido: el diccionario decide gratis e instantáneo en el caso común: solo
-  // cuando NINGUNA palabra clave reconoce la pregunta se paga una consulta
-  // mínima a Haiku para no adivinar en silencio (ver classifyIntentWithAI).
+  // El diccionario decide gratis e instantáneo en el caso común. Cuando
+  // NINGUNA palabra clave reconoce la pregunta, el tipo queda "unknown" y es
+  // el propio modelo que redacta quien lo decide (ver intentRules.unknown).
+  // Antes se hacía una llamada EXTRA a Haiku solo para clasificar, en serie
+  // antes de la redacción: un viaje de ida y vuelta más a la API que el
+  // usuario esperaba sin ver nada.
   const intentGuess = classifyQuestionIntent(question);
-  const questionIntent = intentGuess.matched
-    ? intentGuess.intent
-    : await classifyIntentWithAI(question, ai);
+  const questionIntent = intentGuess.matched ? intentGuess.intent : "unknown";
 
   console.log(
     "[JobFill AI] Idioma detectado:", detectedLang, "| Tipo:", questionIntent,
-    intentGuess.matched ? "(palabra clave)" : "(respaldo IA)",
     "| Pregunta recibida:", JSON.stringify(question)
   );
 
@@ -1477,6 +1466,10 @@ async function handleClaudeGeneration({ question, fieldType, jobTitle, companyNa
 - Conecta lo que la DESCRIPCIÓN DE LA OFERTA plantea (producto, problema, tecnologías, propósito) con la trayectoria real del candidato.
 - Prioriza el porqué sobre el currículum: puedes citar UN hecho real como respaldo, pero la respuesta debe explicar el interés, no enumerar logros.
 - Nada de halagos genéricos aplicables a cualquier empresa ("empresa líder e innovadora"): apóyate en algo específico de esta oferta.`,
+    unknown: `TIPO DE ESTA PREGUNTA: NO CLASIFICADO AUTOMÁTICAMENTE — decídelo tú antes de escribir.
+- Si pide un DATO puntual (disponibilidad, modalidad, ubicación, renta, licencia, título/institución/año): responde el dato en la primera frase, en 1 a 3 frases, sin métricas, proyectos ni stack.
+- Si pregunta por qué te interesa el puesto o la empresa: conecta la oferta con la trayectoria real, sin halagos genéricos.
+- Si pide un caso, logro o capacidad técnica: responde el objeto exacto con UN hilo central de material real del perfil.`,
     experience: `TIPO DE ESTA PREGUNTA: EXPERIENCIA / CAPACIDAD TÉCNICA.
 - Responde el objeto EXACTO de la pregunta con material real del perfil. Si pregunta por un dominio puntual (p. ej. servicios cloud), nombra esos elementos concretos; no narres el proyecto completo por defecto.
 - Ajusta la forma a lo que se pide: una pregunta de inventario ("qué has usado") pide los elementos concretos y para qué los usaste; una pregunta de caso ("describe un proyecto/desafío") sí pide una narración breve con contexto, decisión y desenlace. No apliques el molde de una a la otra.

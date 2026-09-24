@@ -21,15 +21,18 @@ Extensión de navegador (Manifest V3) para Chrome, Edge y Brave que guarda tus d
 
 ## ⚙️ Configuración Inicial
 
-1. Haz clic en el icono de **JobFill AI** y presiona el engranaje ⚙️ o *"Editar Datos Completos"*.
-2. Rellena tus pestañas con tus datos:
-   - 👤 **Datos Personales** (Nombre, **RUT / DNI**, Email, Teléfono, Ubicación).
-   - 🔗 **Redes y Enlaces** (LinkedIn, GitHub, Portafolio).
-   - 💼 **Experiencia y Salario** (Cargo, Años de experiencia, Pretensiones, Inglés).
-   - 🎓 **Educación y Habilidades** (Tu stack técnico, ej: JavaScript, Python, etc.).
-   - 🧩 **Campos Flexibles** (Agrega cualquier dato extra: *Licencia de conducir, Renta líquida, etc.* con sus palabras clave).
-   - 🤖 **Claude IA:** pega tu **Anthropic API Key** (`sk-ant-...`). Opcional: una **API Key de Vertex AI** (modo express, `AQ.…`) para que **Gemini responda automáticamente si Claude se queda sin saldo**, o para usar Gemini como modelo principal. Pulsa *"⚡ Probar Conexión"*: prueba cada proveedor por separado.
-3. Haz clic en **"💾 Guardar Cambios"**.
+Abre el icono de **JobFill AI** → ⚙️. La sección **🏠 Inicio** muestra los 3 pasos y cuáles faltan. Todo se **guarda solo** mientras escribes (o con Ctrl+S).
+
+1. **📚 Fuente de verdad:** arrastra tus archivos **.md** (p. ej. `BASE_Experiencia.md`). Se leen al instante y sin IA:
+   - Las **REGLAS DE USO** del archivo se aplican literalmente en cada respuesta.
+   - Las métricas marcadas **ESTIMADA** y las secciones con `Nota: … NUNCA va en un CV` nunca se envían a la IA.
+   - Para cada oferta se envían solo las experiencias y logros más relevantes (más rápido y más barato).
+   - "Completar Mis datos" llena los campos vacíos (nombre, contacto, links, stack, estudios) desde el archivo.
+   - Para actualizar, vuelve a importar el mismo archivo. ¿Sin .md? Hay una opción plegada para usar un CV en PDF o texto.
+2. **🤖 Inteligencia artificial:** pega tu **Anthropic API Key** (`sk-ant-...`). Opcional: una **API Key de Vertex AI** (`AQ.…`) para que **Gemini responda si Claude se queda sin saldo**. *"⚡ Probar Conexión"* prueba cada proveedor por separado.
+3. **👤 Mis datos:** revisa contacto, renta, disponibilidad y la sección legal. Las preguntas legales empiezan **sin responder**: solo se rellenan si tú eliges una opción.
+
+Extras: **💬 Respuestas guardadas** (Q&A y campos flexibles), **🎯 Perfiles de CV** (facetas con palabras clave, opcional) y **💾 Respaldo**.
 
 > **Apagar la extensión:** el interruptor del popup (o el botón ⏻ del panel flotante) la desactiva en todas las páginas al instante; el ícono muestra "OFF" mientras esté apagada.
 
