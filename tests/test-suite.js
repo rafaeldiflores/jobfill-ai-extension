@@ -2881,8 +2881,49 @@ it("Apply flow: a requested change keeps the vault rules, uses only BASE facts a
 
   const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
   // El cambio deja el CV sin validar: vuelve a pasar por cv_validar (y al ajuste) antes de otro PDF.
-  assert.match(sw, /markdown: revisado\.markdown, validacion: null, fixRounds: 0/);
+  assert.match(sw, /markdown: repair\(revisado\.markdown, cp\.markdown\), validacion: null, fixRounds: 0/);
   assert.ok(sw.indexOf("cp.cambioPendiente) {") < sw.indexOf("let validacion = cp.validacion;"), "el cambio se aplica antes de validar");
+});
+
+it("CV from the AI: a missing frontmatter/titulo is repaired without AI instead of crashing the flow", () => {
+  const C = loadRealCvAdapter();
+  const body = "## RESUMEN PROFESIONAL\nTexto.";
+  const T = "Ingeniero en Informática | AI Engineer";
+  // Sin frontmatter (el error real: "El CV necesita titulo en el frontmatter").
+  assert.strictEqual(C.normalizeCvMarkdown(body, T), `---\ntitulo: "${T}"\n---\n${body}`);
+  // Envuelto en ```markdown.
+  assert.strictEqual(C.normalizeCvMarkdown("```markdown\n" + body + "\n```", T), `---\ntitulo: "${T}"\n---\n${body}`);
+  // Frontmatter sin titulo, o con `title:`.
+  assert.strictEqual(C.normalizeCvMarkdown(`---\nperfil: AI\n---\n${body}`, T), `---\ntitulo: "${T}"\nperfil: AI\n---\n${body}`);
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitle: "X | Y"\n---\n${body}`, T), `---\ntitulo: "X | Y"\n---\n${body}`);
+  // Un CV correcto no se toca (CRLF incluido).
+  const ok = `---\ntitulo: "A | B"\n---\n${body}`;
+  assert.strictEqual(C.normalizeCvMarkdown(ok, T), ok);
+  assert.strictEqual(C.normalizeCvMarkdown(ok.replace(/\n/g, "\r\n"), T), ok);
+  // Comillas del titulo de respaldo no rompen el YAML.
+  assert.match(C.normalizeCvMarkdown(body, 'Ing | "Dev"'), /^---\ntitulo: "Ing \| 'Dev'"\n---/);
+  // tituloDePerfil lee titulos con o sin comillas.
+  assert.strictEqual(C.tituloDePerfil('---\ntitulo: "A | B"\n---'), "A | B");
+  assert.strictEqual(C.tituloDePerfil("---\ntitulo: A | B\n---"), "A | B");
+  assert.strictEqual(C.tituloDePerfil(body), "");
+});
+
+it("Postulador rejecting the CV content becomes a verifier finding for the automatic fix, not a crash", () => {
+  const V = loadRealVaultClient();
+  let err = null;
+  try { V.parseToolResult({ isError: true, content: [{ type: "text", text: 'El CV necesita "titulo" en el frontmatter (subtítulo bajo el nombre).' }] }); } catch (e) { err = e; }
+  assert.ok(err && err.toolError === true, "un rechazo de la herramienta queda marcado como toolError");
+
+  const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
+  const validate = sw.slice(sw.indexOf("async function validateCv"), sw.indexOf("async function readApplyCheckpoint"));
+  assert.match(validate, /if \(!err\.toolError\) throw err;/, "red o sesión siguen siendo errores");
+  assert.match(validate, /return \{ ok: false, hallazgos: \[\{ nivel: "error", detalle: err\.message \}\]/);
+  // El flujo valida siempre con validateCv y repara todo CV que devuelve la IA.
+  const flow = sw.slice(sw.indexOf("async function runAdaptCvSteps"), sw.indexOf("/** Registra la postulación actual"));
+  assert.doesNotMatch(flow, /vaultCall\("cv_validar"/);
+  for (const src of ["adaptado.markdown", "revisado.markdown", "fix.markdown"]) {
+    assert.match(flow, new RegExp(`repair\\(${src.replace(".", "\\.")}`), `${src} pasa por repair`);
+  }
 });
 
 it("Portals: content script runs in every frame, portals.js loads first, widget only in the top frame", () => {

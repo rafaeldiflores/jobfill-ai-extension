@@ -54,7 +54,7 @@
 
   /** Título de un CV base (del frontmatter `titulo: "…"`). */
   function tituloDePerfil(markdown) {
-    return (String(markdown || "").match(/titulo:\s*"([^"]+)"/) || [])[1] || "";
+    return ((String(markdown || "").match(/^titulo:\s*"?([^"\n]+?)"?\s*$/m) || [])[1] || "").trim();
   }
 
   function buildProfilePickPrompt(perfiles, oferta) {
@@ -100,6 +100,33 @@ Responde SOLO JSON: {"markdown": "el CV corregido completo"}
 
 === CV ===
 ${markdown}`;
+  }
+
+  /**
+   * Repara sin IA lo estructural que el modelo a veces rompe y que el
+   * postulador rechaza de plano ("El CV necesita 'titulo' en el frontmatter"):
+   *   - quita un bloque ``` que envuelva todo el CV,
+   *   - agrega el frontmatter si falta, o `titulo` si el frontmatter no lo trae
+   *     (acepta `title:` como sinónimo).
+   * `tituloRespaldo` es el titulo del CV anterior o "{TITULO} | <cargo>".
+   * No toca el contenido: el resto lo juzga el verificador.
+   */
+  function normalizeCvMarkdown(markdown, tituloRespaldo) {
+    let md = String(markdown || "").replace(/\r\n/g, "\n").trim();
+    const fenced = md.match(/^```(?:markdown|md)?\n([\s\S]*?)\n```$/i);
+    if (fenced) md = fenced[1].trim();
+    const titulo = String(tituloRespaldo || "").replace(/"/g, "'").trim();
+
+    const fm = md.match(/^---\n([\s\S]*?)\n---\n?/);
+    if (!fm) {
+      return titulo ? `---\ntitulo: "${titulo}"\n---\n${md}` : md;
+    }
+    let head = fm[1];
+    if (/^titulo\s*:\s*\S/m.test(head)) return md;
+    if (/^title\s*:/m.test(head)) head = head.replace(/^title(\s*:)/m, "titulo$1");
+    else if (titulo) head = `titulo: "${titulo}"${head.trim() ? `\n${head}` : ""}`;
+    else return md;
+    return `---\n${head}\n---\n${md.slice(fm[0].length)}`;
   }
 
   /** Largo máximo de un pedido de cambio: es una instrucción, no un CV. */
@@ -184,6 +211,8 @@ ${String(oferta || "").slice(0, OFERTA_MAX_ADAPTAR)}`;
     buildFixPrompt,
     CAMBIO_MAX,
     buildRevisePrompt,
+    normalizeCvMarkdown,
+    tituloDePerfil,
     parseJsonReply,
     hoy,
     slug,
