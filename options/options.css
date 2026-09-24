@@ -292,6 +292,18 @@ textarea { resize: vertical; min-height: 80px; }
   background: rgba(14, 165, 233, 0.25);
 }
 
+/* `.form-group` fija display:flex, que le gana al atributo [hidden] del
+   navegador: sin esto, los campos del proveedor no elegido seguían visibles. */
+.form-group[hidden] {
+  display: none;
+}
+
+/* El botón de prueba vive solo (compartido por ambos proveedores), no
+   estirado a lo ancho de la columna flex. */
+.form-group > .btn-test-api {
+  align-self: flex-start;
+}
+
 .api-test-badge {
   font-size: 12px;
   font-weight: 500;

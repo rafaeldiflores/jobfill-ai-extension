@@ -428,17 +428,48 @@
 
           <!-- TAB 6: Claude AI -->
           <section id="tab-claude" class="tab-panel">
-            <div class="section-desc">Integra tu API Key de Claude (Anthropic) para responder automáticamente preguntas abiertas de postulaciones en 1 clic.</div>
+            <div class="section-desc">Conecta Claude para responder automáticamente preguntas abiertas de postulaciones en 1 clic. Puedes usar una API Key de Anthropic o tu proyecto de Google Cloud (Vertex AI).</div>
             
             <div class="form-grid">
               <div class="form-group full-width">
+                <label for="aiProvider">Proveedor de Claude</label>
+                <select id="aiProvider" name="aiProvider">
+                  <option value="anthropic">Anthropic API (console.anthropic.com)</option>
+                  <option value="vertex">Google Cloud Vertex AI</option>
+                </select>
+              </div>
+
+              <div class="form-group full-width" data-provider="anthropic">
                 <label for="claudeApiKey">Anthropic Claude API Key *</label>
                 <div class="input-with-button">
                   <input type="password" id="claudeApiKey" name="claudeApiKey" placeholder="sk-ant-api03-..." autocomplete="off">
                   <button type="button" class="btn-toggle-eye" id="btnToggleKey">👁️</button>
-                  <button type="button" class="btn-test-api" id="btnTestClaude">⚡ Probar Conexión</button>
                 </div>
-                <span class="field-hint">Tu clave se guarda 100% local en tu navegador y solo se conecta a api.anthropic.com.</span>
+                <span class="field-hint">Se guarda solo en el almacenamiento local de tu navegador (sin cifrar) y solo se envía a api.anthropic.com.</span>
+              </div>
+
+              <div class="form-group full-width" data-provider="vertex" hidden>
+                <label for="vertexApiKey">Vertex AI API Key o Access Token *</label>
+                <div class="input-with-button">
+                  <input type="password" id="vertexApiKey" name="vertexApiKey" placeholder="AIza... / AQ.... o ya29.... (gcloud auth print-access-token)" autocomplete="off">
+                  <button type="button" class="btn-toggle-eye" id="btnToggleVertexKey">👁️</button>
+                </div>
+                <span class="field-hint">Requisitos: API "Vertex AI" habilitada, Claude Sonnet 5 y Haiku 4.5 habilitados en Model Garden, y rol "Vertex AI User" para la cuenta de la credencial. Un access token (ya29.…) caduca en 1 hora. Se guarda solo en tu navegador (sin cifrar) y solo se envía a aiplatform.googleapis.com.</span>
+              </div>
+
+              <div class="form-group" data-provider="vertex" hidden>
+                <label for="vertexProjectId">ID del proyecto de Google Cloud *</label>
+                <input type="text" id="vertexProjectId" name="vertexProjectId" placeholder="mi-proyecto-123" autocomplete="off" spellcheck="false">
+              </div>
+
+              <div class="form-group" data-provider="vertex" hidden>
+                <label for="vertexRegion">Región</label>
+                <input type="text" id="vertexRegion" name="vertexRegion" placeholder="global" autocomplete="off" spellcheck="false">
+                <span class="field-hint">"global" tiene la mejor disponibilidad. También: us-east5, europe-west1, etc.</span>
+              </div>
+
+              <div class="form-group full-width">
+                <button type="button" class="btn-test-api" id="btnTestClaude">⚡ Probar Conexión</button>
                 <div id="claudeTestResult" class="api-test-badge"></div>
               </div>
 
@@ -513,6 +544,7 @@
     </main>
   </div>
 
+  <script src="../shared/ai-client.js"></script>
   <script src="pdf.min.js"></script>
   <script src="pdf-parser.js"></script>
   <script src="options.js"></script>

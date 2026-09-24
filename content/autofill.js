@@ -3525,7 +3525,15 @@
     if (type === "success") icon = "✅";
     if (type === "error") icon = "⚠️";
 
-    toast.innerHTML = `<span>${icon}</span><span>${message}</span>`;
+    // textContent, nunca innerHTML: `message` arrastra texto de la página
+    // (título del cargo, empresa, mensajes de error) y el toast vive en el DOM
+    // del portal. Con innerHTML, un título de oferta como `<img onerror=…>`
+    // se ejecutaba en el origen del portal (p. ej. linkedin.com).
+    const iconSpan = document.createElement("span");
+    iconSpan.textContent = icon;
+    const messageSpan = document.createElement("span");
+    messageSpan.textContent = String(message);
+    toast.append(iconSpan, messageSpan);
     attachToTopLayerHost(toast);
 
     setTimeout(() => {

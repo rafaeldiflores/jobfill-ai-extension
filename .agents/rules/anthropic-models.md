@@ -10,4 +10,6 @@ Cuando se requiera interactuar con la API de Anthropic o modificar lógica de mo
 
 Estos IDs están completos tal cual: **nunca agregar sufijos de fecha** (`-20251001` y similares son inválidos y devuelven 404).
 
+**Excepción Vertex AI:** en Google Cloud Vertex AI, Haiku 4.5 se publica como snapshot con separador `@` (`claude-haiku-4-5@20251001`); Sonnet 5 va sin versión (`claude-sonnet-5`). Esa traducción vive SOLO en `VERTEX_MODEL_IDS` de `shared/ai-client.js` — el resto del código sigue usando los dos IDs de arriba.
+
 Está terminantemente prohibido hacer fallbacks a modelos como `claude-3-opus`, `claude-3-sonnet` clásico, `claude-2.1`, etc.

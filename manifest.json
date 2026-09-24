@@ -10,7 +10,8 @@
   ],
   "host_permissions": [
     "<all_urls>",
-    "https://api.anthropic.com/*"
+    "https://api.anthropic.com/*",
+    "https://*.googleapis.com/*"
   ],
   "background": {
     "service_worker": "background/service-worker.js"

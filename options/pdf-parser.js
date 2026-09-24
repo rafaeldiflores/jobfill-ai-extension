@@ -138,7 +138,7 @@ class LocalHeuristicCvParser {
     const detectedTech = TECH_KEYWORDS.filter(t => new RegExp(`\\b${t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i").test(cvText));
 
     // Date range regex matcher (e.g. 2022 - Presente, 2020-2023, Ene 2021 - Dic 2022)
-    const dateRangeRegex = /(\b(?:20\d\d|19\d\d)\b(?:\s*[-–—a/]\s*(?:presente|actualidad|current|present|\b(?:20\d\d|19\d\d)\b))|\b(?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{4}\s*[-–—a/]\s*(?:presente|actualidad|current|present|[a-z]+\.?\s+\d{4})/i;
+    const dateRangeRegex = /(\b(?:20\d\d|19\d\d)\b(?:\s*[-–—a/]\s*(?:presente|actualidad|current|present|\b(?:20\d\d|19\d\d)\b))|\b(?:ene|feb|mar|abr|may|jun|jul|ago|sep|oct|nov|dic|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+\d{4}\s*[-–—a/]\s*(?:presente|actualidad|current|present|[a-z]+\.?\s+\d{4}))/i;
 
     // Detect job experience blocks
     let currentExp = null;

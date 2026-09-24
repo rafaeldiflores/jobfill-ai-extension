@@ -596,43 +596,91 @@ it("Detects character limits from attributes / text labels and safely trims answ
   assert.ok(trimmed.endsWith("."));
 });
 
-// 11. ANTHROPIC API STRICT PAYLOAD & VARIABLE INTEGRITY TEST
-it("Validates that callAnthropicMessagesApi properly constructs payload with Sonnet 5 and Haiku 4.5", () => {
-  function prepareAnthropicPayload({ apiKey, model, system, messages, max_tokens = 1500 }) {
-    if (!apiKey || typeof apiKey !== "string" || !apiKey.trim()) {
-      throw new Error("No se ha configurado la API Key de Claude.");
-    }
-    const cleanKey = apiKey.replace(/[\r\n\t\s"']/g, "").trim();
-    const primary = (model || "").trim().toLowerCase();
-    const modelToCall = primary.includes("haiku") ? "claude-haiku-4-5" : "claude-sonnet-5";
-    const modelCandidates = [modelToCall];
+// 11. CLIENTE DE CLAUDE (Anthropic / Vertex AI) — se carga shared/ai-client.js
+// REAL: la versión anterior de este test reimplementaba la función dentro del
+// propio test, así que seguía en verde aunque el código real cambiara.
+function loadRealAiClient(fetchImpl) {
+  const src = fs.readFileSync(path.join(__dirname, "..", "shared", "ai-client.js"), "utf8");
+  const sandbox = { console: { log() {}, error() {} }, fetch: fetchImpl, AbortController, setTimeout, clearTimeout };
+  sandbox.self = sandbox;
+  require("vm").runInNewContext(src, sandbox);
+  return sandbox.JobFillAi;
+}
 
-    const payload = {
-      model: modelCandidates[0],
-      max_tokens,
-      messages
-    };
-    if (system) payload.system = system;
+it("Builds Anthropic requests with only Sonnet 5 / Haiku 4.5 and the model in the body", () => {
+  const ai = loadRealAiClient();
+  const settings = ai.readAiSettings({ claudeApiKey: ' "sk-ant-test-123"\n' });
+  assert.strictEqual(settings.provider, "anthropic");
+  assert.strictEqual(settings.anthropicKey, "sk-ant-test-123");
 
-    return { cleanKey, payload };
-  }
+  const [sonnet] = ai.buildClaudeRequests(settings, "claude-sonnet-5", { max_tokens: 10, messages: [] });
+  assert.strictEqual(sonnet.url, "https://api.anthropic.com/v1/messages");
+  assert.strictEqual(sonnet.body.model, "claude-sonnet-5");
+  assert.strictEqual(sonnet.headers["x-api-key"], "sk-ant-test-123");
 
-  const sonnetResult = prepareAnthropicPayload({
-    apiKey: "sk-ant-test-123456",
-    model: "claude-sonnet-5",
-    messages: [{ role: "user", content: "Hola" }]
+  // Cualquier variante (incluido el ID con sufijo de fecha, que da 404) se
+  // normaliza al ID permitido.
+  const [haiku] = ai.buildClaudeRequests(settings, "claude-haiku-4-5-20251001", { max_tokens: 10, messages: [] });
+  assert.strictEqual(haiku.body.model, "claude-haiku-4-5");
+});
+
+it("Builds Vertex AI rawPredict requests: model in the URL, anthropic_version in the body, key or token auth", () => {
+  const ai = loadRealAiClient();
+  const settings = ai.readAiSettings({ aiProvider: "vertex", vertexApiKey: "AIzaTestKey", vertexProjectId: "mi-proyecto" });
+  assert.strictEqual(settings.vertexRegion, "global");
+  assert.strictEqual(ai.aiSettingsProblem(settings), null);
+
+  const [sonnet] = ai.buildClaudeRequests(settings, "claude-sonnet-5", { max_tokens: 10, messages: [] });
+  assert.strictEqual(sonnet.url, "https://aiplatform.googleapis.com/v1/projects/mi-proyecto/locations/global/publishers/anthropic/models/claude-sonnet-5:rawPredict");
+  assert.strictEqual(sonnet.body.anthropic_version, "vertex-2023-10-16");
+  assert.strictEqual("model" in sonnet.body, false);
+  assert.strictEqual(sonnet.headers["x-goog-api-key"], "AIzaTestKey");
+  assert.strictEqual("x-api-key" in sonnet.headers, false);
+
+  // Haiku 4.5 es snapshot fechado en Vertex (separador @), con el ID sin
+  // versión como respaldo ante 404.
+  const haikuIds = ai.buildClaudeRequests(settings, "claude-haiku-4-5", { messages: [] }).map(r => r.sentModel);
+  assert.strictEqual(JSON.stringify(haikuIds), JSON.stringify(["claude-haiku-4-5@20251001", "claude-haiku-4-5"]));
+
+  // Región específica → host regional. Access token OAuth → Bearer.
+  const regional = ai.readAiSettings({ aiProvider: "vertex", vertexApiKey: "ya29.token", vertexProjectId: "p1", vertexRegion: "us-east5" });
+  const [req] = ai.buildClaudeRequests(regional, "claude-sonnet-5", { messages: [] });
+  assert.ok(req.url.startsWith("https://us-east5-aiplatform.googleapis.com/v1/projects/p1/locations/us-east5/"));
+  assert.strictEqual(req.headers.authorization, "Bearer ya29.token");
+  assert.strictEqual("x-goog-api-key" in req.headers, false);
+
+  // Configuración incompleta: se dice qué falta, sin llamar a la red.
+  assert.match(ai.aiSettingsProblem(ai.readAiSettings({ aiProvider: "vertex", vertexApiKey: "k" })), /proyecto/);
+  assert.match(ai.aiSettingsProblem(ai.readAiSettings({ aiProvider: "vertex", vertexProjectId: "p" })), /Vertex AI/);
+  assert.strictEqual(ai.hasAiCredentials({ claudeApiKey: "sk-ant-x" }), true);
+  assert.strictEqual(ai.hasAiCredentials({ aiProvider: "vertex", claudeApiKey: "sk-ant-x" }), false);
+});
+
+it("Falls back to the next Vertex model ID only on 404, and surfaces permission errors immediately", async () => {
+  const calls = [];
+  const respond = (status, body) => ({ ok: status < 300, status, statusText: "", json: async () => body });
+  const ai = loadRealAiClient(async url => {
+    calls.push(url);
+    if (url.includes("@20251001")) return respond(404, { error: { message: "Publisher model not found" } });
+    return respond(200, { content: [{ type: "text", text: "OK" }] });
   });
+  const settings = ai.readAiSettings({ aiProvider: "vertex", vertexApiKey: "AIzaK", vertexProjectId: "p" });
+  const data = await ai.callClaude(settings, { model: "claude-haiku-4-5", messages: [{ role: "user", content: "hola" }] });
+  assert.strictEqual(data.content[0].text, "OK");
+  assert.strictEqual(calls.length, 2);
+  assert.ok(calls[1].endsWith("/claude-haiku-4-5:rawPredict"));
 
-  assert.strictEqual(sonnetResult.cleanKey, "sk-ant-test-123456");
-  assert.strictEqual(sonnetResult.payload.model, "claude-sonnet-5");
-
-  const haikuResult = prepareAnthropicPayload({
-    apiKey: "sk-ant-test-123456",
-    model: "claude-haiku-4-5",
-    messages: [{ role: "user", content: "Hola" }]
+  // Un 403 no se "arregla" probando otro ID: se corta y se explica.
+  const calls403 = [];
+  const ai403 = loadRealAiClient(async url => {
+    calls403.push(url);
+    return respond(403, [{ error: { code: 403, message: "Permission denied", status: "PERMISSION_DENIED" } }]);
   });
-
-  assert.strictEqual(haikuResult.payload.model, "claude-haiku-4-5");
+  await assert.rejects(
+    ai403.callClaude(settings, { model: "claude-haiku-4-5", messages: [] }),
+    err => err.status === 403 && /Model Garden/.test(err.message) && /Permission denied/.test(err.message)
+  );
+  assert.strictEqual(calls403.length, 1);
 });
 
 // 11b. RESPONSE TEXT EXTRACTION — never assume content[0] is the text block
@@ -2005,8 +2053,14 @@ it("Projects candidateBase onto the storage root so content/autofill.js keeps re
   assert.strictEqual(view.rut, "11.111.111-1");
   // El índice activo tiene su propio targetRole: gana sobre el headline genérico.
   assert.strictEqual(view.headline, "Backend Engineer");
-  // Ajustes globales (fuera de candidateBase) se conservan intactos.
-  assert.strictEqual(view.claudeApiKey, "sk-ant-test");
+  // Las credenciales de IA NO viajan al content script: la vista llega a
+  // cada página donde corre el autofill, y ese script nunca llama a la API.
+  assert.strictEqual("claudeApiKey" in view, false);
+  const vertexView = api.buildAutofillProfileView({ ...storage, vertexApiKey: "AIza-x", vertexProjectId: "p", profiles_backup_v1: [{}] });
+  assert.strictEqual("vertexApiKey" in vertexView, false);
+  assert.strictEqual("profiles_backup_v1" in vertexView, false);
+  // El resto de ajustes globales sí se conserva.
+  assert.strictEqual(vertexView.activeCvIndexId, "idx_back");
 
   // Índice sin targetRole propio: cae al headline genérico de candidateBase.
   const viewFrontend = api.buildAutofillProfileView({ ...storage, activeCvIndexId: "idx_front" });
@@ -2131,6 +2185,46 @@ it("Actually clears the legacy keys from storage, not just from the payload it w
     restoreLog();
     throw err;
   });
+});
+
+// REVISIÓN — cada script de la extensión debe PARSEAR. options/pdf-parser.js
+// tuvo una regex con un grupo sin cerrar: el archivo entero no cargaba y
+// options.js lo ocultaba con un `typeof … !== "undefined"`.
+it("Every extension script parses (a syntax error silently disables a whole file)", () => {
+  const { execFileSync } = require("child_process");
+  const scripts = [
+    ["background", "service-worker.js"], ["content", "autofill.js"], ["options", "options.js"],
+    ["options", "pdf-parser.js"], ["popup", "popup.js"], ["shared", "ai-client.js"]
+  ];
+  for (const parts of scripts) {
+    execFileSync(process.execPath, ["--check", path.join(__dirname, "..", ...parts)], { stdio: "pipe" });
+  }
+});
+
+it("Toasts render page-derived text as text, never as HTML (XSS in the portal's origin)", () => {
+  const src = sliceRealSource("function showToast(message", "setTimeout(() => {\n      toast.style.opacity");
+  assert.ok(!/\.innerHTML\s*=/.test(src), "showToast no debe asignar innerHTML");
+  assert.ok(/textContent = String\(message\)/.test(src));
+});
+
+it("Never fills missing profile facts with plausible defaults in the prompt", () => {
+  const src = sliceRealSource(
+    "const REQUIREMENT_VOCABULARY = [",
+    "async function handleClaudeGeneration(",
+    ["background", "service-worker.js"]
+  );
+  const buildContext = eval(src + "\nresolveCandidateContext;");
+  const { logisticsContext, candidateContext } = buildContext({
+    candidateBase: { skills: "JavaScript, Python, SQL, BigQuery", cvDatabase: {} },
+    cvIndexes: []
+  }, "", "");
+
+  for (const ctx of [logisticsContext, candidateContext]) {
+    assert.ok(!/Años de Experiencia: 3 años/.test(ctx), "No debe inventar 3 años de experiencia");
+    assert.ok(!/Disponibilidad: Inmediata/.test(ctx), "No debe inventar disponibilidad inmediata");
+    assert.ok(!/Nivel de Inglés: Intermedio/.test(ctx), "No debe inventar nivel de inglés");
+    assert.ok(/Años de Experiencia: No especificado/.test(ctx));
+  }
 });
 
 // Espera a los tests async antes de contar: si el resumen se imprimiera de

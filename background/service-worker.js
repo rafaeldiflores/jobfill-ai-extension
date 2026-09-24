@@ -3,6 +3,10 @@
  * Handles background operations, Anthropic Claude API requests, and default state.
  */
 
+// Cliente único de Claude (Anthropic directo o Vertex AI), compartido con la
+// página de opciones. Ruta absoluta: importScripts resuelve relativo al SW.
+importScripts("/shared/ai-client.js");
+
 // `targetRole` vacío por defecto: alimenta `headline`, que el autofill escribe
 // en campos "Job Title"/"Titular" y que el prompt le pasa a Claude como el cargo
 // del candidato. Un default de "Senior Full Stack Developer" es una declaración
@@ -39,7 +43,8 @@ const createDefaultProfileObj = (id = "prof_default", name = "Perfil Principal",
   // Vacío a propósito — sin dato del usuario, jamás se inventa una fecha.
   birthDate: "",
   country: "Chile",
-  city: "Santiago",
+  // Vacía: una ciudad por defecto la escribe el autofill como si fuera tuya.
+  city: "",
   address: "",
   postalCode: "",
   
@@ -118,7 +123,7 @@ const createDefaultProfileObj = (id = "prof_default", name = "Perfil Principal",
  * experiencia decide si te llaman a entrevista y ahí ahorrar sale caro.
  */
 const MODEL_COMPLEX = "claude-sonnet-5";
-const MODEL_SIMPLE = "claude-haiku-4-5-20251001";
+const MODEL_SIMPLE = "claude-haiku-4-5";
 
 /**
  * Rediseño de datos: reemplaza `profiles[]` (identidad completa duplicada por
@@ -164,8 +169,16 @@ function buildAutofillProfileView(storage) {
   const cvIndexes = storage.cvIndexes || [];
   const activeIndex = cvIndexes.find(i => i.id === storage.activeCvIndexId) || cvIndexes[0];
 
+  // Las credenciales de IA y el respaldo del esquema viejo NO viajan al
+  // content script: este objeto llega a cada página donde corre el autofill,
+  // y el content script jamás llama a la API (lo hace este service worker).
+  const {
+    claudeApiKey, vertexApiKey, vertexProjectId, vertexRegion,
+    profiles_backup_v1, ...safeStorage
+  } = storage;
+
   return {
-    ...storage,
+    ...safeStorage,
     ...candidateBase,
     headline: activeIndex?.targetRole || candidateBase.headline || candidateBase.currentTitle || ""
   };
@@ -267,7 +280,13 @@ const DEFAULT_GLOBAL_SETTINGS = {
   candidateBase: createDefaultCandidateBase(),
   cvIndexes: [ createDefaultCvIndex() ],
   activeCvIndexId: "idx_default",
+  // Proveedor de Claude: "anthropic" (API key sk-ant-…) o "vertex" (Google
+  // Cloud Vertex AI: API key o access token + proyecto + región).
+  aiProvider: "anthropic",
   claudeApiKey: "",
+  vertexApiKey: "",
+  vertexProjectId: "",
+  vertexRegion: "global",
   // Debe coincidir literalmente con un <option value="..."> de #aiTone en
   // options.html — "professional" (inglés) no calzaba con ninguno, así que el
   // select quedaba sin selección real y el prompt de sistema mezclaba idiomas
@@ -302,7 +321,7 @@ async function ensureSchemaMigrated() {
         const flat = createDefaultProfileObj(
           "prof_default",
           existing.headline || "Perfil Principal",
-          existing.headline || "Senior Full Stack Developer"
+          existing.headline || ""
         );
         Object.keys(flat).forEach(k => {
           if (existing[k] !== undefined && existing[k] !== null) flat[k] = existing[k];
@@ -486,9 +505,9 @@ chrome.commands.onCommand.addListener((command, tab) => {
 async function captureJobTitleNearMouse(tab, { x, y, dpr }) {
   if (!tab?.windowId) throw new Error("No se pudo identificar la pestaña activa.");
 
-  const profile = await chrome.storage.local.get("claudeApiKey");
-  if (!profile.claudeApiKey || !profile.claudeApiKey.trim()) {
-    throw new Error("Configura tu API Key de Claude para usar la captura por pantalla.");
+  const ai = JobFillAi.readAiSettings(await chrome.storage.local.get(null));
+  if (!JobFillAi.hasAiCredentials(ai)) {
+    throw new Error("Configura tu acceso a Claude (Anthropic o Vertex AI) para usar la captura por pantalla.");
   }
 
   const dataUrl = await chrome.tabs.captureVisibleTab(tab.windowId, { format: "png" });
@@ -504,7 +523,7 @@ async function captureJobTitleNearMouse(tab, { x, y, dpr }) {
   const base64 = arrayBufferToBase64(await cropBlob.arrayBuffer());
 
   const data = await callAnthropicMessagesApi({
-    apiKey: profile.claudeApiKey,
+    ai,
     model: MODEL_SIMPLE,
     max_tokens: 60,
     system: "Lees fragmentos de pantalla de portales de empleo para extraer el título del cargo/puesto de trabajo. Respondes ÚNICAMENTE con el título tal como aparece en la imagen, sin comillas ni explicación. Si no hay ningún título de cargo visible en la imagen, respondes exactamente: NONE.",
@@ -564,110 +583,22 @@ function arrayBufferToBase64(buffer) {
 }
 
 /**
- * Resilient Anthropic Messages API caller with canonical resolution
- * Exclusively supports Claude Sonnet 5 and Claude Haiku 4.5
+ * Llama a Claude con el proveedor configurado (Anthropic o Vertex AI). La
+ * implementación vive en shared/ai-client.js, compartida con options.js.
+ *
+ * `thinking: disabled` siempre: Sonnet 5 activa "adaptive thinking" por
+ * defecto si se omite, y los tokens de razonamiento se descuentan de
+ * max_tokens — con presupuestos pequeños se agotan antes de emitir texto y la
+ * respuesta llega vacía. Aquí siempre queremos texto directo y acotado.
  */
-async function callAnthropicMessagesApi({ apiKey, model, system, messages, max_tokens = 1500 }) {
-  if (!apiKey || typeof apiKey !== "string" || !apiKey.trim()) {
-    throw new Error("No se ha configurado la API Key de Claude. Ingresa tu API Key en la pestaña '🤖 Claude IA'.");
-  }
-
-  const cleanKey = apiKey.replace(/[\r\n\t\s"']/g, "").trim();
-  const primary = (model || "").trim().toLowerCase();
-  
-  // Utilizar estrictamente los nombres originales de los modelos indicados por el usuario
-  const modelToCall = primary.includes("haiku") ? "claude-haiku-4-5" : "claude-sonnet-5";
-  const modelCandidates = [modelToCall];
-
-  let lastError = null;
-
-  for (const candidate of modelCandidates) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60000); // 60s generous timeout for Sonnet 5 reasoning
-
-    try {
-      const payload = {
-        model: candidate,
-        max_tokens,
-        messages,
-        // Sonnet 5 activa "adaptive thinking" por defecto si se omite este campo, y
-        // los tokens de razonamiento se descuentan de max_tokens: con presupuestos
-        // pequeños se agotan antes de emitir texto y la respuesta llega vacía.
-        // Aquí siempre queremos texto directo y de longitud acotada.
-        thinking: { type: "disabled" }
-      };
-      if (system) payload.system = system;
-
-      console.log(`[JobFill AI] Llamando a Anthropic — modelo solicitado: "${model || "(ninguno)"}" → modelo enviado: "${candidate}" (max_tokens: ${max_tokens})`);
-
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "x-api-key": cleanKey,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
-          "anthropic-dangerous-direct-browser-access": "true"
-        },
-        body: JSON.stringify(payload),
-        signal: controller.signal
-      });
-
-      clearTimeout(timeoutId);
-
-      if (response.ok) {
-        return await response.json();
-      }
-
-      const errorData = await response.json().catch(() => ({}));
-      const errorMsg = errorData?.error?.message || `Error ${response.status}: ${response.statusText}`;
-
-      // Diagnóstico: registrar la causa real tal como la devuelve Anthropic
-      console.error("[JobFill AI] Anthropic API rechazó la petición:", {
-        status: response.status,
-        model: candidate,
-        anthropicError: errorData?.error || errorData,
-        message: errorMsg
-      });
-
-      // Authentication error (Invalid API Key)
-      if (response.status === 401) {
-        throw new Error("Error 401: Tu API Key de Claude es inválida o no autorizada. Cópiala directamente desde console.anthropic.com.");
-      }
-
-      // Rate limit or credit balance empty
-      if (response.status === 429 || errorMsg.toLowerCase().includes("credit") || errorMsg.toLowerCase().includes("balance")) {
-        throw new Error(`Error 429 Anthropic: Saldo agotado o límite de uso alcanzado (${errorMsg}). Recarga saldo en console.anthropic.com.`);
-      }
-
-      // If model not found or invalid model name, try next candidate
-      const isModelError = response.status === 404 || 
-                           (response.status === 400 && (errorMsg.toLowerCase().includes("model") || errorMsg.toLowerCase().includes("not_found") || errorMsg.toLowerCase().includes("invalid_request")));
-
-      if (isModelError) {
-        lastError = new Error(errorMsg);
-        continue;
-      } else {
-        throw new Error(errorMsg);
-      }
-    } catch (err) {
-      clearTimeout(timeoutId);
-      lastError = err;
-      console.error("[JobFill AI] Fallo al llamar a Anthropic:", { model: candidate, name: err.name, message: err.message });
-      if (err.name === "AbortError" || err.message?.includes("aborted")) {
-        lastError = new Error("Tiempo de espera agotado (Timeout) al conectar con Claude.");
-        continue;
-      }
-      if (err.message && (err.message.includes("401") || err.message.includes("429") || err.message.includes("Saldo"))) {
-        throw err;
-      }
-      if (err.message && (err.message.includes("404") || err.message.includes("model") || err.message.includes("not_found"))) {
-        continue;
-      }
-      throw err;
-    }
-  }
-
-  throw lastError || new Error("No se pudo conectar con la API de Anthropic (sin respuesta del servidor). Revisa la consola del service worker para ver el detalle.");
+async function callAnthropicMessagesApi({ ai, model, system, messages, max_tokens = 1500 }) {
+  return JobFillAi.callClaude(ai, {
+    model,
+    system,
+    messages,
+    max_tokens,
+    thinking: { type: "disabled" }
+  });
 }
 
 /**
@@ -1072,10 +1003,10 @@ function detectQuestionIntent(text) {
  * llamada SÍ usa Haiku — es una clasificación de una palabra, no redacción —
  * y solo se paga en el subconjunto que el diccionario no reconoce.
  */
-async function classifyIntentWithAI(question, apiKey) {
+async function classifyIntentWithAI(question, ai) {
   try {
     const data = await callAnthropicMessagesApi({
-      apiKey,
+      ai,
       model: MODEL_SIMPLE,
       max_tokens: 10,
       system: "Clasificas preguntas de formularios de postulación laboral en una sola palabra:\nLOGISTICS: pide un dato puntual del candidato, sin narrativa — disponibilidad, modalidad de trabajo, ubicación, renta, licencias, o una credencial académica (título, institución, año de titulación).\nMOTIVATION: pregunta por qué le interesa el puesto o la empresa.\nEXPERIENCE: pide narrar un caso, logro, proyecto o capacidad técnica.\nResponde ÚNICAMENTE con una de esas tres palabras en mayúsculas, nada más — ni explicación ni puntuación.",
@@ -1371,15 +1302,20 @@ function resolveCandidateContext(profile, jobTitle, jobDescription) {
     .map(ed => `${ed.degree || ""}${ed.institution ? ` — ${ed.institution}` : ""}${ed.year ? ` (${ed.year})` : ""}`.trim())
     .filter(Boolean);
 
+  // Un dato ausente se declara como "No especificado", NUNCA con un valor
+  // plausible ("3 años", "Inmediata", "Intermedio"): el modelo trata este
+  // bloque como la verdad del candidato y lo afirma ante el reclutador. Con
+  // "No especificado", la regla de logística ("no inventes datos que el perfil
+  // no trae") lo hace responder sin comprometer una cifra falsa.
   const logisticsContext = `
 PERFIL DEL CANDIDATO (datos para preguntas de disponibilidad, condiciones y credenciales académicas):
 - Nombre: ${p.fullName || `${p.firstName || ""} ${p.lastName || ""}`.trim() || "Candidato"}
 - Título/Cargo Objetivo: ${p.headline || p.currentTitle || "Profesional"}
-- Años de Experiencia: ${p.yearsOfExperience || "3"} años
-- Nivel de Inglés: ${p.englishLevel || "Intermedio"}
-- Ubicación: ${p.location || p.city || "No especificada"}
-- Disponibilidad: ${p.noticePeriod || "Inmediata"}
-- Pretensiones Salariales: ${p.salaryExpectation || ""} ${p.currency || "CLP"}
+- Años de Experiencia: ${p.yearsOfExperience ? `${p.yearsOfExperience} años` : "No especificado"}
+- Nivel de Inglés: ${p.englishLevel || "No especificado"}
+- Ubicación: ${[p.city, p.country].filter(Boolean).join(", ") || "No especificada"}
+- Disponibilidad: ${p.noticePeriod || "No especificada"}
+- Pretensiones Salariales: ${p.salaryExpectation ? `${p.salaryExpectation} ${p.currency || "CLP"}` : "No especificadas"}
 - Título Académico: ${p.degree || "No especificado"}
 - Casa de Estudios: ${p.university || "No especificada"}
 ${educationEntries.length ? `- Educación registrada: ${educationEntries.join(" | ")}` : ""}
@@ -1392,13 +1328,13 @@ PERFIL DEL CANDIDATO:
 - Nombre: ${p.fullName || `${p.firstName || ""} ${p.lastName || ""}`.trim() || "Candidato"}
 - RUT / DNI: ${p.rut || "No especificado"}
 - Título/Cargo Objetivo: ${p.headline || p.currentTitle || "Profesional"}
-- Años de Experiencia: ${p.yearsOfExperience || "3"} años
+- Años de Experiencia: ${p.yearsOfExperience ? `${p.yearsOfExperience} años` : "No especificado"}
 - Habilidades Clave: ${p.skills || ""}
-- Nivel de Inglés: ${p.englishLevel || "Intermedio"}
+- Nivel de Inglés: ${p.englishLevel || "No especificado"}
 - Educación: ${p.degree || ""} (${p.university || ""})
 - Resumen Profesional: ${p.summary || ""}
-- Disponibilidad: ${p.noticePeriod || "Inmediata"}
-- Pretensiones Salariales: ${p.salaryExpectation || ""} ${p.currency || "CLP"}
+- Disponibilidad: ${p.noticePeriod || "No especificada"}
+- Pretensiones Salariales: ${p.salaryExpectation ? `${p.salaryExpectation} ${p.currency || "CLP"}` : "No especificadas"}
 ${matchedProfileName ? `- Versión de Perfil / CV Aplicada: ${matchedProfileName}` : ""}
 ${customFieldsContext ? `\n--- CAMPOS PERSONALIZADOS DEL CANDIDATO ---\n${customFieldsContext}` : ""}
 ${customQaContext ? `\n--- BANCO DE PREGUNTAS Y RESPUESTAS FRECUENTES DEL CANDIDATO ---\n${customQaContext}` : ""}
@@ -1417,9 +1353,9 @@ ${resumeTextBlock}
 async function handleClaudeGeneration({ question, fieldType, jobTitle, companyName, jobDescription, maxCharacters, minCharacters, previousAnswers, mustCover }) {
   const profile = await chrome.storage.local.get(null);
 
-  if (!profile.claudeApiKey || !profile.claudeApiKey.trim()) {
-    throw new Error("Por favor configura tu API Key de Claude en las opciones de JobFill AI.");
-  }
+  const ai = JobFillAi.readAiSettings(profile);
+  const aiProblem = JobFillAi.aiSettingsProblem(ai);
+  if (aiProblem) throw new Error(aiProblem);
 
   const { p, matchedProfileName, hasRealCandidateData, logisticsContext, candidateContext } =
     resolveCandidateContext(profile, jobTitle, jobDescription);
@@ -1446,7 +1382,7 @@ async function handleClaudeGeneration({ question, fieldType, jobTitle, companyNa
   const intentGuess = classifyQuestionIntent(question);
   const questionIntent = intentGuess.matched
     ? intentGuess.intent
-    : await classifyIntentWithAI(question, profile.claudeApiKey);
+    : await classifyIntentWithAI(question, ai);
 
   console.log(
     "[JobFill AI] Idioma detectado:", detectedLang, "| Tipo:", questionIntent,
@@ -1663,7 +1599,7 @@ ${isEnglish ? `Generate an exceptional, persuasive, and directly focused answer 
   console.log(`[JobFill AI] Tipo: ${questionIntent} → modelo: ${modelToUse} | contexto: ${stableContextBlock.length} car.${stableBlock.cache_control ? " (cacheado)" : ""}`);
 
   const data = await callAnthropicMessagesApi({
-    apiKey: profile.claudeApiKey,
+    ai,
     model: modelToUse,
     max_tokens: tokensToUse,
     // "system" como array de bloques: permite marcar cache_control en el único
@@ -1749,9 +1685,9 @@ async function handleClaudeGenerationBatch({ items: rawItems, jobTitle, companyN
   }
 
   const profile = await chrome.storage.local.get(null);
-  if (!profile.claudeApiKey || !profile.claudeApiKey.trim()) {
-    throw new Error("Por favor configura tu API Key de Claude en las opciones de JobFill AI.");
-  }
+  const ai = JobFillAi.readAiSettings(profile);
+  const aiProblem = JobFillAi.aiSettingsProblem(ai);
+  if (aiProblem) throw new Error(aiProblem);
 
   const { p, hasRealCandidateData, candidateContext } =
     resolveCandidateContext(profile, jobTitle, jobDescription);
@@ -1803,7 +1739,7 @@ Longitud objetivo: entre ${effectiveMin} y ${effectiveMax} caracteres${ceiling ?
   console.log(`[JobFill AI] Lote de ${items.length} preguntas -> modelo: ${MODEL_COMPLEX}`);
 
   const data = await callAnthropicMessagesApi({
-    apiKey: profile.claudeApiKey,
+    ai,
     model: MODEL_COMPLEX,
     max_tokens: tokensToUse,
     system: [{ type: "text", text: systemPrompt }],

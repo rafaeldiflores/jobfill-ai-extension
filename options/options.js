@@ -25,7 +25,11 @@ function extractClaudeText(data) {
  * como la cadena "on" que FormData produce, no como booleano).
  */
 const GLOBAL_SETTING_KEYS = [
+  "aiProvider",
   "claudeApiKey",
+  "vertexApiKey",
+  "vertexProjectId",
+  "vertexRegion",
   "claudeModel",
   "claudeModelSimple",
   "aiTone",
@@ -114,6 +118,38 @@ document.addEventListener("DOMContentLoaded", async () => {
   const btnTestClaude = document.getElementById("btnTestClaude");
   const claudeTestResult = document.getElementById("claudeTestResult");
   const claudeApiKeyInput = document.getElementById("claudeApiKey");
+  const aiProviderSelect = document.getElementById("aiProvider");
+  const vertexApiKeyInput = document.getElementById("vertexApiKey");
+  const vertexProjectIdInput = document.getElementById("vertexProjectId");
+  const vertexRegionInput = document.getElementById("vertexRegion");
+  const btnToggleVertexKey = document.getElementById("btnToggleVertexKey");
+
+  /**
+   * Ajustes de IA tal como están AHORA en los inputs (aunque no se hayan
+   * guardado): "Probar Conexión" y "Estructurar CV" deben usar lo que el
+   * usuario acaba de escribir, no lo último guardado.
+   */
+  function aiSettingsFromDOM() {
+    return JobFillAi.readAiSettings({
+      aiProvider: aiProviderSelect?.value,
+      claudeApiKey: claudeApiKeyInput?.value,
+      vertexApiKey: vertexApiKeyInput?.value,
+      vertexProjectId: vertexProjectIdInput?.value,
+      vertexRegion: vertexRegionInput?.value
+    });
+  }
+
+  /** Muestra solo los campos del proveedor elegido. */
+  function syncProviderFields() {
+    const provider = aiProviderSelect?.value === "vertex" ? "vertex" : "anthropic";
+    document.querySelectorAll("[data-provider]").forEach(el => {
+      el.hidden = el.dataset.provider !== provider;
+    });
+  }
+  aiProviderSelect?.addEventListener("change", () => {
+    syncProviderFields();
+    claudeTestResult.className = "api-test-badge";
+  });
   const btnAddQa = document.getElementById("btnAddQa");
   const qaList = document.getElementById("qaList");
   const btnAddCustomField = document.getElementById("btnAddCustomField");
@@ -191,6 +227,11 @@ document.addEventListener("DOMContentLoaded", async () => {
   if (storedData) {
     // Load Global API Key & Global Settings
     if (storedData.claudeApiKey && claudeApiKeyInput) claudeApiKeyInput.value = storedData.claudeApiKey;
+    if (aiProviderSelect) aiProviderSelect.value = storedData.aiProvider === "vertex" ? "vertex" : "anthropic";
+    if (storedData.vertexApiKey && vertexApiKeyInput) vertexApiKeyInput.value = storedData.vertexApiKey;
+    if (storedData.vertexProjectId && vertexProjectIdInput) vertexProjectIdInput.value = storedData.vertexProjectId;
+    if (vertexRegionInput) vertexRegionInput.value = storedData.vertexRegion || "global";
+    syncProviderFields();
     if (storedData.aiTone && document.getElementById("aiTone")) document.getElementById("aiTone").value = storedData.aiTone;
     if (storedData.customAiInstructions && document.getElementById("customAiInstructions")) document.getElementById("customAiInstructions").value = storedData.customAiInstructions;
     // Sin valor guardado, la confirmación va activada (el checkbox ya viene
@@ -218,7 +259,7 @@ document.addEventListener("DOMContentLoaded", async () => {
         email: storedData.email || "",
         phone: storedData.phone || "",
         country: storedData.country || "Chile",
-        city: storedData.city || "Santiago",
+        city: storedData.city || "",
         address: storedData.address || "",
         postalCode: storedData.postalCode || "",
         linkedinUrl: storedData.linkedinUrl || "",
@@ -245,7 +286,7 @@ document.addEventListener("DOMContentLoaded", async () => {
           email: storedData.email || "",
           phone: storedData.phone || "",
           country: storedData.country || "Chile",
-          city: storedData.city || "Santiago",
+          city: storedData.city || "",
           address: storedData.address || "",
           postalCode: storedData.postalCode || "",
           linkedinUrl: storedData.linkedinUrl || "",
@@ -426,7 +467,11 @@ document.addEventListener("DOMContentLoaded", async () => {
 
     const storagePayload = {
       ...candidateDataFromProfiles(localProfiles, activeProfileId),
+      aiProvider: aiProviderSelect?.value === "vertex" ? "vertex" : "anthropic",
       claudeApiKey: claudeApiKeyInput?.value?.trim() || "",
+      vertexApiKey: vertexApiKeyInput?.value?.trim() || "",
+      vertexProjectId: vertexProjectIdInput?.value?.trim() || "",
+      vertexRegion: vertexRegionInput?.value?.trim() || "global",
       aiTone: document.getElementById("aiTone")?.value || "profesional y persuasivo",
       customAiInstructions: document.getElementById("customAiInstructions")?.value || "",
       // El content script trata cualquier valor distinto de false como "sí
@@ -448,72 +493,62 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   // Toggle API Key visibility
-  btnToggleKey.addEventListener("click", () => {
-    if (claudeApiKeyInput.type === "password") {
-      claudeApiKeyInput.type = "text";
-      btnToggleKey.textContent = "🔒";
-    } else {
-      claudeApiKeyInput.type = "password";
-      btnToggleKey.textContent = "👁️";
-    }
-  });
+  function wireVisibilityToggle(button, input) {
+    button?.addEventListener("click", () => {
+      const reveal = input.type === "password";
+      input.type = reveal ? "text" : "password";
+      button.textContent = reveal ? "🔒" : "👁️";
+    });
+  }
+  wireVisibilityToggle(btnToggleKey, claudeApiKeyInput);
+  wireVisibilityToggle(btnToggleVertexKey, vertexApiKeyInput);
 
-  // Test Claude API Key
+  // Test Claude connection (Anthropic o Vertex AI, según el proveedor elegido)
   btnTestClaude.addEventListener("click", async () => {
-    const key = claudeApiKeyInput.value.trim();
-    // El modelo ya no se elige a mano: el enrutado por tipo de pregunta vive en
-    // el service worker. Aqui solo se prueba que la API Key funcione.
-    const model = "claude-sonnet-5";
-
-    if (!key) {
-      claudeTestResult.textContent = "⚠️ Ingresa una API Key primero.";
+    const ai = aiSettingsFromDOM();
+    const problem = JobFillAi.aiSettingsProblem(ai);
+    if (problem) {
+      claudeTestResult.textContent = `⚠️ ${problem}`;
       claudeTestResult.className = "api-test-badge show error";
       return;
     }
 
-    claudeTestResult.textContent = "⏳ Conectando directamente con Anthropic API...";
+    claudeTestResult.textContent = `⏳ Conectando con Claude vía ${JobFillAi.describeProvider(ai)}...`;
     claudeTestResult.className = "api-test-badge show";
 
-    const cleanKey = key.replace(/[\r\n\t\s"']/g, "").trim();
-    const endpointModel = model.includes("haiku") ? "claude-haiku-4-5" : "claude-sonnet-5";
-
-    try {
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "x-api-key": cleanKey,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
-          "anthropic-dangerous-direct-browser-access": "true"
-        },
-        body: JSON.stringify({
-          model: endpointModel,
+    // Se prueban LOS DOS modelos que usa la extensión: en Vertex cada modelo
+    // se habilita por separado en Model Garden, y un Haiku sin habilitar solo
+    // se notaría al fallar la primera pregunta logística.
+    const results = [];
+    for (const model of [JobFillAi.MODEL_SONNET, JobFillAi.MODEL_HAIKU]) {
+      try {
+        const data = await JobFillAi.callClaude(ai, {
+          model,
           max_tokens: 20,
           thinking: { type: "disabled" },
-          messages: [{ role: "user", content: "Hola Claude, responde únicamente con 'OK' para verificar la conexión." }]
-        })
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        const reply = extractClaudeText(data) || "(sin texto)";
-        claudeTestResult.textContent = `✅ ¡Conexión exitosa con Claude (${model})! Respuesta: "${reply}"`;
-        claudeTestResult.className = "api-test-badge show success";
-        await chrome.storage.local.set({ claudeApiKey: cleanKey });
-      } else {
-        const errData = await response.json().catch(() => ({}));
-        const msg = errData?.error?.message || `Error ${response.status}: ${response.statusText}`;
-        if (response.status === 401) {
-          claudeTestResult.textContent = "❌ Error 401: API Key inválida o expirada. Cópiala de console.anthropic.com";
-        } else if (response.status === 429) {
-          claudeTestResult.textContent = "❌ Error 429: Saldo agotado en tu cuenta de Anthropic. Recarga saldo en console.anthropic.com";
-        } else {
-          claudeTestResult.textContent = `❌ Error Anthropic (${response.status}): ${msg}`;
-        }
-        claudeTestResult.className = "api-test-badge show error";
+          messages: [{ role: "user", content: "Responde únicamente con 'OK' para verificar la conexión." }],
+          timeoutMs: 30000
+        });
+        results.push({ model, ok: true, reply: extractClaudeText(data) || "(sin texto)" });
+      } catch (err) {
+        results.push({ model, ok: false, error: err.message });
       }
-    } catch (err) {
-      claudeTestResult.textContent = `❌ Error de red / conexión: ${err.message}`;
+    }
+
+    if (results.every(r => r.ok)) {
+      claudeTestResult.textContent = `✅ Conexión exitosa vía ${JobFillAi.describeProvider(ai)} (Sonnet 5 y Haiku 4.5). Respuesta: "${results[0].reply}"`;
+      claudeTestResult.className = "api-test-badge show success";
+      // Solo se persiste lo que ya se comprobó que funciona.
+      await chrome.storage.local.set({
+        aiProvider: ai.provider,
+        ...(ai.provider === "vertex"
+          ? { vertexApiKey: ai.vertexCredential, vertexProjectId: ai.vertexProjectId, vertexRegion: ai.vertexRegion }
+          : { claudeApiKey: ai.anthropicKey })
+      });
+    } else {
+      claudeTestResult.textContent = results
+        .map(r => r.ok ? `✅ ${r.model}: OK` : `❌ ${r.model}: ${r.error}`)
+        .join("  ·  ");
       claudeTestResult.className = "api-test-badge show error";
     }
   });
@@ -831,15 +866,11 @@ document.addEventListener("DOMContentLoaded", async () => {
     }
   }
 
-  async function parseCvWithClaudeOrFallback(cvText, apiKey, model) {
-    if (!apiKey || !apiKey.trim()) {
-      fallbackToLocalParsing(cvText, "Sin API Key");
+  async function parseCvWithClaudeOrFallback(cvText, ai, model) {
+    if (!JobFillAi.hasAiCredentials(ai)) {
+      fallbackToLocalParsing(cvText, "Sin credenciales de Claude");
       return;
     }
-
-    const cleanKey = apiKey.replace(/[\r\n\t\s"']/g, "").trim();
-    const isHaiku = (model || "").toLowerCase().includes("haiku");
-    const targetModel = isHaiku ? "claude-haiku-4-5" : "claude-sonnet-5";
 
     const systemPrompt = `Eres un sistema experto en análisis y estructuración de Currículum Vitae profesional para postulaciones laborales.
 Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON válido con la siguiente estructura completa (sin markdown, sin explicaciones):
@@ -893,66 +924,49 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
     let lastErrorMsg = "";
 
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 45000); // 45s — Claude needs time for full CV analysis
-
-      const response = await fetch("https://api.anthropic.com/v1/messages", {
-        method: "POST",
-        headers: {
-          "x-api-key": cleanKey,
-          "anthropic-version": "2023-06-01",
-          "content-type": "application/json",
-          "anthropic-dangerous-direct-browser-access": "true"
-        },
-        body: JSON.stringify({
-          model: targetModel,
-          max_tokens: 3000,
-          thinking: { type: "disabled" },
-          system: systemPrompt,
-          messages: [{ role: "user", content: `Analiza y extrae TODOS los datos personales, contacto, resumen, habilidades y Base de Datos del siguiente CV:\n\n${cvText}` }]
-        }),
-        signal: controller.signal
+      // max_tokens holgado: el JSON de un CV con varios cargos y proyectos
+      // supera fácilmente 3000 tokens, y un JSON cortado a la mitad no parsea
+      // y termina en el parser local (mucho peor) sin que se note por qué.
+      const data = await JobFillAi.callClaude(ai, {
+        model,
+        max_tokens: 8000,
+        thinking: { type: "disabled" },
+        system: systemPrompt,
+        messages: [{ role: "user", content: `Analiza y extrae TODOS los datos personales, contacto, resumen, habilidades y Base de Datos del siguiente CV:\n\n${cvText}` }],
+        timeoutMs: 90000
       });
 
-      clearTimeout(timeoutId);
+      const rawReply = extractClaudeText(data);
+      const cleaned = rawReply.replace(/```json/gi, "").replace(/```/g, "").trim();
 
-      if (response.ok) {
-        const data = await response.json();
-        const rawReply = extractClaudeText(data);
-        const cleaned = rawReply.replace(/```json/gi, "").replace(/```/g, "").trim();
-
-        let parsed;
-        try {
-          parsed = JSON.parse(cleaned);
-        } catch (jsonErr) {
-          console.warn("Claude returned invalid JSON, falling back to local parser:", cleaned.slice(0, 200));
-          fallbackToLocalParsing(cvText, "Claude devolvió JSON inválido");
-          return;
-        }
-
-        parsed.rawText = cvText;
-        parsed.parsedAt = new Date().toISOString();
-
-        localCvDatabase = {
-          rawText: cvText,
-          parsedAt: parsed.parsedAt,
-          experiences: parsed.experiences || [],
-          projects: parsed.projects || [],
-          education: parsed.education || []
-        };
-        renderCvDatabase();
-
-        // Populate entire profile fields across all tabs
-        applyFullProfileExtraction(parsed, cvText);
-
-        completeProgress(true, `✅ [100%] ¡Perfil completo y Base de Datos autocompletados con éxito por Claude! (${localCvDatabase.experiences.length} cargos, ${localCvDatabase.projects.length} proyectos)`);
+      let parsed;
+      try {
+        parsed = JSON.parse(cleaned);
+      } catch (jsonErr) {
+        console.warn("Claude returned invalid JSON, falling back to local parser:", cleaned.slice(0, 200));
+        fallbackToLocalParsing(cvText, "Claude devolvió JSON inválido");
         return;
       }
 
-      const errData = await response.json().catch(() => ({}));
-      lastErrorMsg = errData?.error?.message || `Error ${response.status}`;
+      parsed.rawText = cvText;
+      parsed.parsedAt = new Date().toISOString();
+
+      localCvDatabase = {
+        rawText: cvText,
+        parsedAt: parsed.parsedAt,
+        experiences: parsed.experiences || [],
+        projects: parsed.projects || [],
+        education: parsed.education || []
+      };
+      renderCvDatabase();
+
+      // Populate entire profile fields across all tabs
+      applyFullProfileExtraction(parsed, cvText);
+
+      completeProgress(true, `✅ [100%] ¡Perfil completo y Base de Datos autocompletados con éxito por Claude! (${localCvDatabase.experiences.length} cargos, ${localCvDatabase.projects.length} proyectos)`);
+      return;
     } catch (err) {
-      lastErrorMsg = err.name === "AbortError" ? "Timeout de 45s con Claude (CV muy largo o red lenta)" : (err.message || "Error de red");
+      lastErrorMsg = err.message || "Error de red";
     }
 
     // Claude call failed or timed out: activate instant local fallback
@@ -962,8 +976,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
   if (btnParseCvToDb) {
     btnParseCvToDb.addEventListener("click", async () => {
       const text = resumeTextInput.value.trim();
-      let currentApiKey = claudeApiKeyInput?.value?.trim();
-      const currentModel = "claude-sonnet-5";
+      const currentModel = JobFillAi.MODEL_SONNET;
 
       if (!text || text.length < 20) {
         cvParseStatus.textContent = "⚠️ Pega el texto de tu CV o sube un archivo antes de estructurarlo.";
@@ -976,13 +989,10 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
 
       saveActiveProfileFromDOM();
 
-      if (!currentApiKey) {
-        const stored = await chrome.storage.local.get("claudeApiKey");
-        if (stored && stored.claudeApiKey) {
-          currentApiKey = stored.claudeApiKey.trim();
-        }
-      } else {
-        await chrome.storage.local.set({ claudeApiKey: currentApiKey });
+      // Lo escrito en la pestaña de IA manda; si está vacío, se usa lo guardado.
+      let currentAi = aiSettingsFromDOM();
+      if (!JobFillAi.hasAiCredentials(currentAi)) {
+        currentAi = JobFillAi.readAiSettings(await chrome.storage.local.get(null));
       }
 
       startProgressSimulation();
@@ -990,7 +1000,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
 
       // Execute parsing with automatic fallback and guaranteed error recovery
       try {
-        await parseCvWithClaudeOrFallback(text, currentApiKey, currentModel);
+        await parseCvWithClaudeOrFallback(text, currentAi, currentModel);
       } catch (fatalErr) {
         console.error("Fatal CV parsing error:", fatalErr);
         try {

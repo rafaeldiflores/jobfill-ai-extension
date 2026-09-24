@@ -56,8 +56,8 @@ document.addEventListener("DOMContentLoaded", async () => {
       }
     }
 
-    if (storedData.claudeApiKey && storedData.claudeApiKey.trim().length > 10) {
-      aiStatusBadge.textContent = "Claude IA Activo";
+    if (JobFillAi.hasAiCredentials(storedData)) {
+      aiStatusBadge.textContent = storedData.aiProvider === "vertex" ? "Claude IA Activo (Vertex)" : "Claude IA Activo";
       aiStatusBadge.classList.remove("inactive");
     } else {
       aiStatusBadge.textContent = "IA Sin Configurar";
