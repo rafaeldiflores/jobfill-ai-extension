@@ -4311,6 +4311,8 @@
     .jf-steps li.is-done { color: #94a3b8; }
     .jf-steps li.is-done::before { content: "✓"; color: #34d399; }
     .jf-steps li.is-skip { display: none; }
+    .jf-steps li.is-error { color: #fca5a5; font-weight: 600; }
+    .jf-steps li.is-error::before { content: "✗"; color: #f87171; }
     .jf-detail { margin: 10px 0 0 !important; min-height: 18px; }
     .jf-result { margin-top: 14px; display: grid; gap: 8px; font-size: 12.5px; color: #cbd5e1; }
     .jf-result .ok { color: #6ee7b7; }
@@ -4340,6 +4342,7 @@
           <div class="jobfill-field"><label for="jf-ap-cargo">Cargo</label><input type="text" id="jf-ap-cargo" spellcheck="false"></div>
         </div>
         <div class="jobfill-confirm-actions">
+          <button class="jobfill-confirm-ok" type="button" data-act="retry" hidden>↻ Reintentar</button>
           <button class="jobfill-confirm-ok" type="button" data-act="register" hidden>📌 Registrar en el Tracker</button>
           <button class="jobfill-confirm-cancel" type="button" data-act="download" hidden>⬇ Descargar PDF</button>
           <button class="jobfill-confirm-cancel" type="button" data-act="close">Cerrar</button>
@@ -4363,7 +4366,7 @@
           if (i < idx && li.classList.contains("is-active")) li.classList.replace("is-active", "is-done");
           else if (i < idx && !li.classList.contains("is-done")) li.classList.add(id === "ajustar" || id === "perfil" ? "is-skip" : "is-done");
         });
-        $s(`[data-step="${step}"]`).classList.remove("is-skip");
+        $s(`[data-step="${step}"]`).classList.remove("is-skip", "is-error");
         $s(`[data-step="${step}"]`).classList.add("is-active");
         current = idx;
         $s(".jf-detail").textContent = detail;
@@ -4379,6 +4382,24 @@
         });
         $s(".jf-detail").textContent = "";
       },
+      /** Marca en rojo el paso en curso (el que falló). */
+      markError() {
+        const li = shadow.querySelector(".jf-steps li.is-active");
+        if (li) li.classList.replace("is-active", "is-error");
+      },
+      clearResult() {
+        const box = $s(".jf-result");
+        box.replaceChildren();
+        box.hidden = true;
+      },
+      showRetry(label, onRetry) {
+        const btn = $s('[data-act="retry"]');
+        btn.textContent = label;
+        btn.disabled = false;
+        btn.hidden = false;
+        btn.onclick = () => { btn.disabled = true; onRetry(); };
+      },
+      hideRetry() { $s('[data-act="retry"]').hidden = true; },
       showResult(lines) {
         const box = $s(".jf-result");
         box.replaceChildren();
@@ -4566,61 +4587,88 @@
     ui.setOffer(`${cargo || "Cargo sin detectar"}${empresa ? ` · ${empresa}` : ""}${job.fromCache ? " (oferta guardada)" : ""}`);
     ui.setStep("contexto", "Conectando con tu vault…");
 
-    try {
-      const res = await sendToWorker("APPLY_ADAPT_CV", { oferta, empresa, cargo });
-      if (!res?.success) throw new Error(res?.error || "No se pudo adaptar el CV.");
-
-      if (!res.ok) {
-        ui.finishSteps("validar");
-        ui.showResult([
-          { text: "✗ El CV adaptado no pasa las reglas de tu verificador, así que no se generó el PDF.", tone: "err", items: res.hallazgos.filter(h => h.nivel === "error").map(h => h.detalle) },
-          { text: "Ábrelo en el Postulador de claude.ai para ajustarlo a mano; el formulario no se tocó." }
-        ]);
-        return;
-      }
-
-      ui.setStep("adjuntar", "Buscando el campo para subir el CV…");
-      const attach = await sendToWorker("APPLY_ATTACH_CV", { base64: res.base64, archivo: res.archivo });
-      ui.setStep("rellenar", "Rellenando el resto del formulario…");
-      const fill = await executeAutofill();
-      ui.finishSteps();
-
-      const warnings = res.hallazgos.filter(h => h.nivel !== "error").map(h => h.detalle);
-      ui.showResult([
-        { text: `✓ CV ${res.perfil} adaptado${res.ajustado ? " (con un ajuste automático)" : ""} y guardado en tu vault: cv/generados/${res.archivo}`, tone: "ok" },
-        attach.attached
-          ? { text: `✓ PDF adjuntado al campo del CV${attach.inFrame ? " (formulario embebido)" : ""}. Revísalo antes de enviar.`, tone: "ok" }
-          : attach.pending
-            ? { text: "⏳ Este paso del formulario aún no pide el CV: se adjuntará solo cuando aparezca el campo (en esta pestaña, durante 30 min).", tone: "warn" }
-            : { text: `⚠ No se adjuntó automáticamente: ${attach.reason || attach.error || "error desconocido"}. Descárgalo y súbelo a mano.`, tone: "warn" },
-        { text: fill?.count ? `✓ ${fill.count === 1 ? "1 campo del formulario rellenado" : `${fill.count} campos del formulario rellenados`}.` : "Formulario sin campos vacíos que rellenar." },
-        res.cobertura ? { text: `Requisitos de la oferta respaldados por tu grafo: ${res.cobertura}` } : null,
-        res.faltantes?.length ? { text: "Sin respaldo en tu BASE (no se mencionan en el CV):", tone: "warn", items: res.faltantes } : null,
-        warnings.length ? { text: "Avisos del verificador:", tone: "warn", items: warnings } : null
-      ].filter(Boolean));
-
-      ui.showDownload(() => downloadPdf(res.base64, res.archivo));
-      ui.showRegister(res.empresa || empresa, res.cargo || cargo, async (emp, car, regBtn) => {
-        if (!emp || !car) return;
-        regBtn.disabled = true;
-        const r = await sendToWorker("VAULT_REGISTER_APPLICATION", {
-          empresa: emp, cargo: car, url: location.href, canal: location.hostname.replace(/^www\./, ""),
-          cvPerfil: res.perfil, cvPdf: res.archivo, area: res.area, keywordsCubiertas: res.cobertura
-        });
-        if (r?.success) {
-          regBtn.textContent = "✓ Registrada";
-          showToast(`📌 Registrada en tu Tracker: ${r.name}`, "success");
-        } else {
-          regBtn.disabled = false;
-          showToast(r?.error || "No se pudo registrar la postulación.", "error");
+    // Cada intento pide al worker que adapte; "Reintentar" repite con
+    // `resume: true` y el worker sigue desde su punto de control (no vuelve a
+    // adaptar ni a gastar lo que ya salió bien).
+    const attempt = async (payload) => {
+      ui.hideRetry();
+      ui.clearResult();
+      btn.disabled = true;
+      try {
+        const res = await sendToWorker("APPLY_ADAPT_CV", payload);
+        if (!res?.success) {
+          const err = new Error(res?.error || "No se pudo adaptar el CV.");
+          err.retryable = Boolean(res?.retryable);
+          throw err;
         }
+
+        if (!res.ok) {
+          ui.finishSteps("validar");
+          ui.showResult([
+            { text: "✗ El CV adaptado no pasa las reglas de tu verificador, así que no se generó el PDF.", tone: "err", items: res.hallazgos.filter(h => h.nivel === "error").map(h => h.detalle) },
+            { text: res.canRetry
+              ? "Puedes pedir otro ajuste automático, o abrirlo en el Postulador de claude.ai para ajustarlo a mano. El formulario no se tocó."
+              : "Ábrelo en el Postulador de claude.ai para ajustarlo a mano; el formulario no se tocó." }
+          ]);
+          if (res.canRetry) ui.showRetry("↻ Intentar otro ajuste", () => { ui.setStep("ajustar", "Pidiendo otro ajuste…"); attempt({ resume: true }); });
+          return;
+        }
+
+        await completeApplyFlow(ui, res, { empresa, cargo });
+      } catch (err) {
+        ui.markError();
+        clearFlowDetail(ui);
+        ui.showResult([
+          { text: `✗ ${err.message}`, tone: "err" },
+          err.retryable ? { text: "Lo que ya estaba listo (perfil, CV adaptado, verificación) quedó guardado: Reintentar sigue desde el paso que falló." } : null
+        ].filter(Boolean));
+        if (err.retryable) ui.showRetry("↻ Reintentar", () => attempt({ resume: true }));
+      } finally {
+        btn.disabled = false;
+      }
+    };
+
+    await attempt({ oferta, empresa, cargo });
+  }
+
+  /** Con el PDF listo: adjuntar, autorrellenar, mostrar el resultado y ofrecer descarga y registro. */
+  async function completeApplyFlow(ui, res, { empresa, cargo }) {
+    ui.setStep("adjuntar", "Buscando el campo para subir el CV…");
+    const attach = await sendToWorker("APPLY_ATTACH_CV", { base64: res.base64, archivo: res.archivo });
+    ui.setStep("rellenar", "Rellenando el resto del formulario…");
+    const fill = await executeAutofill();
+    ui.finishSteps();
+
+    const warnings = res.hallazgos.filter(h => h.nivel !== "error").map(h => h.detalle);
+    ui.showResult([
+      { text: `✓ CV ${res.perfil} adaptado${res.ajustado ? " (con un ajuste automático)" : ""} y guardado en tu vault: cv/generados/${res.archivo}`, tone: "ok" },
+      attach.attached
+        ? { text: `✓ PDF adjuntado al campo del CV${attach.inFrame ? " (formulario embebido)" : ""}. Revísalo antes de enviar.`, tone: "ok" }
+        : attach.pending
+          ? { text: "⏳ Este paso del formulario aún no pide el CV: se adjuntará solo cuando aparezca el campo (en esta pestaña, durante 30 min).", tone: "warn" }
+          : { text: `⚠ No se adjuntó automáticamente: ${attach.reason || attach.error || "error desconocido"}. Descárgalo y súbelo a mano.`, tone: "warn" },
+      { text: fill?.count ? `✓ ${fill.count === 1 ? "1 campo del formulario rellenado" : `${fill.count} campos del formulario rellenados`}.` : "Formulario sin campos vacíos que rellenar." },
+      res.cobertura ? { text: `Requisitos de la oferta respaldados por tu grafo: ${res.cobertura}` } : null,
+      res.faltantes?.length ? { text: "Sin respaldo en tu BASE (no se mencionan en el CV):", tone: "warn", items: res.faltantes } : null,
+      warnings.length ? { text: "Avisos del verificador:", tone: "warn", items: warnings } : null
+    ].filter(Boolean));
+
+    ui.showDownload(() => downloadPdf(res.base64, res.archivo));
+    ui.showRegister(res.empresa || empresa, res.cargo || cargo, async (emp, car, regBtn) => {
+      if (!emp || !car) return;
+      regBtn.disabled = true;
+      const r = await sendToWorker("VAULT_REGISTER_APPLICATION", {
+        empresa: emp, cargo: car, url: location.href, canal: location.hostname.replace(/^www\./, ""),
+        cvPerfil: res.perfil, cvPdf: res.archivo, area: res.area, keywordsCubiertas: res.cobertura
       });
-    } catch (err) {
-      ui.showResult([{ text: `✗ ${err.message}`, tone: "err" }]);
-      clearFlowDetail(ui);
-    } finally {
-      btn.disabled = false;
-    }
+      if (r?.success) {
+        regBtn.textContent = "✓ Registrada";
+        showToast(`📌 Registrada en tu Tracker: ${r.name}`, "success");
+      } else {
+        regBtn.disabled = false;
+        showToast(r?.error || "No se pudo registrar la postulación.", "error");
+      }
+    });
   }
 
   function clearFlowDetail(ui) {

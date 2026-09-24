@@ -605,7 +605,10 @@ function loadRealAiClient(fetchImpl) {
   return sandbox.JobFillAi;
 }
 
-const jsonResponse = (status, body) => ({ ok: status < 300, status, statusText: "", json: async () => body });
+const jsonResponse = (status, body, headers = {}) => ({
+  ok: status < 300, status, statusText: "", json: async () => body,
+  headers: { get: name => headers[name.toLowerCase()] ?? null }
+});
 const geminiOk = text => jsonResponse(200, {
   candidates: [{ content: { role: "model", parts: [{ text: "pensando…", thought: true }, { text }] }, finishReason: "STOP" }],
   usageMetadata: { promptTokenCount: 7, candidatesTokenCount: 2 }
@@ -701,9 +704,11 @@ it("Falls back to Gemini only when Claude runs out of credit or capacity, and sa
   assert.strictEqual(data.content[0].text, "Respuesta de Gemini");
   assert.strictEqual(calls.length, 2);
 
-  // Sobrecarga (529) también activa el respaldo.
-  claudeReply = () => jsonResponse(529, { error: { message: "Overloaded" } });
+  // Sobrecarga (529): primero se reintenta Claude (2 veces) y recién ahí responde Gemini.
+  calls.length = 0;
+  claudeReply = () => jsonResponse(529, { error: { message: "Overloaded" } }, { "retry-after": "0" });
   assert.strictEqual((await ai.callAi(settings, request))._provider, "gemini");
+  assert.strictEqual(calls.filter(u => u.includes("anthropic.com")).length, 3);
 
   // API key inválida (401): NO se esconde detrás de Gemini.
   calls.length = 0;
@@ -712,14 +717,14 @@ it("Falls back to Gemini only when Claude runs out of credit or capacity, and sa
   assert.strictEqual(calls.length, 1);
 
   // Respaldo desactivado o sin key de Gemini: el error de saldo llega tal cual.
-  claudeReply = () => jsonResponse(429, { error: { message: "rate limited" } });
+  claudeReply = () => jsonResponse(429, { error: { message: "rate limited" } }, { "retry-after": "0" });
   for (const noFallback of [
     ai.readAiSettings({ claudeApiKey: "sk-ant-x", vertexApiKey: "AQ.k", aiFallbackToGemini: false }),
     ai.readAiSettings({ claudeApiKey: "sk-ant-x" })
   ]) {
     calls.length = 0;
-    await assert.rejects(ai.callAi(noFallback, request), err => err.outOfCredit === true);
-    assert.strictEqual(calls.length, 1);
+    await assert.rejects(ai.callAi(noFallback, request), err => err.outOfCredit === true && err.rateLimited === true && /límite de uso por minuto/.test(err.message));
+    assert.strictEqual(calls.length, 3, "1 intento + 2 reintentos");
   }
 
   // Claude OK: Gemini ni se toca.
@@ -729,6 +734,29 @@ it("Falls back to Gemini only when Claude runs out of credit or capacity, and sa
   assert.strictEqual(ok._provider, "anthropic");
   assert.strictEqual(ok._fallbackReason, undefined);
   assert.strictEqual(calls.length, 1);
+});
+
+it("Claude rate limit (429): waits what retry-after asks and retries the same request, reporting each wait", async () => {
+  let n = 0;
+  const ai = loadRealAiClient(async () => (++n < 3
+    ? jsonResponse(429, { error: { type: "rate_limit_error", message: "Number of request tokens has exceeded your per-minute rate limit" } }, { "retry-after": "0" })
+    : jsonResponse(200, { content: [{ type: "text", text: "OK" }], stop_reason: "end_turn" })));
+  const waits = [];
+  const data = await ai.callAi(ai.readAiSettings({ claudeApiKey: "sk-ant-x" }), {
+    model: "claude-sonnet-5", messages: [{ role: "user", content: "hola" }], onRetry: w => waits.push(w)
+  });
+  assert.strictEqual(data._provider, "anthropic");
+  assert.strictEqual(n, 3);
+  assert.deepStrictEqual(waits.map(w => [w.status, w.attempt]), [[429, 1], [429, 2]]);
+
+  const h = v => ({ get: () => v });
+  assert.strictEqual(ai.retryAfterMs(h("12")), 12000);
+  assert.strictEqual(ai.retryAfterMs(h(new Date(Date.now() + 5000).toUTCString())) > 3000, true);
+  assert.strictEqual(ai.retryAfterMs(h(null)), null);
+  assert.strictEqual(ai.rateLimitWait(429, h(null), 0), 15000, "sin retry-after: 15 s");
+  assert.strictEqual(ai.rateLimitWait(429, h("120"), 0), null, "más de un minuto: no se reintenta solo");
+  assert.strictEqual(ai.rateLimitWait(429, h("5"), 2), null, "máximo 2 reintentos");
+  assert.strictEqual(ai.rateLimitWait(400, h("5"), 0), null);
 });
 
 it("Within Gemini, walks 3.8 Flash → preview → 2.5 Flash on 404/429/400, but stops on an invalid key", async () => {
@@ -2736,7 +2764,7 @@ it("Apply flow: attaches the PDF only to the CV field, never to cover letters, a
   assert.match(src, /:not\(\[type='file'\]\), textarea/, "el autorrelleno no intenta escribir texto en campos de archivo");
 
   const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
-  assert.match(sw, /if \(!validacion\?\.ok\) \{\n    return \{ success: true, ok: false/, "un CV que no pasa el verificador no genera PDF");
+  assert.match(sw, /if \(!validacion\?\.ok\) \{\n(?:\s*\/\/.*\n)*\s*await save\(\{ retryFix: true \}\);\n\s*return \{ success: true, ok: false/, "un CV que no pasa el verificador no genera PDF");
   assert.match(sw, /importScripts\([^)]*"\/shared\/cv-adapter\.js"[^)]*"\/content\/portals\.js"\)/);
 });
 
