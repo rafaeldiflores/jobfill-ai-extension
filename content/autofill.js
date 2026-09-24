@@ -439,6 +439,14 @@
   function setElementValue(el, value) {
     if (!el || value === undefined || value === null || value === "") return false;
 
+    // <input type="number">: solo un número limpio (el RUT con guion o el
+    // teléfono con "+" dejaban el campo vacío con un aviso en la consola).
+    if (el.tagName === "INPUT" && (el.type || "").toLowerCase() === "number") {
+      const numeric = Portals.toNumberInputValue(value, { min: el.min, max: el.max });
+      if (numeric === null) return false;
+      value = numeric;
+    }
+
     // Rich Text / Trix Editor (Getonbrd / Modern Portals)
     if (el.tagName === "TRIX-EDITOR") {
       if (el.editor && typeof el.editor.loadHTML === "function") {
@@ -1199,7 +1207,7 @@
           }
           return false;
         }
-        setElementValue(el, val);
+        if (!setElementValue(el, val)) return false;
         // Un <input role="combobox"> (react-select y similares: el selector de
         // país del widget de teléfono es el caso real que lo motivó) NO se
         // rellena escribiendo texto — eso solo filtra su lista de opciones. El
@@ -1290,7 +1298,7 @@
               if (Portals.pickOptionIndex([choiceOptionText(el)], cf.value) !== 0) continue;
               return checkChoice(el);
             }
-            setElementValue(el, cf.value);
+            if (!setElementValue(el, cf.value)) continue;
             return true;
           }
         }
@@ -2205,6 +2213,10 @@
   }
 
   function extractCompanyName() {
+    return Portals.cleanCompanyName(extractCompanyNameRaw());
+  }
+
+  function extractCompanyNameRaw() {
     return firstMatchingText([
       "[itemprop='hiringOrganization']",
       // LinkedIn
@@ -2324,7 +2336,7 @@
       const hasEvidence = best.score >= 40;
       return {
         title: best.context.title,
-        company: best.context.company,
+        company: Portals.cleanCompanyName(best.context.company),
         description: best.context.description,
         fromCache: true,
         capturedAt: best.context.capturedAt,
@@ -4699,7 +4711,7 @@
     let job = {};
     try { job = await resolveJobContext(); } catch (e) { /* se valida abajo */ }
     let oferta = (job.description || "").trim();
-    let empresa = job.company || extractCompanyName() || "";
+    let empresa = Portals.cleanCompanyName(job.company) || extractCompanyName() || "";
     let cargo = job.title || extractJobTitle() || "";
     if (oferta.length < 80) {
       // Formulario embebido: la oferta puede estar dentro del iframe del ATS.
@@ -4708,7 +4720,7 @@
         // El cargo y la empresa del iframe mandan: el <h1> del sitio que lo
         // envuelve suele ser "Trabaja con nosotros", no el cargo.
         oferta = fromFrames.description.trim();
-        empresa = fromFrames.company || empresa;
+        empresa = Portals.cleanCompanyName(fromFrames.company) || empresa;
         cargo = fromFrames.title || cargo;
       }
     }

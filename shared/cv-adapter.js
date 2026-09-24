@@ -54,7 +54,7 @@
 
   /** Título de un CV base (del frontmatter `titulo: "…"`). */
   function tituloDePerfil(markdown) {
-    return (String(markdown || "").match(/titulo:\s*"([^"]+)"/) || [])[1] || "";
+    return ((String(markdown || "").match(/^titulo:\s*"?([^"\n]+?)"?\s*$/m) || [])[1] || "").trim();
   }
 
   function buildProfilePickPrompt(perfiles, oferta) {
@@ -100,6 +100,58 @@ Responde SOLO JSON: {"markdown": "el CV corregido completo"}
 
 === CV ===
 ${markdown}`;
+  }
+
+  /**
+   * Repara sin IA lo estructural que el modelo a veces rompe y que el
+   * postulador rechaza de plano. El Worker (rdf-grafo/cv/src/parse.ts) lee el
+   * frontmatter con gray-matter (YAML) y exige `titulo` como texto; falla con
+   * "El CV necesita titulo en el frontmatter" si falta, pero también si el
+   * YAML no es válido (comillas dentro de comillas, ": " sin comillas) o si
+   * el CV llegó con "\n" literales. Por eso el frontmatter se REESCRIBE
+   * siempre desde cero, con el titulo como string JSON (YAML válido), en vez
+   * de confiar en el que escribió el modelo:
+   *   - "\n" literales → saltos de línea reales (si no hay ninguno real),
+   *   - quita un bloque ``` que envuelva el CV y el texto previo al CV,
+   *   - titulo: el del modelo (`titulo:`/`title:`, con o sin comillas) o,
+   *     si no hay, `tituloRespaldo` (titulo del CV anterior o "{TITULO} | <cargo>"),
+   *   - `perfil`, si venía, se conserva.
+   * El cuerpo (secciones, viñetas) no se toca: eso lo juzga el verificador.
+   */
+  function normalizeCvMarkdown(markdown, tituloRespaldo) {
+    let md = String(markdown || "").replace(/^\uFEFF/, "").replace(/\r\n?/g, "\n");
+    if (!md.includes("\n") && md.includes("\\n")) md = md.replace(/\\n/g, "\n").replace(/\\"/g, '"');
+    md = md.trim();
+    const fenced = md.match(/```(?:markdown|md|yaml)?\n([\s\S]*?)\n```/i);
+    if (fenced && fenced[1].includes("## ")) md = fenced[1].trim();
+
+    // Frontmatter del modelo (puede venir después de un texto de cortesía).
+    let head = "";
+    let body = md;
+    const fm = md.match(/(?:^|\n)---[ \t]*\n([\s\S]*?)\n---[ \t]*(?:\n|$)/);
+    if (fm && (fm.index === 0 || !md.slice(0, fm.index).includes("## "))) {
+      head = fm[1];
+      body = md.slice(fm.index + fm[0].length);
+    }
+    // Lo que venga antes de la primera sección no es CV ("Aquí está tu CV:").
+    const firstSection = body.search(/^## /m);
+    if (firstSection > 0) body = body.slice(firstSection);
+    body = body.trim();
+
+    const field = key => {
+      const m = head.match(new RegExp(`^[ \\t]*${key}[ \\t]*:[ \\t]*(.*)$`, "mi"));
+      if (!m) return "";
+      let v = m[1].trim();
+      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) v = v.slice(1, -1);
+      return v.replace(/\\"/g, '"').replace(/''/g, "'").trim();
+    };
+    const titulo = field("titulo") || field("title") || String(tituloRespaldo || "").trim();
+    const perfil = field("perfil");
+
+    if (!titulo) return body;
+    const lines = [`titulo: ${JSON.stringify(titulo)}`];
+    if (perfil) lines.push(`perfil: ${JSON.stringify(perfil)}`);
+    return `---\n${lines.join("\n")}\n---\n${body}`;
   }
 
   /** Largo máximo de un pedido de cambio: es una instrucción, no un CV. */
@@ -184,6 +236,8 @@ ${String(oferta || "").slice(0, OFERTA_MAX_ADAPTAR)}`;
     buildFixPrompt,
     CAMBIO_MAX,
     buildRevisePrompt,
+    normalizeCvMarkdown,
+    tituloDePerfil,
     parseJsonReply,
     hoy,
     slug,

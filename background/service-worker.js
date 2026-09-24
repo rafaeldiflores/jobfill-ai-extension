@@ -801,6 +801,23 @@ const APPLY_CHECKPOINT_TTL_MS = 30 * 60 * 1000;
 // "Reintentar" sobre un CV que sigue sin pasar hace uno más).
 const MAX_FIX_ROUNDS = 1;
 
+/**
+ * cv_validar que nunca tumba el flujo por el CONTENIDO: si el postulador
+ * rechaza el CV (frontmatter roto, sección que falta…), se devuelve como un
+ * hallazgo de error y el ajuste automático lo corrige con ese detalle. Solo
+ * los fallos reales (red, sesión del vault) se propagan, y esos se pueden
+ * reintentar.
+ */
+async function validateCv(markdown) {
+  try {
+    return await vaultCall("cv_validar", { markdown });
+  } catch (err) {
+    if (!err.toolError) throw err;
+    console.warn("[JobFill AI] El postulador rechazó el CV; pasa al ajuste:", err.message);
+    return { ok: false, hallazgos: [{ nivel: "error", detalle: err.message }], paginas: null, html: "" };
+  }
+}
+
 async function readApplyCheckpoint(tabId) {
   const all = (await chrome.storage.session.get(APPLY_CHECKPOINT_KEY))[APPLY_CHECKPOINT_KEY] || {};
   const cp = all[tabId];
@@ -835,6 +852,8 @@ async function adaptCvForOffer({ oferta, empresa, cargo, resume = false, cambio 
     const pedido = String(cambio || "").trim().slice(0, JobFillCv.CAMBIO_MAX);
     if (pedido) cp.cambioPendiente = pedido;
   } else {
+    // Ofertas guardadas antes de limpiar el nombre traían "3IT Follow August 31…".
+    empresa = JobFillPortals.cleanCompanyName(empresa);
     cp = { input: { oferta, empresa, cargo } };
     await writeApplyCheckpoint(tabId, null);
   }
@@ -873,6 +892,16 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
     throw new Error("Tu vault no tiene CVs base (cv/base/*.md): el Postulador los necesita para adaptar.");
   }
 
+  // Todo CV que devuelve la IA pasa por aquí antes de guardarse: repara el
+  // frontmatter (titulo) sin gastar otra llamada. El titulo de respaldo es el
+  // del CV anterior o "{TITULO} | <cargo de la oferta>".
+  const tituloBase = `${ctx.reglas?.titulo_profesional || "Ingeniero en Informática"} | ${cargo || "Postulación"}`;
+  const repair = (md, anterior) => JobFillCv.normalizeCvMarkdown(md, JobFillCv.tituloDePerfil(anterior) || tituloBase);
+  // Un punto de control guardado antes de esta reparación también se arregla.
+  if (cp.markdown && repair(cp.markdown, cp.markdown) !== cp.markdown) {
+    await save({ markdown: repair(cp.markdown, cp.markdown), validacion: null });
+  }
+
   // Si Claude pide esperar (límite por minuto), el diálogo lo muestra en el
   // paso en curso en vez de quedarse "pegado" sin explicación.
   const onRetry = ({ waitMs, attempt }) => progress(getStep(), `Claude pidió esperar por el límite de uso por minuto de tu cuenta. Reintento ${attempt} en ${Math.round(waitMs / 1000)} s…`);
@@ -899,7 +928,7 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
     progress("adaptar", `Adaptando tu CV ${perfil} a la oferta (suele tardar 30–60 s)…`);
     const adaptado = await ask(JobFillCv.buildAdaptPrompt(ctx, perfil, ofertaCompleta), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
     if (!adaptado?.markdown) throw new Error("La IA no devolvió el CV adaptado. Intenta de nuevo.");
-    await save({ adaptado, markdown: adaptado.markdown, fixRounds: 0 });
+    await save({ adaptado, markdown: repair(adaptado.markdown, ""), fixRounds: 0 });
   }
   const adaptado = cp.adaptado;
 
@@ -918,7 +947,7 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
     const revisado = await ask(JobFillCv.buildRevisePrompt(ctx, cp.markdown, cp.cambioPendiente, ofertaCompleta), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
     if (!revisado?.markdown) throw new Error("La IA no devolvió el CV con el cambio. Intenta de nuevo.");
     await save({
-      markdown: revisado.markdown, validacion: null, fixRounds: 0, retryFix: false,
+      markdown: repair(revisado.markdown, cp.markdown), validacion: null, fixRounds: 0, retryFix: false,
       cambioPendiente: null, nota: String(revisado.nota || "").trim(), cambios: (cp.cambios || 0) + 1
     });
   }
@@ -926,7 +955,7 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
   let validacion = cp.validacion;
   if (!validacion) {
     progress("validar", "Revisando reglas y que quepa en 1 página…");
-    validacion = await vaultCall("cv_validar", { markdown: cp.markdown });
+    validacion = await validateCv(cp.markdown);
     await save({ validacion });
   }
 
@@ -938,9 +967,9 @@ async function runAdaptCvSteps({ oferta, empresa, cargo, cp, save, progress, get
     const fix = await ask(JobFillCv.buildFixPrompt(ctx, cp.markdown, validacion), { model: MODEL_COMPLEX, max_tokens: 8000, timeoutMs: 150000 });
     await save({ fixRounds: (cp.fixRounds || 0) + 1, retryFix: false });
     if (fix?.markdown) {
-      await save({ markdown: fix.markdown, validacion: null });
+      await save({ markdown: repair(fix.markdown, cp.markdown), validacion: null });
       progress("ajustar", "Revisando de nuevo el CV ajustado…");
-      validacion = await vaultCall("cv_validar", { markdown: cp.markdown });
+      validacion = await validateCv(cp.markdown);
       await save({ validacion });
     }
   }

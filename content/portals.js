@@ -235,7 +235,58 @@
     });
   }
 
+  /**
+   * Nombre de empresa limpio. El elemento de la empresa en LinkedIn y otros
+   * portales trae pegado el botón "Follow"/"Seguir", la fecha y "Last replied
+   * to candidates…"; al aplanar el texto quedaba "3IT Follow August 31, 2026
+   * Last replied to candidates about 4 hours ago" y eso llegaba al CV y al
+   * Tracker. Se corta en el primer marcador de ese ruido.
+   */
+  const COMPANY_NOISE_RE = new RegExp([
+    "\\s+(?:follow|following|seguir|siguiendo)\\b",
+    "\\s+(?:posted|reposted|publicad[oa]|last replied|actively|responds?|hace\\s+\\d|\\d+\\s+(?:minutes?|hours?|days?|weeks?|months?)\\s+ago)\\b",
+    "\\s+(?:january|february|march|april|may|june|july|august|september|october|november|december|enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)\\s+\\d{1,2}\\b",
+    "\\s+\\d{1,2}\\s+de\\s+[a-záéíóú]+\\s+de\\s+\\d{4}",
+    "\\s+[·•|]\\s+",
+    "\\s+\\d[\\d.,]*\\s*(?:followers|seguidores|employees|empleados)\\b"
+  ].join("|"), "i");
+
+  function cleanCompanyName(text) {
+    const first = String(text || "").split(/\n/).map(l => l.trim()).find(Boolean) || "";
+    const cut = first.search(COMPANY_NOISE_RE);
+    return (cut > 0 ? first.slice(0, cut) : first).replace(/\s+/g, " ").trim().slice(0, 80);
+  }
+
+  /**
+   * Valor para un <input type="number">, o null si no hay uno sensato.
+   * Chrome rechaza cualquier texto no numérico ("The specified value
+   * '19974960-9' cannot be parsed") y el campo queda vacío en silencio:
+   *   - RUT "19.974.960-9" → "19974960" (el cuerpo: un campo numérico no
+   *     puede llevar el dígito verificador, que puede ser K),
+   *   - teléfono "+56 9 1234 5678" → "56912345678",
+   *   - "3,5" → "3.5"; "$1.200.000" → "1200000",
+   *   - texto sin número ("No especificado") → null: no se toca el campo.
+   * Respeta min/max del campo.
+   */
+  function toNumberInputValue(value, { min, max } = {}) {
+    const raw = String(value ?? "").trim();
+    if (!raw) return null;
+    let out = null;
+    const rut = raw.match(/^(\d{1,2}(?:\.?\d{3}){2})-?[\dkK]$/);
+    if (rut && /[-.]|[kK]$/.test(raw)) out = rut[1].replace(/\./g, "");
+    else if (/^-?\d+(?:[.,]\d+)?$/.test(raw)) out = raw.replace(",", ".");
+    else if (/^[\s$+()\d.\-]+$/.test(raw) && /\d/.test(raw)) out = raw.replace(/\D/g, "");
+    if (out === null || out === "") return null;
+    const n = Number(out);
+    if (!Number.isFinite(n)) return null;
+    if (min !== undefined && min !== "" && n < Number(min)) return null;
+    if (max !== undefined && max !== "" && n > Number(max)) return null;
+    return out;
+  }
+
   root.JobFillPortals = {
+    toNumberInputValue,
+    cleanCompanyName,
     PLACEHOLDER_RE,
     isPlaceholderOption,
     pickOptionIndex,

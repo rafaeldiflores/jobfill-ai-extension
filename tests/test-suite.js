@@ -648,7 +648,7 @@ it("Translates Messages API requests to Gemini generateContent on Vertex AI expr
 
   const sonnetReqs = ai.buildRequests(settings, "gemini", "claude-sonnet-5", body);
   assert.strictEqual(JSON.stringify(sonnetReqs.map(r => r.sentModel)),
-    JSON.stringify(["gemini-3.8-flash", "gemini-3.8-flash-preview", "gemini-2.5-flash"]));
+    JSON.stringify(["gemini-3.8-flash", "gemini-2.5-flash"]));
   const [flash38] = sonnetReqs;
   assert.strictEqual(flash38.url, "https://aiplatform.googleapis.com/v1/publishers/google/models/gemini-3.8-flash:generateContent");
   assert.strictEqual(flash38.headers["x-goog-api-key"], "AQ.test-key");
@@ -666,7 +666,8 @@ it("Translates Messages API requests to Gemini generateContent on Vertex AI expr
 
   // Haiku → 3.8 Flash con razonamiento mínimo; 2.5 Flash (último recurso) sin razonar.
   const haikuReqs = ai.buildRequests(settings, "gemini", "claude-haiku-4-5", { max_tokens: 60, messages: [{ role: "assistant", content: "x" }] });
-  assert.strictEqual(haikuReqs[0].body.generationConfig.thinkingConfig.thinkingLevel, "minimal");
+  // 3.8 Flash rechaza "minimal" (400 real): Haiku también va con "low".
+  assert.strictEqual(haikuReqs[0].body.generationConfig.thinkingConfig.thinkingLevel, "low");
   assert.strictEqual(haikuReqs[0].body.contents[0].role, "model");
   const last = haikuReqs[haikuReqs.length - 1];
   assert.strictEqual(last.sentModel, "gemini-2.5-flash");
@@ -759,7 +760,7 @@ it("Claude rate limit (429): waits what retry-after asks and retries the same re
   assert.strictEqual(ai.rateLimitWait(400, h("5"), 0), null);
 });
 
-it("Within Gemini, walks 3.8 Flash → preview → 2.5 Flash on 404/429/400, but stops on an invalid key", async () => {
+it("Within Gemini, walks 3.8 Flash → 2.5 Flash on 404/429/400, but stops on an invalid key", async () => {
   const calls = [];
   let replies;
   const ai = loadRealAiClient(async url => {
@@ -770,19 +771,19 @@ it("Within Gemini, walks 3.8 Flash → preview → 2.5 Flash on 404/429/400, but
   const settings = ai.readAiSettings({ aiProvider: "gemini", vertexApiKey: "AQ.k" });
   const request = { model: "claude-sonnet-5", messages: [{ role: "user", content: "hola" }] };
 
-  // 3.8 no existe con ese ID, la preview no acepta la config → cae a 2.5 Flash.
-  replies = {
-    "gemini-3.8-flash": () => jsonResponse(404, { error: { code: 404, message: "Publisher model not found" } }),
-    "gemini-3.8-flash-preview": () => jsonResponse(400, [{ error: { code: 400, message: "Invalid thinking level", status: "INVALID_ARGUMENT" } }])
-  };
+  // 3.8 no acepta la config (400 real: THINKING_LEVEL_MINIMAL) → cae a 2.5 Flash.
+  replies = { "gemini-3.8-flash": () => jsonResponse(400, [{ error: { code: 400, message: "Thinking level is unsupported: THINKING_LEVEL_MINIMAL", status: "INVALID_ARGUMENT" } }]) };
   const data = await ai.callAi(settings, request);
   assert.strictEqual(data._model, "gemini-2.5-flash");
-  assert.strictEqual(calls.length, 3);
+  assert.strictEqual(calls.length, 2);
 
-  // Cuota del primero agotada → el siguiente responde.
-  calls.length = 0;
-  replies = { "gemini-3.8-flash": () => jsonResponse(429, { error: { message: "Resource exhausted" } }) };
-  assert.strictEqual((await ai.callAi(settings, request))._model, "gemini-3.8-flash-preview");
+  // Modelo inexistente (404) o cuota agotada (429, lo que pasó en la cuenta real) → 2.5 Flash responde.
+  for (const fail of [() => jsonResponse(404, { error: { code: 404, message: "Publisher model not found" } }), () => jsonResponse(429, { error: { message: "Resource has been exhausted (e.g. check quota)." } })]) {
+    calls.length = 0;
+    replies = { "gemini-3.8-flash": fail };
+    assert.strictEqual((await ai.callAi(settings, request))._model, "gemini-2.5-flash");
+    assert.strictEqual(calls.length, 2);
+  }
 
   // Key inválida: se corta al primer intento.
   calls.length = 0;
@@ -2881,8 +2882,82 @@ it("Apply flow: a requested change keeps the vault rules, uses only BASE facts a
 
   const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
   // El cambio deja el CV sin validar: vuelve a pasar por cv_validar (y al ajuste) antes de otro PDF.
-  assert.match(sw, /markdown: revisado\.markdown, validacion: null, fixRounds: 0/);
+  assert.match(sw, /markdown: repair\(revisado\.markdown, cp\.markdown\), validacion: null, fixRounds: 0/);
   assert.ok(sw.indexOf("cp.cambioPendiente) {") < sw.indexOf("let validacion = cp.validacion;"), "el cambio se aplica antes de validar");
+});
+
+it("CV from the AI: the frontmatter is rebuilt so the Worker's YAML parser always finds a text titulo", () => {
+  const C = loadRealCvAdapter();
+  const body = "## RESUMEN PROFESIONAL\nTexto.";
+  const T = "Ingeniero en Informática | AI Engineer";
+  const fm = t => `---\ntitulo: ${JSON.stringify(t)}\n---\n${body}`;
+  // Casos reales que el Worker (gray-matter) rechazaba con "El CV necesita titulo en el frontmatter" o un error de YAML.
+  assert.strictEqual(C.normalizeCvMarkdown(body, T), fm(T), "sin frontmatter");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitulo: "Ing | Full-Stack ("GenAI")"\n---\n${body}`, T), fm('Ing | Full-Stack ("GenAI")'), "comillas dentro de comillas");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitulo: Ing | Full-Stack: AI\n---\n${body}`, T), fm("Ing | Full-Stack: AI"), "dos puntos sin comillas");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitle: "X | Y"\n---\n${body}`, T), fm("X | Y"), "title en inglés");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\\ntitulo: \\"A | B\\"\\n---\\n## RESUMEN PROFESIONAL\\nTexto.`, T), fm("A | B"), "\\n literales");
+  assert.strictEqual(C.normalizeCvMarkdown(`Aquí está tu CV:\n\n---\ntitulo: "A | B"\n---\n${body}`, T), fm("A | B"), "texto previo");
+  assert.strictEqual(C.normalizeCvMarkdown("```markdown\n---\ntitulo: \"A | B\"\n---\n" + body + "\n```", T), fm("A | B"), "bloque ```");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitulo: ""\n---\n${body}`, T), fm(T), "titulo vacío");
+  assert.strictEqual(C.normalizeCvMarkdown(`---\n---\n${body}`, T), fm(T), "frontmatter vacío");
+  assert.strictEqual(C.normalizeCvMarkdown(`Hola\n${body}`, T), fm(T), "texto antes de la primera sección");
+  // perfil se conserva; un CV correcto queda equivalente (CRLF/BOM incluidos).
+  assert.strictEqual(C.normalizeCvMarkdown(`---\ntitulo: "A | B"\nperfil: AI\n---\n${body}`, T), `---\ntitulo: "A | B"\nperfil: "AI"\n---\n${body}`);
+  assert.strictEqual(C.normalizeCvMarkdown("\uFEFF" + fm("A | B").replace(/\n/g, "\r\n"), T), fm("A | B"));
+  // Idempotente.
+  const once = C.normalizeCvMarkdown(`---\ntitulo: Ing: AI\n---\n${body}`, T);
+  assert.strictEqual(C.normalizeCvMarkdown(once, T), once);
+  // tituloDePerfil lee titulos con o sin comillas.
+  assert.strictEqual(C.tituloDePerfil('---\ntitulo: "A | B"\n---'), "A | B");
+  assert.strictEqual(C.tituloDePerfil("---\ntitulo: A | B\n---"), "A | B");
+  assert.strictEqual(C.tituloDePerfil(body), "");
+});
+
+it("Company names lose the portal noise glued to them (Follow, dates, 'Last replied…')", () => {
+  const P = loadRealPortals();
+  assert.strictEqual(P.cleanCompanyName("3IT Follow August 31, 2026 Last replied to candidates about 4 hours ago"), "3IT");
+  assert.strictEqual(P.cleanCompanyName("3IT\nFollow\nAugust 31"), "3IT");
+  assert.strictEqual(P.cleanCompanyName("Acme Labs · Santiago, Chile"), "Acme Labs");
+  assert.strictEqual(P.cleanCompanyName("Banco Estado Seguir"), "Banco Estado");
+  assert.strictEqual(P.cleanCompanyName("Falabella 12.345 seguidores"), "Falabella");
+  assert.strictEqual(P.cleanCompanyName("Empresa X Publicado hace 3 días"), "Empresa X");
+  for (const ok of ["Mayo Clinic", "Hace Group", "Posted Labs", "BCI", ""]) assert.strictEqual(P.cleanCompanyName(ok), ok);
+});
+
+it("Postulador rejecting the CV content becomes a verifier finding for the automatic fix, not a crash", () => {
+  const V = loadRealVaultClient();
+  let err = null;
+  try { V.parseToolResult({ isError: true, content: [{ type: "text", text: 'El CV necesita "titulo" en el frontmatter (subtítulo bajo el nombre).' }] }); } catch (e) { err = e; }
+  assert.ok(err && err.toolError === true, "un rechazo de la herramienta queda marcado como toolError");
+
+  const sw = readSourceText(path.join(__dirname, "..", "background", "service-worker.js"));
+  const validate = sw.slice(sw.indexOf("async function validateCv"), sw.indexOf("async function readApplyCheckpoint"));
+  assert.match(validate, /if \(!err\.toolError\) throw err;/, "red o sesión siguen siendo errores");
+  assert.match(validate, /return \{ ok: false, hallazgos: \[\{ nivel: "error", detalle: err\.message \}\]/);
+  // El flujo valida siempre con validateCv y repara todo CV que devuelve la IA.
+  const flow = sw.slice(sw.indexOf("async function runAdaptCvSteps"), sw.indexOf("/** Registra la postulación actual"));
+  assert.doesNotMatch(flow, /vaultCall\("cv_validar"/);
+  for (const src of ["adaptado.markdown", "revisado.markdown", "fix.markdown"]) {
+    assert.match(flow, new RegExp(`repair\\(${src.replace(".", "\\.")}`), `${src} pasa por repair`);
+  }
+});
+
+it("Number inputs get a clean number (RUT body, phone digits) or are left alone", () => {
+  const P = loadRealPortals();
+  assert.strictEqual(P.toNumberInputValue("19974960-9"), "19974960", "el aviso real de Chrome: RUT con guion en type=number");
+  assert.strictEqual(P.toNumberInputValue("19.974.960-9"), "19974960");
+  assert.strictEqual(P.toNumberInputValue("7.654.321-K"), "7654321");
+  assert.strictEqual(P.toNumberInputValue("+56 9 1234 5678"), "56912345678");
+  assert.strictEqual(P.toNumberInputValue("3,5"), "3.5");
+  assert.strictEqual(P.toNumberInputValue("$1.200.000"), "1200000");
+  assert.strictEqual(P.toNumberInputValue("2022"), "2022");
+  assert.strictEqual(P.toNumberInputValue("No especificado"), null);
+  assert.strictEqual(P.toNumberInputValue(""), null);
+  assert.strictEqual(P.toNumberInputValue("150", { max: "100" }), null, "respeta max");
+  assert.strictEqual(P.toNumberInputValue("5", { min: "10" }), null, "respeta min");
+  const src = readSourceText(path.join(__dirname, "..", "content", "autofill.js"));
+  assert.match(src, /const numeric = Portals\.toNumberInputValue\(value, \{ min: el\.min, max: el\.max \}\);\n\s*if \(numeric === null\) return false;/);
 });
 
 it("Portals: content script runs in every frame, portals.js loads first, widget only in the top frame", () => {

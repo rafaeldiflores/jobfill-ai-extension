@@ -98,7 +98,14 @@
    */
   function parseToolResult(result) {
     const text = (result?.content || []).filter(c => c.type === "text").map(c => c.text).join("");
-    if (result?.isError) throw new Error(text || "El postulador devolvió un error.");
+    if (result?.isError) {
+      // La herramienta respondió, pero rechazó lo que se le pasó (p. ej. un CV
+      // sin frontmatter). Distinto de un fallo de red o de sesión: quien llama
+      // puede tratarlo como un hallazgo y corregir el contenido.
+      const err = new Error(text || "El postulador devolvió un error.");
+      err.toolError = true;
+      throw err;
+    }
     try {
       return JSON.parse(text);
     } catch (e) {
