@@ -310,9 +310,10 @@
       const errorObj = Array.isArray(errorData) ? errorData[0]?.error : errorData?.error;
       const rawMessage = errorObj?.message || `${response.status} ${response.statusText}`;
 
-      console.error("[JobFill AI] La IA rechazó la petición:", {
-        provider, status: response.status, model: request.sentModel, error: errorObj || errorData
-      });
+      // En una sola línea de texto: al copiar desde la consola, un objeto
+      // suelto se pega como "[object Object]" y se pierde la causa real.
+      const errorType = errorObj?.type ? ` [${errorObj.type}]` : "";
+      console.error(`[JobFill AI] ${describeProvider(provider)} rechazó la petición — HTTP ${response.status}${errorType}, modelo "${request.sentModel}": ${rawMessage}`);
 
       lastError = friendlyError(provider, response.status, rawMessage);
       const tryNextModel = response.status === 404 ||
