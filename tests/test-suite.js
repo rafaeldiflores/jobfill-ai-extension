@@ -2261,7 +2261,7 @@ it("Every extension script parses (a syntax error silently disables a whole file
   const { execFileSync } = require("child_process");
   const scripts = [
     ["background", "service-worker.js"], ["content", "autofill.js"], ["options", "options.js"],
-    ["options", "pdf-parser.js"], ["popup", "popup.js"], ["shared", "ai-client.js"], ["shared", "markdown-source.js"]
+    ["options", "pdf-parser.js"], ["popup", "popup.js"], ["shared", "ai-client.js"], ["shared", "markdown-source.js"], ["shared", "vault-client.js"]
   ];
   for (const parts of scripts) {
     execFileSync(process.execPath, ["--check", path.join(__dirname, "..", ...parts)], { stdio: "pipe" });
@@ -2521,6 +2521,96 @@ it("Options never invent answers: legal and English selects start empty, nothing
   assert.ok(!/\srequired[\s>]/.test(html), "ningún campo required bloquea el guardado");
   assert.match(html, /id="mdDropzone"/);
   assert.match(html, /markdown-source\.js/);
+});
+
+// ─── CONEXIÓN CON EL VAULT (postulador-mcp) ───────────────────────────────
+function loadRealVaultClient(fetchImpl) {
+  const src = fs.readFileSync(path.join(__dirname, "..", "shared", "vault-client.js"), "utf8");
+  const sandbox = { fetch: fetchImpl, URL, URLSearchParams, TextEncoder, crypto: globalThis.crypto, btoa, console };
+  sandbox.self = sandbox;
+  require("vm").runInNewContext(src, sandbox);
+  return sandbox.JobFillVault;
+}
+
+it("Vault client: URL normalization, PKCE S256 (RFC 7636 vector) and authorize URL", async () => {
+  const V = loadRealVaultClient();
+  assert.strictEqual(V.normalizeServerUrl("postulador-mcp.rafa.workers.dev/mcp/"), "https://postulador-mcp.rafa.workers.dev");
+  assert.strictEqual(V.normalizeServerUrl("http://localhost:8788/mcp"), "http://localhost:8788");
+  assert.throws(() => V.normalizeServerUrl("http://evil.example.com"), /https/, "las credenciales OAuth solo viajan por HTTPS");
+
+  // Vector del Apéndice B de la RFC 7636.
+  assert.strictEqual(await V.pkceChallenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"), "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM");
+
+  const url = new URL(V.buildAuthorizeUrl("https://x.dev/authorize", { clientId: "c1", redirectUri: "https://id.chromiumapp.org/vault", codeChallenge: "abc", state: "s1" }));
+  assert.strictEqual(url.searchParams.get("response_type"), "code");
+  assert.strictEqual(url.searchParams.get("code_challenge_method"), "S256");
+  assert.strictEqual(url.searchParams.get("redirect_uri"), "https://id.chromiumapp.org/vault");
+  assert.strictEqual(url.searchParams.get("state"), "s1");
+});
+
+it("Vault client: parses MCP replies over SSE or JSON, and tool errors", () => {
+  const V = loadRealVaultClient();
+  const sse = 'event: message\ndata: {"jsonrpc":"2.0","id":1,"result":{"ok":1}}\n\nevent: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"ok":2}}\n\n';
+  assert.strictEqual(V.parseMcpResponse("text/event-stream", sse, 2).result.ok, 2);
+  assert.strictEqual(V.parseMcpResponse("application/json", '{"jsonrpc":"2.0","id":7,"result":{}}', 7).id, 7);
+  assert.strictEqual(V.parseMcpResponse("application/json", "", 1), null);
+
+  assert.strictEqual(V.parseToolResult({ content: [{ type: "text", text: '{"base":"# B"}' }] }).base, "# B");
+  assert.throws(() => V.parseToolResult({ isError: true, content: [{ type: "text", text: "No autorizado." }] }), /No autorizado/);
+
+  const payload = V.buildApplicationPayload({ empresa: "  Acme ", cargo: "Dev", url: "https://x", fecha: "2026-09-24" });
+  assert.strictEqual(JSON.stringify(payload), JSON.stringify({ empresa: "Acme", cargo: "Dev", estado: "Postulado", fecha: "2026-09-24", url: "https://x" }));
+  assert.throws(() => V.buildApplicationPayload({ empresa: "", cargo: "Dev" }), /empresa/);
+  assert.strictEqual(V.buildApplicationPayload({ empresa: "A".repeat(500), cargo: "B" }).empresa.length, 120, "mismos topes que valida el Worker");
+});
+
+it("Vault client: a tool call does initialize → initialized → tools/call in one session, and refreshes once on 401", async () => {
+  const calls = [];
+  let rejectNext = true;
+  const reply = (status, body, headers = {}) => ({
+    ok: status < 300, status, headers: { get: k => headers[k.toLowerCase()] ?? null },
+    text: async () => body, json: async () => JSON.parse(body)
+  });
+  const fetchImpl = async (url, init) => {
+    const msg = init.body && init.body.startsWith("{") ? JSON.parse(init.body) : null;
+    calls.push({ url, method: msg?.method, auth: init.headers?.authorization, session: init.headers?.["mcp-session-id"], body: init.body });
+    if (url.endsWith("/token")) return reply(200, JSON.stringify({ access_token: "nuevo", refresh_token: "rt2", expires_in: 3600 }));
+    if (init.headers.authorization === "Bearer viejo" && rejectNext) { rejectNext = false; return reply(401, ""); }
+    if (!msg.id) return reply(202, "");
+    const result = msg.method === "initialize" ? { protocolVersion: "2025-06-18" } : { content: [{ type: "text", text: '{"base":"# BASE"}' }] };
+    return reply(200, `data: ${JSON.stringify({ jsonrpc: "2.0", id: msg.id, result })}\n\n`, { "content-type": "text/event-stream", "mcp-session-id": "s9" });
+  };
+  const V = loadRealVaultClient(fetchImpl);
+  const auth = { serverUrl: "https://p.dev", accessToken: "viejo", refreshToken: "rt1", clientId: "c1", tokenEndpoint: "https://p.dev/token", expiresAt: Date.now() + 3600e3 };
+
+  const { data, auth: renewed } = await V.callWithAuth(auth, "cv_contexto", {});
+  assert.strictEqual(data.base, "# BASE");
+  assert.strictEqual(renewed.accessToken, "nuevo", "tras un 401 se renueva el token una vez");
+  assert.strictEqual(renewed.refreshToken, "rt2");
+  const refresh = calls.find(c => c.url.endsWith("/token"));
+  assert.match(refresh.body, /grant_type=refresh_token/);
+  const mcp = calls.filter(c => c.url.endsWith("/mcp") && c.auth === "Bearer nuevo");
+  assert.deepStrictEqual(mcp.map(c => c.method), ["initialize", "notifications/initialized", "tools/call"]);
+  assert.strictEqual(mcp[0].session, undefined);
+  assert.ok(mcp.slice(1).every(c => c.session === "s9"), "las llamadas siguientes llevan Mcp-Session-Id");
+});
+
+it("Vault rules: vetoed terms exclude sections, reach the prompt and are flagged in answers", () => {
+  const M = loadRealMarkdownSource();
+  const parsed = M.parseMarkdownSources([{ name: "b.md", content: MD_FIXTURE() }], { vetoed: ["Tienda Y"] });
+  assert.ok(parsed.excludedSections.includes("Tienda Y - E-commerce familiar"));
+  const ctx = M.buildMarkdownContext(parsed, "Power BI", { vetoed: ["Tienda Y"] });
+  assert.match(ctx, /TÉRMINOS VETADOS POR EL CANDIDATO \(NUNCA los escribas\) ---\nTienda Y/);
+  assert.ok(!/### Tienda Y/.test(ctx));
+  assert.deepStrictEqual(M.findVetoedTerms("Trabajé en la tienda y en Plataforma X", ["Tienda Y", "Gemini Spark"]), ["Tienda Y"]);
+
+  const view = loadRealCandidateSchemaHelpers().buildAutofillProfileView({ vaultAuth: { accessToken: "x" }, vaultLastSync: 1 });
+  assert.strictEqual("vaultAuth" in view, false, "el token del vault no viaja a las páginas");
+
+  const manifest = JSON.parse(fs.readFileSync(path.join(__dirname, "..", "manifest.json"), "utf8"));
+  assert.ok(manifest.permissions.includes("identity"), "chrome.identity para el login OAuth");
+  const optionsSrc = fs.readFileSync(path.join(__dirname, "..", "options", "options.js"), "utf8");
+  assert.match(optionsSrc, /BACKUP_EXCLUDED_KEYS = \[[^\]]*"vaultAuth"/, "el token del vault no sale en los respaldos");
 });
 
 // Espera a los tests async antes de contar: si el resumen se imprimiera de

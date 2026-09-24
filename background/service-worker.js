@@ -6,7 +6,7 @@
 // Cliente único de IA (Claude, con respaldo en Gemini vía Vertex AI),
 // compartido con opciones y popup. Ruta absoluta: importScripts resuelve
 // relativo al SW.
-importScripts("/shared/ai-client.js", "/shared/markdown-source.js");
+importScripts("/shared/ai-client.js", "/shared/markdown-source.js", "/shared/vault-client.js");
 
 // `targetRole` vacío por defecto: alimenta `headline`, que el autofill escribe
 // en campos "Job Title"/"Titular" y que el prompt le pasa a Claude como el cargo
@@ -176,7 +176,7 @@ function buildAutofillProfileView(storage) {
   const {
     // vertexProjectId/vertexRegion: restos de una versión previa, por si
     // quedaron en storage.
-    claudeApiKey, vertexApiKey, vertexProjectId, vertexRegion,
+    claudeApiKey, vertexApiKey, vertexProjectId, vertexRegion, vaultAuth,
     profiles_backup_v1, ...safeStorage
   } = storage;
 
@@ -454,6 +454,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === "VAULT_CONNECT") {
+    withKeepAlive(() => connectVault(message.payload?.serverUrl))
+      .then(response => sendResponse(response))
+      .catch(error => sendResponse({ success: false, error: describeError(error) }));
+    return true;
+  }
+
+  if (message.type === "VAULT_SYNC") {
+    withKeepAlive(() => syncFromVault())
+      .then(response => sendResponse(response))
+      .catch(error => sendResponse({ success: false, error: describeError(error) }));
+    return true;
+  }
+
+  if (message.type === "VAULT_DISCONNECT") {
+    chrome.storage.local.remove(["vaultAuth", "vaultLastSync"])
+      .then(() => sendResponse({ success: true }))
+      .catch(error => sendResponse({ success: false, error: describeError(error) }));
+    return true;
+  }
+
+  if (message.type === "VAULT_REGISTER_APPLICATION") {
+    withKeepAlive(() => registerApplication(message.payload || {}))
+      .then(response => sendResponse(response))
+      .catch(error => sendResponse({ success: false, error: describeError(error) }));
+    return true;
+  }
+
   if (message.type === "ENSURE_SCHEMA_MIGRATED") {
     ensureSchemaMigrated()
       .then(() => sendResponse({ success: true }))
@@ -521,6 +549,91 @@ chrome.commands.onCommand.addListener(async (command, tab) => {
     // que el usuario necesite ver, el atajo simplemente no aplica ahí.
     console.warn("[JobFill AI] Atajo de captura: no se pudo avisar a la pestaña activa:", err);
   });
+});
+
+// ─── Vault (postulador-mcp) ────────────────────────────────────────────────
+//
+// La conexión, la sincronización de la BASE y el registro en el Tracker viven
+// aquí (no en la página de opciones) para que funcionen igual desde el popup,
+// el panel flotante o al arrancar el navegador. Ver shared/vault-client.js.
+
+const VAULT_BASE_NAME = "BASE_Experiencia.md";
+const VAULT_STALE_MS = 6 * 60 * 60 * 1000;
+
+async function connectVault(serverUrl) {
+  const auth = await JobFillVault.connect(serverUrl);
+  await chrome.storage.local.set({ vaultAuth: auth });
+  // Primera sincronización inmediata: conectar sin traer la BASE no le sirve
+  // de nada al usuario.
+  const sync = await syncFromVault();
+  return { success: true, serverUrl: auth.serverUrl, sync };
+}
+
+/**
+ * Trae la BASE y las reglas del vault y las deja como fuente de verdad: el
+ * archivo entra en `candidateBase.markdownSources` (reemplazando la versión
+ * anterior, venga del vault o de un .md arrastrado con el mismo nombre) y la
+ * base estructurada se regenera desde él. Las reglas `nunca_incluir` y
+ * `fechas_fijas` se guardan aparte para el prompt.
+ */
+async function syncFromVault() {
+  const { vaultAuth, candidateBase } = await chrome.storage.local.get(["vaultAuth", "candidateBase"]);
+  if (!vaultAuth) throw new Error("JobFill AI no está conectado a tu vault.");
+
+  const { data, auth } = await JobFillVault.callWithAuth(vaultAuth, "cv_contexto", {});
+  if (!data || typeof data.base !== "string" || !data.base.trim()) {
+    throw new Error("El postulador no devolvió la BASE de experiencia.");
+  }
+
+  const base = candidateBase || {};
+  const vetoed = data.reglas?.nunca_incluir || [];
+  const sources = (base.markdownSources || []).filter(src => src.name !== VAULT_BASE_NAME);
+  sources.unshift({ name: VAULT_BASE_NAME, content: data.base, importedAt: Date.now(), origin: "vault" });
+
+  const parsed = JobFillMarkdown.parseMarkdownSources(sources, { vetoed });
+  const updatedBase = {
+    ...base,
+    markdownSources: sources,
+    ...(parsed.sections.length ? { cvDatabase: JobFillMarkdown.markdownToCvDatabase(parsed, "") } : {})
+  };
+
+  await chrome.storage.local.set({
+    candidateBase: updatedBase,
+    vaultAuth: auth,
+    vaultRules: {
+      nunca_incluir: vetoed,
+      fechas_fijas: data.reglas?.fechas_fijas || {},
+      estados: data.reglas?.estados || []
+    },
+    vaultLastSync: Date.now()
+  });
+
+  return {
+    success: true,
+    bytes: data.base.length,
+    sections: parsed.sections.length,
+    excluded: parsed.excludedSections,
+    vetoed: vetoed.length,
+    syncedAt: Date.now()
+  };
+}
+
+/** Registra la postulación actual en el Tracker del vault (postulacion_guardar). */
+async function registerApplication(input) {
+  const { vaultAuth, cvIndexes, activeCvIndexId } = await chrome.storage.local.get(["vaultAuth", "cvIndexes", "activeCvIndexId"]);
+  if (!vaultAuth) throw new Error("Conecta JobFill AI a tu vault en Opciones → Fuente de verdad para registrar postulaciones.");
+  const activeIndex = (cvIndexes || []).find(i => i.id === activeCvIndexId);
+  const payload = JobFillVault.buildApplicationPayload({ ...input, cvPerfil: input.cvPerfil || activeIndex?.area });
+  const { data, auth } = await JobFillVault.callWithAuth(vaultAuth, "postulacion_guardar", payload);
+  await chrome.storage.local.set({ vaultAuth: auth });
+  return { success: true, name: `${payload.empresa} - ${payload.cargo}`, result: data };
+}
+
+/** Al arrancar el navegador: si la BASE del vault tiene más de 6 h, se refresca en segundo plano. */
+chrome.runtime.onStartup.addListener(async () => {
+  const { vaultAuth, vaultLastSync } = await chrome.storage.local.get(["vaultAuth", "vaultLastSync"]);
+  if (!vaultAuth || (vaultLastSync && Date.now() - vaultLastSync < VAULT_STALE_MS)) return;
+  syncFromVault().catch(err => console.warn("[JobFill AI] Sincronización con el vault al arrancar falló:", err));
 });
 
 /**
@@ -1218,7 +1331,10 @@ function resolveCandidateContext(profile, jobTitle, jobDescription) {
   // propósito: son ~5 ms locales, y así nunca hay una versión "cacheada"
   // desincronizada del archivo que el usuario acaba de reimportar.
   const markdownSources = (p.markdownSources || []).filter(src => src && typeof src.content === "string" && src.content.trim());
-  const mdParsed = markdownSources.length ? JobFillMarkdown.parseMarkdownSources(markdownSources) : null;
+  // Términos que el usuario vetó en su vault (sincronizados desde el
+  // postulador): excluyen secciones y se le prohíben al modelo.
+  const vetoed = profile.vaultRules?.nunca_incluir || [];
+  const mdParsed = markdownSources.length ? JobFillMarkdown.parseMarkdownSources(markdownSources, { vetoed }) : null;
   const hasMarkdown = Boolean(mdParsed && mdParsed.sections.length);
 
   // Sin material real del candidato, la regla "no niegues experiencia" del
@@ -1373,7 +1489,7 @@ ${hasMarkdown && mdParsed.identityText.length ? `\n--- IDENTIDAD (de su archivo 
   // (con sus reglas literales y las secciones más relevantes para la oferta)
   // en vez de la base estructurada, que es una versión resumida de lo mismo.
   const experienceMaterial = hasMarkdown
-    ? `--- ARCHIVO DE EXPERIENCIA DEL CANDIDATO (fuente de verdad) ---\n${JobFillMarkdown.buildMarkdownContext(mdParsed, jobText)}`
+    ? `--- ARCHIVO DE EXPERIENCIA DEL CANDIDATO (fuente de verdad) ---\n${JobFillMarkdown.buildMarkdownContext(mdParsed, jobText, { vetoed })}`
     : `--- BASE DE DATOS DE EXPERIENCIA LABORAL Y CARGOS ---
 ${experiencesContext || "Sin cargos desglosados en BD"}
 
@@ -1706,7 +1822,11 @@ ${isEnglish ? `Generate an exceptional, persuasive, and directly focused answer 
     term => !confirmedTerms.some(c => c.toLowerCase() === term.toLowerCase())
   );
 
-  return { success: true, answer, coverage, ...providerInfo(data) };
+  // Garantía extra: si el modelo igual escribió un término vetado, se avisa
+  // (no se corrige solo: quitar una palabra puede dejar la frase sin sentido).
+  const vetoedInAnswer = JobFillMarkdown.findVetoedTerms(answer, profile.vaultRules?.nunca_incluir || []);
+
+  return { success: true, answer, coverage, vetoedInAnswer, ...providerInfo(data) };
 }
 
 /**

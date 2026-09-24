@@ -142,7 +142,13 @@
    * Las secciones de varios archivos se suman; lo especial (reglas,
    * identidad…) se concatena en orden.
    */
-  function parseMarkdownSources(sources) {
+  /**
+   * `vetoed`: términos que el usuario vetó en su vault (reglas.nunca_incluir
+   * del postulador, p. ej. "Sistema de Postulaciones"). Una sección cuyo
+   * título contenga uno se excluye igual que las marcadas "NUNCA va en un CV".
+   */
+  function parseMarkdownSources(sources, { vetoed = [] } = {}) {
+    const vetoedNorm = vetoed.map(norm).filter(Boolean);
     const result = {
       rules: [], identity: {}, identityText: [], canonical: [], stack: [], education: [], other: [],
       sections: [], excludedSections: [], estimatedRemoved: 0
@@ -173,7 +179,8 @@
             body,
             source: source.name || ""
           };
-          if (NEVER_IN_CV_RE.test(kv.nota || "")) result.excludedSections.push(title);
+          const isVetoed = vetoedNorm.some(v => norm(title).includes(v));
+          if (NEVER_IN_CV_RE.test(kv.nota || "") || isVetoed) result.excludedSections.push(title);
           else result.sections.push(entry);
         }
       }
@@ -280,7 +287,7 @@
    * (no se niega experiencia que existe, solo se resume). Empate: se conserva
    * el orden del archivo, que el usuario ya escribe por importancia.
    */
-  function buildMarkdownContext(parsed, jobText, { maxDetailed = 4, maxAchievements = 10 } = {}) {
+  function buildMarkdownContext(parsed, jobText, { maxDetailed = 4, maxAchievements = 10, vetoed = [] } = {}) {
     const keywords = jobKeywords(jobText || "");
     const ranked = parsed.sections
       .map((section, index) => ({ section, index, score: sectionRelevance(section, keywords) }))
@@ -292,6 +299,7 @@
     const block = (title, parts) => (parts.length ? `--- ${title} ---\n${parts.join("\n\n")}` : "");
     return [
       block("REGLAS DEL CANDIDATO (escritas por él; OBLIGATORIAS en cada respuesta)", parsed.rules),
+      vetoed.length ? `--- TÉRMINOS VETADOS POR EL CANDIDATO (NUNCA los escribas) ---\n${vetoed.join(", ")}` : "",
       block("IDENTIDAD", parsed.identityText),
       block("FRASES CANÓNICAS (úsalas tal cual cuando las cites)", parsed.canonical),
       block("EXPERIENCIA Y PROYECTOS MÁS RELEVANTES PARA ESTA OFERTA", detailed),
@@ -419,7 +427,14 @@
     };
   }
 
+  /** Términos vetados que aparecen en un texto (sin tildes ni mayúsculas). */
+  function findVetoedTerms(text, vetoed = []) {
+    const t = norm(text);
+    return vetoed.filter(v => v && t.includes(norm(v)));
+  }
+
   root.JobFillMarkdown = {
+    findVetoedTerms,
     parseMarkdownSources,
     buildMarkdownContext,
     markdownToProfileFields,

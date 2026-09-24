@@ -271,6 +271,27 @@
               Tu experiencia vive en <strong>archivos Markdown (.md)</strong>, por ejemplo tu <code>BASE_Experiencia.md</code>. JobFill AI los lee <strong>al instante y sin IA</strong>: respeta tus <strong>REGLAS DE USO</strong> tal cual, nunca envía métricas marcadas como ESTIMADA ni secciones que digan "NUNCA va en un CV", y elige para cada oferta la experiencia más relevante.
             </div>
 
+            <div class="vault-card" id="vaultCard">
+              <div class="vault-card-head">
+                <div>
+                  <h3>🔗 Conectar con tu vault (postulador)</h3>
+                  <p id="vaultStatusText">La BASE se sincroniza sola desde tu vault y puedes registrar postulaciones en tu Tracker. Entras con tu cuenta de GitHub; JobFill nunca escribe tu BASE.</p>
+                </div>
+                <span class="vault-pill" id="vaultPill">Sin conectar</span>
+              </div>
+              <div class="vault-card-actions" id="vaultDisconnected">
+                <input type="url" id="vaultServerUrl" placeholder="https://postulador-mcp.tu-cuenta.workers.dev" autocomplete="off" spellcheck="false">
+                <button type="button" class="btn-primary" id="btnVaultConnect">Conectar con GitHub</button>
+              </div>
+              <div class="vault-card-actions" id="vaultConnected" hidden>
+                <button type="button" class="btn-primary" id="btnVaultSync">⟳ Sincronizar ahora</button>
+                <button type="button" class="btn-secondary" id="btnVaultDisconnect">Desconectar</button>
+              </div>
+              <div id="vaultResult" class="api-test-badge"></div>
+            </div>
+
+            <div class="md-or">o importa tus archivos a mano</div>
+
             <div class="md-dropzone" id="mdDropzone" tabindex="0" role="button" aria-label="Importar archivos Markdown">
               <input type="file" id="mdFileInput" accept=".md,.markdown,text/markdown" multiple hidden>
               <div class="md-dropzone-icon">📥</div>

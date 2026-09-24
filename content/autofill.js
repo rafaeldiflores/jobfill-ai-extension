@@ -1508,6 +1508,9 @@
    */
   let extensionEnabled = false;
   let widgetCollapsed = false;
+  // Se usa `vaultLastSync` (no el token) como señal de "vault conectado": el
+  // content script no necesita ver credenciales para decidir si mostrar un botón.
+  let vaultConnected = false;
 
   /** Referencias a nodos dentro del Shadow DOM del widget (null si no existe). */
   let widgetRefs = null;
@@ -3257,7 +3260,13 @@
       rememberGeneratedAnswer(textarea, finalAnswer);
       textarea.classList.add("jobfill-highlight-ai");
       setTimeout(() => textarea.classList.remove("jobfill-highlight-ai"), 2500);
-      showToast(`✨ Respuesta redactada (${finalAnswer.length}${maxCharacters ? `/${maxCharacters}` : ""} caracteres).${providerNote(result)}`, "success");
+      const vetoed = result?.vetoedInAnswer || [];
+      showToast(
+        vetoed.length
+          ? `⚠️ La respuesta menciona ${vetoed.join(", ")}, que tus reglas vetan. Revísala antes de enviar.${providerNote(result)}`
+          : `✨ Respuesta redactada (${finalAnswer.length}${maxCharacters ? `/${maxCharacters}` : ""} caracteres).${providerNote(result)}`,
+        vetoed.length ? "error" : "success"
+      );
       return finalAnswer;
     };
 
@@ -3338,7 +3347,7 @@
             }
 
             if (response && response.success && response.answer) {
-              resolve({ answer: response.answer, coverage: response.coverage, provider: response.provider, fallbackReason: response.fallbackReason });
+              resolve({ answer: response.answer, coverage: response.coverage, provider: response.provider, fallbackReason: response.fallbackReason, vetoedInAnswer: response.vetoedInAnswer || [] });
             } else {
               reject(new Error(response?.error || "El service worker se cerró antes de responder. Recarga la extensión en chrome://extensions e inténtalo de nuevo."));
             }
@@ -3830,6 +3839,7 @@
       border: 1px solid rgba(148, 163, 184, 0.2);
     }
     .btn.secondary:hover { border-color: rgba(129, 140, 248, 0.6); background: #1e293b; }
+    .btn.wide { width: 100%; }
 
     .launcher {
       display: grid;
@@ -3915,6 +3925,7 @@
           <button type="button" class="btn secondary" data-action="answer-all" title="Detecta todas las preguntas abiertas del formulario y las responde con una sola llamada a la IA">✨ Responder todas</button>
           <button type="button" class="btn secondary" data-action="capture" title="Lee el cargo de esta página y lo guarda para usarlo al postular (atajo: Ctrl+Shift+0, configurable en chrome://extensions/shortcuts)">📄 Guardar cargo</button>
         </div>
+        <button type="button" class="btn secondary wide" data-action="register" title="Crea o actualiza &quot;Empresa - Cargo&quot; en el Tracker de tu vault, con estado Postulado" hidden>📌 Registrar postulación</button>
       </section>`;
 
     const $ = selector => dock.querySelector(selector);
@@ -3948,14 +3959,112 @@
     answerAllBtn.addEventListener("click", () => handleAnswerAllQuestions(answerAllBtn));
     const captureBtn = $('[data-action="capture"]');
     captureBtn.addEventListener("click", () => manualCaptureJobContext(captureBtn));
+    const registerBtn = $('[data-action="register"]');
+    registerBtn.hidden = !vaultConnected;
+    registerBtn.addEventListener("click", () => registerApplicationFromPage(registerBtn));
 
-    widgetRefs = { host, chip: $(".job"), chipText: $(".job-text") };
+    widgetRefs = { host, chip: $(".job"), chipText: $(".job-text"), registerBtn };
 
     shadow.append(style, dock);
     attachToTopLayerHost(host);
     ensureTopLayerWatcher();
 
     refreshCacheChip();
+  }
+
+  /**
+   * "📌 Registrar postulación": confirma empresa y cargo (detectados de la
+   * página o del cargo guardado) y los envía al Tracker del vault. Siempre
+   * con confirmación: escribir en el vault es un commit, no algo que deba
+   * pasar por un clic accidental.
+   */
+  async function registerApplicationFromPage(btn) {
+    let ctx = {};
+    try { ctx = await resolveJobContext(); } catch (e) { /* se completa a mano */ }
+
+    const input = await confirmApplicationDetails({
+      empresa: ctx.company || extractCompanyName() || "",
+      cargo: ctx.title || extractJobTitle() || ""
+    });
+    if (!input) return;
+
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = "Registrando…";
+    try {
+      const response = await new Promise(resolve => {
+        chrome.runtime.sendMessage({
+          type: "VAULT_REGISTER_APPLICATION",
+          payload: { ...input, url: location.href, canal: location.hostname.replace(/^www\./, "") }
+        }, r => resolve(chrome.runtime.lastError ? { success: false, error: ORPHANED_CONTEXT_MSG } : r));
+      });
+      if (response?.success) showToast(`📌 Registrada en tu Tracker: ${response.name}`, "success");
+      else showToast(response?.error || "No se pudo registrar la postulación.", "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
+
+  function confirmApplicationDetails(initial) {
+    return new Promise(resolve => {
+      const host = document.createElement("div");
+      host.className = "jobfill-dialog-host";
+      const shadow = host.attachShadow({ mode: "open" });
+      const style = document.createElement("style");
+      style.textContent = CONFIRM_DIALOG_STYLES;
+
+      const overlay = document.createElement("div");
+      overlay.className = "jobfill-overlay";
+      overlay.innerHTML = `
+        <div class="jobfill-confirm" role="dialog" aria-modal="true" aria-label="Registrar postulación">
+          <h3>📌 Registrar postulación</h3>
+          <p>Se crea (o actualiza) la nota <strong>Empresa - Cargo</strong> en el Tracker de tu vault, con estado <strong>Postulado</strong> y la fecha de hoy.</p>
+          <div class="jobfill-field">
+            <label for="jf-reg-empresa">Empresa</label>
+            <input type="text" id="jf-reg-empresa" spellcheck="false">
+          </div>
+          <div class="jobfill-field">
+            <label for="jf-reg-cargo">Cargo</label>
+            <input type="text" id="jf-reg-cargo" spellcheck="false">
+          </div>
+          <div class="jobfill-confirm-actions">
+            <button class="jobfill-confirm-ok" type="button">📌 Registrar</button>
+            <button class="jobfill-confirm-cancel" type="button">Cancelar</button>
+          </div>
+        </div>`;
+      shadow.append(style, overlay);
+      attachToTopLayerHost(host);
+
+      const empresa = shadow.getElementById("jf-reg-empresa");
+      const cargo = shadow.getElementById("jf-reg-cargo");
+      // Con .value, nunca interpolado en el HTML: el texto viene de la página.
+      empresa.value = initial.empresa;
+      cargo.value = initial.cargo;
+      (initial.empresa ? cargo : empresa).focus();
+
+      let settled = false;
+      const close = result => {
+        if (settled) return;
+        settled = true;
+        document.removeEventListener("keydown", onKeydown, true);
+        host.remove();
+        resolve(result);
+      };
+      function onKeydown(e) { if (e.key === "Escape") { e.stopPropagation(); close(null); } }
+      document.addEventListener("keydown", onKeydown, true);
+
+      shadow.querySelector(".jobfill-confirm-ok").addEventListener("click", () => {
+        const e = empresa.value.trim();
+        const c = cargo.value.trim();
+        if (!e || !c) {
+          (e ? cargo : empresa).focus();
+          return;
+        }
+        close({ empresa: e, cargo: c });
+      });
+      shadow.querySelector(".jobfill-confirm-cancel").addEventListener("click", () => close(null));
+    });
   }
 
   /** Quita de la página todo lo que la extensión dibuja de forma persistente. */
@@ -4052,6 +4161,10 @@
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area !== "local") return;
     if (changes.extensionEnabled) applyEnabledState(changes.extensionEnabled.newValue !== false);
+    if (changes.vaultLastSync) {
+      vaultConnected = Boolean(changes.vaultLastSync.newValue);
+      if (widgetRefs?.registerBtn) widgetRefs.registerBtn.hidden = !vaultConnected;
+    }
     if (changes.widgetCollapsed) {
       widgetCollapsed = changes.widgetCollapsed.newValue === true;
       const dock = widgetRefs?.host.shadowRoot.querySelector(".dock");
@@ -4060,8 +4173,9 @@
   });
 
   // Arranque: primero se lee el interruptor, recién después se dibuja algo.
-  chrome.storage.local.get(["extensionEnabled", "widgetCollapsed"]).then(prefs => {
+  chrome.storage.local.get(["extensionEnabled", "widgetCollapsed", "vaultLastSync"]).then(prefs => {
     widgetCollapsed = prefs.widgetCollapsed === true;
+    vaultConnected = Boolean(prefs.vaultLastSync);
     const start = () => applyEnabledState(prefs.extensionEnabled !== false);
     if (document.readyState === "loading") {
       document.addEventListener("DOMContentLoaded", start);

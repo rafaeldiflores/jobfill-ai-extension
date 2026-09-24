@@ -71,7 +71,7 @@ const MD_FIELD_LABELS = {
 };
 
 /** Credenciales que nunca salen ni entran por un archivo de respaldo. */
-const BACKUP_EXCLUDED_KEYS = ["claudeApiKey", "vertexApiKey", "vertexProjectId", "vertexRegion"];
+const BACKUP_EXCLUDED_KEYS = ["claudeApiKey", "vertexApiKey", "vertexProjectId", "vertexRegion", "vaultAuth"];
 
 /** `candidateBase` + cada `cvIndexes[]` → un array de objetos "con forma de perfil". */
 function profilesFromCandidateData(candidateBase, cvIndexes) {
@@ -205,6 +205,9 @@ document.addEventListener("DOMContentLoaded", async () => {
   const cvProgressFill = document.getElementById("cvProgressFill");
 
   let localMarkdownSources = [];
+  // Términos vetados por las reglas del vault: la vista del .md debe mostrar
+  // exactamente lo mismo que el service worker le enviará a la IA.
+  let vaultVetoed = [];
   let localProfiles = [];
   let activeProfileId = "prof_default";
   let localQA = [];
@@ -1724,7 +1727,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
   const btnApplyMdFields = document.getElementById("btnApplyMdFields");
 
   function parsedMarkdown() {
-    return localMarkdownSources.length ? JobFillMarkdown.parseMarkdownSources(localMarkdownSources) : null;
+    return localMarkdownSources.length ? JobFillMarkdown.parseMarkdownSources(localMarkdownSources, { vetoed: vaultVetoed }) : null;
   }
 
   function formatBytes(n) {
@@ -1738,7 +1741,7 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
     mdSourcesList.replaceChildren();
 
     for (const source of localMarkdownSources) {
-      const parsed = JobFillMarkdown.parseMarkdownSources([source]);
+      const parsed = JobFillMarkdown.parseMarkdownSources([source], { vetoed: vaultVetoed });
       const summary = JobFillMarkdown.summarizeParsed(parsed);
 
       const card = document.createElement("div");
@@ -1774,7 +1777,8 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
       if (summary.sections) fact(`✓ ${summary.sections} experiencias/proyectos con ${summary.achievements} logros`);
       else fact("⚠️ No se encontraron secciones de experiencia (encabezados ## con logros en viñetas).", "warn");
       fact(summary.hasRules ? "✓ REGLAS DE USO: se aplican literalmente en cada respuesta" : "Sin sección REGLAS DE USO (opcional)");
-      if (summary.excluded.length) fact(`🚫 Nunca se envían (su nota dice "NUNCA va en un CV"): ${summary.excluded.join(", ")}`);
+      if (summary.excluded.length) fact(`🚫 Nunca se envían (su nota dice "NUNCA va en un CV" o tus reglas las vetan): ${summary.excluded.join(", ")}`);
+      if (source.origin === "vault") fact("🔗 Sincronizado desde tu vault: se actualiza solo");
       if (summary.estimatedMetricsRemoved) fact(`🚫 ${summary.estimatedMetricsRemoved} métricas ESTIMADA se omiten siempre`);
 
       card.append(head, facts);
@@ -1873,6 +1877,109 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
     if (filled) scheduleSave();
   });
 
+  // ─── Conexión con el vault (postulador) ──────────────────────────────────
+  // La lógica vive en el service worker (VAULT_*): aquí solo se muestra el
+  // estado y se envían las órdenes.
+  const vaultServerUrl = document.getElementById("vaultServerUrl");
+  const vaultResult = document.getElementById("vaultResult");
+
+  function sendToWorker(type, payload) {
+    return new Promise(resolve => {
+      chrome.runtime.sendMessage({ type, payload }, response => {
+        resolve(chrome.runtime.lastError
+          ? { success: false, error: chrome.runtime.lastError.message }
+          : response || { success: false, error: "Sin respuesta del service worker." });
+      });
+    });
+  }
+
+  function timeAgo(ts) {
+    const min = Math.round((Date.now() - ts) / 60000);
+    if (min < 1) return "recién";
+    if (min < 60) return `hace ${min} min`;
+    const h = Math.round(min / 60);
+    return h < 48 ? `hace ${h} h` : `hace ${Math.round(h / 24)} días`;
+  }
+
+  async function renderVaultCard() {
+    const { vaultAuth, vaultLastSync, vaultRules } = await chrome.storage.local.get(["vaultAuth", "vaultLastSync", "vaultRules"]);
+    const connected = Boolean(vaultAuth);
+    const newVetoed = vaultRules?.nunca_incluir || [];
+    if (JSON.stringify(newVetoed) !== JSON.stringify(vaultVetoed)) {
+      vaultVetoed = newVetoed;
+      renderMarkdownSources();
+    }
+    document.getElementById("vaultDisconnected").hidden = connected;
+    document.getElementById("vaultConnected").hidden = !connected;
+    const pill = document.getElementById("vaultPill");
+    pill.textContent = connected ? "Conectado" : "Sin conectar";
+    pill.classList.toggle("is-on", connected);
+    if (connected) {
+      const host = new URL(vaultAuth.serverUrl).host;
+      const vetoed = vaultRules?.nunca_incluir?.length || 0;
+      document.getElementById("vaultStatusText").textContent =
+        `${host} · BASE sincronizada ${vaultLastSync ? timeAgo(vaultLastSync) : "—"}` +
+        (vetoed ? ` · ${vetoed} ${vetoed === 1 ? "término vetado" : "términos vetados"} por tus reglas` : "") +
+        ". Se refresca sola al abrir esta página y al iniciar el navegador si tiene más de 6 h.";
+    }
+  }
+
+  function showVaultResult(ok, text) {
+    vaultResult.textContent = text;
+    vaultResult.className = `api-test-badge show ${ok ? "success" : "error"}`;
+  }
+
+  async function runVaultSync({ silent = false } = {}) {
+    if (!silent) showVaultResult(true, "⏳ Sincronizando con tu vault…");
+    const res = await sendToWorker("VAULT_SYNC");
+    if (res.success) {
+      if (!silent) showVaultResult(true, `✅ BASE sincronizada: ${res.sections} ${res.sections === 1 ? "experiencia" : "experiencias"}${res.excluded?.length ? ` (${res.excluded.length} excluidas por tus reglas)` : ""}.`);
+    } else if (!silent) {
+      showVaultResult(false, `❌ ${res.error}`);
+    }
+    await renderVaultCard();
+    return res;
+  }
+
+  document.getElementById("btnVaultConnect")?.addEventListener("click", async () => {
+    showVaultResult(true, "⏳ Abriendo el login de GitHub…");
+    const res = await sendToWorker("VAULT_CONNECT", { serverUrl: vaultServerUrl.value });
+    if (res.success) showVaultResult(true, `✅ Conectado. BASE sincronizada: ${res.sync.sections} ${res.sync.sections === 1 ? "experiencia" : "experiencias"}.`);
+    else showVaultResult(false, `❌ ${res.error}`);
+    await renderVaultCard();
+  });
+  document.getElementById("btnVaultSync")?.addEventListener("click", () => runVaultSync());
+  document.getElementById("btnVaultDisconnect")?.addEventListener("click", async () => {
+    await sendToWorker("VAULT_DISCONNECT");
+    showVaultResult(true, "Desconectado. Tu BASE ya importada se conserva.");
+    await renderVaultCard();
+  });
+
+  // Si otro contexto (el service worker al arrancar, el popup) actualiza la
+  // BASE mientras esta página está abierta, se refleja aquí — y se evita que
+  // el autoguardado la pise con la copia vieja que tenía en memoria.
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area !== "local") return;
+    if (changes.candidateBase?.newValue) {
+      const incoming = changes.candidateBase.newValue.markdownSources || [];
+      const changed = JSON.stringify(incoming.map(x => [x.name, x.importedAt])) !== JSON.stringify(localMarkdownSources.map(x => [x.name, x.importedAt]));
+      if (changed) {
+        localMarkdownSources = [...incoming];
+        localCvDatabase = changes.candidateBase.newValue.cvDatabase || localCvDatabase;
+        renderMarkdownSources();
+        renderCvDatabase();
+      }
+    }
+    if (changes.vaultAuth || changes.vaultLastSync || changes.vaultRules) renderVaultCard();
+  });
+
+  // Al abrir la página: si la BASE del vault tiene más de 30 min, se refresca.
+  (async () => {
+    await renderVaultCard();
+    const { vaultAuth, vaultLastSync } = await chrome.storage.local.get(["vaultAuth", "vaultLastSync"]);
+    if (vaultAuth && (!vaultLastSync || Date.now() - vaultLastSync > 30 * 60 * 1000)) runVaultSync({ silent: true });
+  })();
+
   // ─── Inicio: checklist de configuración ──────────────────────────────────
   async function renderSetupChecklist() {
     const container = document.getElementById("setupSteps");
@@ -1887,7 +1994,9 @@ Tu tarea es analizar el texto de un CV y devolver ÚNICAMENTE un objeto JSON vá
       {
         done: mdCount > 0 || expCount > 0,
         title: "Carga tu experiencia",
-        detail: mdCount ? `${mdCount} archivo${mdCount > 1 ? "s" : ""} .md como fuente de verdad` : expCount ? `${expCount} cargos cargados desde tu CV` : "Importa tu BASE en Markdown (instantáneo) o tu CV",
+        detail: stored.vaultAuth
+          ? "BASE sincronizada desde tu vault"
+          : mdCount ? `${mdCount} archivo${mdCount > 1 ? "s" : ""} .md como fuente de verdad` : expCount ? `${expCount} cargos cargados desde tu CV` : "Conecta tu vault o importa tu BASE en Markdown (instantáneo)",
         tab: "tab-source",
         action: "Ir a Fuente de verdad"
       },

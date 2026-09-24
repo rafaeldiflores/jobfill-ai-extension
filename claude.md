@@ -23,7 +23,7 @@ Extensión de navegador (Manifest V3) para Chrome, Edge y Brave que guarda tus d
 
 Abre el icono de **JobFill AI** → ⚙️. La sección **🏠 Inicio** muestra los 3 pasos y cuáles faltan. Todo se **guarda solo** mientras escribes (o con Ctrl+S).
 
-1. **📚 Fuente de verdad:** arrastra tus archivos **.md** (p. ej. `BASE_Experiencia.md`). Se leen al instante y sin IA:
+1. **📚 Fuente de verdad:** lo ideal es **🔗 Conectar con tu vault**: pega la URL de tu postulador (`https://postulador-mcp.<cuenta>.workers.dev`) y entra con GitHub. La BASE se sincroniza sola (al abrir opciones si tiene más de 30 min y al iniciar el navegador si tiene más de 6 h), con tus reglas `nunca_incluir` del vault. JobFill **nunca escribe tu BASE**: el postulador solo le permite leerla. También puedes arrastrar tus archivos **.md** a mano. En ambos casos se leen al instante y sin IA:
    - Las **REGLAS DE USO** del archivo se aplican literalmente en cada respuesta.
    - Las métricas marcadas **ESTIMADA** y las secciones con `Nota: … NUNCA va en un CV` nunca se envían a la IA.
    - Para cada oferta se envían solo las experiencias y logros más relevantes (más rápido y más barato).
@@ -31,6 +31,8 @@ Abre el icono de **JobFill AI** → ⚙️. La sección **🏠 Inicio** muestra 
    - Para actualizar, vuelve a importar el mismo archivo. ¿Sin .md? Hay una opción plegada para usar un CV en PDF o texto.
 2. **🤖 Inteligencia artificial:** pega tu **Anthropic API Key** (`sk-ant-...`). Opcional: una **API Key de Vertex AI** (`AQ.…`) para que **Gemini responda si Claude se queda sin saldo**. *"⚡ Probar Conexión"* prueba cada proveedor por separado.
 3. **👤 Mis datos:** revisa contacto, renta, disponibilidad y la sección legal. Las preguntas legales empiezan **sin responder**: solo se rellenan si tú eliges una opción.
+
+Con el vault conectado, el panel flotante muestra **📌 Registrar postulación**: confirma empresa y cargo, y crea o actualiza `postulaciones/Empresa - Cargo.md` en tu Tracker con estado *Postulado* (siempre con confirmación, nunca automático).
 
 Extras: **💬 Respuestas guardadas** (Q&A y campos flexibles), **🎯 Perfiles de CV** (facetas con palabras clave, opcional) y **💾 Respaldo**.
 
@@ -63,5 +65,6 @@ Extras: **💬 Respuestas guardadas** (Q&A y campos flexibles), **🎯 Perfiles 
 ## 🛠️ Desarrollo
 
 - `npm test` corre la suite completa (sin dependencias). Carga el código **real** de la extensión (nunca copias) y verifica la sintaxis de cada script. GitHub Actions la corre en cada push (`.github/workflows/ci.yml`).
+- `shared/vault-client.js` es el cliente OAuth 2.1 (registro dinámico + PKCE con `chrome.identity`) y MCP (Streamable HTTP) del postulador (`rdf-grafo/postulador-mcp`). El token del vault no sale en los respaldos ni llega a las páginas.
 - `shared/ai-client.js` es el único cliente de IA (Claude + respaldo Gemini); no agregues `fetch()` a proveedores en otros archivos.
 - El autorrelleno **nunca pisa un campo que ya tiene valor**; para reemplazarlo, bórralo y vuelve a autorrellenar.
